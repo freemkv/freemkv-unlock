@@ -46,5 +46,9 @@ step; it is **never** automated by freemkv. This crate only performs the
 non-persistent `#2` step — the microcode lives in RAM and is gone on power
 cycle.
 
-<!-- TODO(owner): MakeMKV attribution + thanks -->
+## Credits
+
+LibreDrive was created by **Mike Chen** and the **MakeMKV team**. This crate
+builds on their work — our thanks and full credit to them for the LibreDrive
+capabilities.
 

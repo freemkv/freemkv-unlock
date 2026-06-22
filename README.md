@@ -3,12 +3,12 @@
 Unlocker plugins for [libfreemkv](https://github.com/freemkv/libfreemkv).
 
 libfreemkv ships only the pluggable `Unlocker` trait + registry and stays
-firmware-clean — it contains no concrete firmware-unlock code. Each crate in
-this workspace implements one unlocker and is registered into libfreemkv by a
-single line in the consuming binary:
+firmware-clean — it contains no concrete unlock code. Each crate in this
+workspace implements one unlocker and is registered into libfreemkv by a single
+line in the consuming binary:
 
 ```rust
-libfreemkv::register_unlocker(Box::new(freemkv_unlock_ld::LibreDrive::new()));
+libfreemkv::register_unlocker(Box::new(my_unlocker::MyUnlocker::new()));
 ```
 
 Removing an unlocker is deleting that one line and the dependency
@@ -16,8 +16,6 @@ Removing an unlocker is deleting that one line and the dependency
 
 ## Members
 
-| Crate | Unlocker |
-|-------|----------|
-| [`ld`](ld/) (`freemkv-unlock-ld`) | LibreDrive — MediaTek MT1959 firmware unlock |
+Each member is a self-contained unlocker plugin — see its own README for details.
 
 License: AGPL-3.0-only.
