@@ -1,15 +1,13 @@
-[package]
-name = "freemkv-unlock-ld"
-version = "1.0.0-rc.2"
-edition = "2024"
-rust-version = "1.86"
-license = "AGPL-3.0-only"
-description = "LibreDrive unlocker plugin for libfreemkv (firmware unlock for MediaTek MT1959 drives)"
-repository = "https://github.com/freemkv/freemkv-unlock-ld"
-
-[dependencies]
-libfreemkv = "1.0.0-rc.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22.1"
-tracing = "0.1"
+# freemkv-unlock — unlocker plugins for libfreemkv.
+#
+# libfreemkv ships only the `Unlocker` trait + registry and stays firmware-clean.
+# Each member here is one concrete unlocker, registered into libfreemkv by a
+# single `register_unlocker(...)` line in the consuming binary — so dropping an
+# unlocker is deleting that one line plus the dependency (delete-to-comply).
+#
+# Members:
+#   ld — LibreDrive (MediaTek MT1959 firmware unlock)
+#   (future unlockers go here as additional members)
+[workspace]
+resolver = "2"
+members = ["ld"]
