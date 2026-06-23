@@ -20,6 +20,7 @@
 // `crate::error::*` / `crate::scsi::*` paths.
 pub(crate) use libfreemkv::{error, scsi};
 
+pub mod cdb;
 pub mod profile;
 
 mod platform;
