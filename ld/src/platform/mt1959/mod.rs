@@ -425,6 +425,64 @@ mod tests {
         }
     }
 
+    /// Records every CDB issued, so a test can assert which bytes hit the wire.
+    struct RecordingTransport {
+        cdbs: Vec<Vec<u8>>,
+    }
+
+    impl ScsiTransport for RecordingTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> Result<ScsiResult> {
+            self.cdbs.push(cdb.to_vec());
+            // Empty response → do_unlock's signature check fails, so the unlock
+            // loop exhausts — but the firmware-load CDBs (incl. the F1 verify)
+            // are already recorded by then.
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: 0,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    /// variant_b must issue the PROFILE's per-drive `fw_verify_cdb`, not the
+    /// hardcoded fallback const — the bug that broke ~139 of 140 B drives.
+    #[test]
+    fn variant_b_issues_profile_fw_verify_cdb_not_const() {
+        let drive_f1 = [0xF1, 0x01, 0x02, 0x00, 0x0C, 0xF0, 0x01, 0xFB, 0xC9, 0x93];
+        // variant_b's hardcoded fallback const (a different drive's token).
+        let fallback_f1 = [0xF1, 0x01, 0x02, 0x00, 0x0D, 0x30, 0x01, 0xF3, 0xAD, 0x23];
+        let mut profile = fixture_profile([0x9a, 0xa9, 0x3a, 0xe2]);
+        profile.firmware = vec![0u8; 2208]; // a real per-drive length, != old 0x9C0
+        profile.fw_verify_cdb = Some(drive_f1);
+
+        let mut mt = Mt1959::new(profile, true);
+        let mut t = RecordingTransport { cdbs: Vec::new() };
+        let _ = variant_b::load_firmware(&mut mt, &mut t);
+
+        assert!(
+            t.cdbs.iter().any(|c| c.as_slice() == drive_f1),
+            "must send the profile's F1 verify CDB"
+        );
+        assert!(
+            !t.cdbs.iter().any(|c| c.as_slice() == fallback_f1),
+            "must NOT send the hardcoded fallback const when the profile has its own"
+        );
+        // MODE SELECT must encode the real per-drive length (2208), not 0x9C0.
+        let ms = t
+            .cdbs
+            .iter()
+            .find(|c| c.first() == Some(&0x55))
+            .expect("MODE SELECT issued");
+        let len = ((ms[7] as usize) << 8) | ms[8] as usize;
+        assert_eq!(len, 2208, "MODE SELECT length = firmware.len(), not 2496");
+    }
+
     fn fixture_profile(signature: [u8; 4]) -> DriveProfile {
         DriveProfile {
             identity: Identity {
@@ -446,6 +504,7 @@ mod tests {
             read_buffer_verify_cdb: None,
             write_buffer_cdb: None,
             read_buffer_unlock_cdb: None,
+            fw_verify_cdb: None,
             speed_zone_table: None,
             speed_calc_table: None,
         }

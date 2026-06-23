@@ -71,6 +71,11 @@ pub struct DriveProfile {
     pub write_buffer_cdb: Option<[u8; 10]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
     pub read_buffer_unlock_cdb: Option<[u8; 10]>,
+    /// Variant-B vendor verify (0xF1) CDB. PER-DRIVE: 39 distinct values across
+    /// the 140 B drives, so it CANNOT be a hardcoded constant. `variant_b`'s old
+    /// `VENDOR_VERIFY` const was one drive's token, wrong for the other ~139.
+    #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
+    pub fw_verify_cdb: Option<[u8; 10]>,
 
     // Per-drive identifier tables — variable-length hex strings.
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes")]
