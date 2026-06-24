@@ -47,7 +47,7 @@ mod tests {
         assert!(!is_unlock_read_buffer(1, 0x77));
         assert!(!is_unlock_read_buffer(2, 0x44));
         // Wrong mode, right buffer id.
-        assert!(!is_unlock_read_buffer(2, 0x44));
+        assert!(!is_unlock_read_buffer(0, 0x77));
         assert!(!is_unlock_read_buffer(0, 0x44));
         assert!(!is_unlock_read_buffer(3, 0x77));
         // Ordinary data reads.
