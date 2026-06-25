@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-unlock-ld"
-version = "1.0.0-rc.5.2"
+version = "1.0.0-rc.5.3"
 edition = "2024"
 rust-version = "1.86"
 license = "AGPL-3.0-only"
@@ -8,7 +8,7 @@ description = "LibreDrive unlocker plugin for libfreemkv (firmware unlock for Me
 repository = "https://github.com/freemkv/freemkv-unlock"
 
 [dependencies]
-libfreemkv = "1.0.0-rc.5.2"
+libfreemkv = "1.0.0-rc.5.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22.1"
