@@ -25,8 +25,9 @@ pub mod profile;
 
 mod platform;
 
-use error::{Error, Result};
-use libfreemkv::{DriveId, ScsiTransport, Unlocker};
+use error::Result;
+use libfreemkv::aacs::Vid;
+use libfreemkv::{DriveId, ScsiTransport, UnlockError, Unlocker};
 use scsi::DataDirection;
 
 /// The LibreDrive unlocker.
@@ -48,78 +49,48 @@ impl Default for LibreDrive {
     }
 }
 
-impl Unlocker for LibreDrive {
-    fn name(&self) -> &str {
-        "LibreDrive"
-    }
-
-    fn matches(&self, id: &DriveId) -> bool {
-        profile::find_bundled(id).is_some()
-    }
-
-    fn unlock_drive(&self, scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<()> {
-        let Some(m) = profile::find_bundled(id) else {
-            // matches() returned true but the profile vanished — treat as
-            // "nothing to do"; the caller falls back to the cert handshake.
-            return Ok(());
-        };
-        let is_variant_b = matches!(m.platform, profile::Platform::Mt1959B);
-        if matches!(m.platform, profile::Platform::Renesas) {
-            // Renesas firmware unlock is not implemented; leave the drive
-            // untouched so the host-cert handshake carries the disc.
-            return Ok(());
-        }
-        use platform::PlatformDriver;
-        let mut mt = platform::mt1959::Mt1959::new(m.profile, is_variant_b);
-        // Firmware unlock. On success, prime the per-region speed table so
-        // the drive manages zone speeds internally (best-effort — probe
-        // calibration failure must not fail an otherwise-good unlock).
-        mt.init(scsi)?;
-        let _ = mt.probe_disc(scsi);
-        Ok(())
-    }
-
-    /// OEM Volume ID retrieval.
+impl LibreDrive {
+    /// Read the OEM Volume ID via the matched profile's vendor CDB.
     ///
-    /// An unlocker unlocks drive *functionality*, not just the disc: VID
-    /// retrieval via the drive's OEM CDB is a capability separate from
-    /// `unlock`. This recovers the per-drive READ_BUFFER VID path that lived
-    /// in libfreemkv before the unlocker refactor (it was `read_vid_oem` in
-    /// `libfreemkv/src/disc/encrypt.rs`), now living inside the unlocker
-    /// where the per-drive `read_vid_cdb` template belongs.
+    /// This recovers the per-drive READ_BUFFER VID path that lived in
+    /// libfreemkv before the unlocker refactor (it was `read_vid_oem` in
+    /// `libfreemkv/src/disc/encrypt.rs`), now living inside the unlocker where
+    /// the per-drive `read_vid_cdb` template belongs. Folded into [`Self::unlock`]:
+    /// an unlocked drive must hand back its Volume ID in one step.
     ///
     /// Returns:
-    ///   * `Ok(Some(vid))` — the drive's profile carries an OEM VID CDB and
-    ///     the drive served a well-formed VID. No host certificate or HRL is
-    ///     involved — VID is decoupled from the cert chain.
-    ///   * `Ok(None)` — no profile matched, or the profile carries no OEM VID
-    ///     CDB; libfreemkv falls back to the cert-based VID read.
-    ///   * `Err(_)` — the OEM CDB ran but returned a short or malformed
-    ///     response.
+    ///   * `Ok(Vid)` — the profile carries an OEM VID CDB and the drive served a
+    ///     well-formed VID. No host certificate or HRL is involved.
+    ///   * `Err(UnlockError::VidUnavailable)` — no matching profile, no OEM VID
+    ///     CDB, or a short / bad-signature response (auth succeeded but the VID
+    ///     could not be read → cert fallback).
+    ///   * `Err(UnlockError::Scsi(code))` — the OEM CDB itself failed at the
+    ///     transport (via `?` / `From<Error>`).
     ///
     /// Response layout (36 bytes):
     ///   * `[0..3]`   3-byte response signature; expected `00 22 00`
     ///   * `[3]`      reserved
     ///   * `[4..20]`  16-byte Volume ID
     ///   * `[20..36]` reserved / per-drive padding
-    fn read_volume_id(
+    fn read_oem_vid(
         &self,
         scsi: &mut dyn ScsiTransport,
         id: &DriveId,
-    ) -> Result<Option<[u8; 16]>> {
+    ) -> std::result::Result<Vid, UnlockError> {
         const RESPONSE_LEN: usize = 36;
         const EXPECTED_HEADER: [u8; 3] = [0x00, 0x22, 0x00];
 
-        // No matching profile, or a profile without an OEM VID CDB → no OEM
+        // No matching profile, or a profile without an OEM VID CDB → no OEM VID
         // path; the caller falls back to the cert handshake.
         let Some(m) = profile::find_bundled(id) else {
-            return Ok(None);
+            return Err(UnlockError::VidUnavailable);
         };
         let Some(cdb) = m.profile.read_vid_cdb else {
-            return Ok(None);
+            return Err(UnlockError::VidUnavailable);
         };
 
         let mut buf = vec![0u8; RESPONSE_LEN];
+        // A transport failure here is a raw SCSI error → Scsi(code) via `?`.
         let result = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
         if result.bytes_transferred < RESPONSE_LEN {
             tracing::warn!(
@@ -128,7 +99,7 @@ impl Unlocker for LibreDrive {
                 bytes_transferred = result.bytes_transferred,
                 "OEM VID CDB returned short response"
             );
-            return Err(Error::AacsVidRead);
+            return Err(UnlockError::VidUnavailable);
         }
         if buf[0..3] != EXPECTED_HEADER {
             tracing::warn!(
@@ -139,7 +110,7 @@ impl Unlocker for LibreDrive {
                 header_2 = buf[2],
                 "OEM VID response header mismatch"
             );
-            return Err(Error::AacsVidRead);
+            return Err(UnlockError::VidUnavailable);
         }
         let mut vid = [0u8; 16];
         vid.copy_from_slice(&buf[4..20]);
@@ -148,7 +119,56 @@ impl Unlocker for LibreDrive {
             phase = "oem_vid_ok",
             "OEM VID retrieved via unlocker"
         );
-        Ok(Some(vid))
+        Ok(Vid(vid))
+    }
+}
+
+impl Unlocker for LibreDrive {
+    fn name(&self) -> &str {
+        "LibreDrive"
+    }
+
+    fn matches(&self, id: &DriveId) -> bool {
+        profile::find_bundled(id).is_some()
+    }
+
+    /// Firmware-unlock the drive AND return the disc's OEM Volume ID in one step
+    /// (the new trait folds the old `unlock_drive()` + `read_volume_id()`).
+    ///
+    /// Maps to [`UnlockError`]:
+    ///   * no matching profile / Renesas (no firmware unlock implemented) →
+    ///     [`UnlockError::FirmwareNotUnlockable`];
+    ///   * a SCSI failure during the firmware-unlock handshake →
+    ///     [`UnlockError::Scsi`] (via `?` / `From<Error>`);
+    ///   * unlocked but no readable OEM VID → [`UnlockError::VidUnavailable`].
+    ///
+    /// Any error makes libfreemkv fall through to the in-tree cert handshake.
+    fn unlock(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        id: &DriveId,
+    ) -> std::result::Result<Vid, UnlockError> {
+        let Some(m) = profile::find_bundled(id) else {
+            // matches() returned true but the profile vanished — this unlocker
+            // cannot put the firmware into extended mode.
+            return Err(UnlockError::FirmwareNotUnlockable);
+        };
+        if matches!(m.platform, profile::Platform::Renesas) {
+            // Renesas firmware unlock is not implemented; cannot unlock the
+            // firmware, so the host-cert handshake must carry the disc.
+            return Err(UnlockError::FirmwareNotUnlockable);
+        }
+        let is_variant_b = matches!(m.platform, profile::Platform::Mt1959B);
+        use platform::PlatformDriver;
+        let mut mt = platform::mt1959::Mt1959::new(m.profile, is_variant_b);
+        // Firmware unlock. A SCSI failure becomes UnlockError::Scsi via `?`.
+        mt.init(scsi)?;
+        // On success, prime the per-region speed table so the drive manages
+        // zone speeds internally (best-effort — calibration failure must not
+        // fail an otherwise-good unlock).
+        let _ = mt.probe_disc(scsi);
+        // An unlocked drive must hand back its Volume ID in the same step.
+        self.read_oem_vid(scsi, id)
     }
 
     /// Raise the drive to its maximum read speed.
@@ -221,12 +241,12 @@ mod tests {
     }
 
     /// A well-formed 36-byte response (signature 00 22 00, VID at [4..20])
-    /// parses to that VID.
+    /// parses to that VID via the OEM-VID helper `unlock` folds in.
     #[test]
-    fn read_vid_parses_well_formed_response() {
-        // Confirm the bundled profile actually carries a read_vid_cdb;
-        // otherwise read_vid would short-circuit to Ok(None) and this test
-        // wouldn't exercise the parse path.
+    fn read_oem_vid_parses_well_formed_response() {
+        // Confirm the bundled profile actually carries a read_vid_cdb; otherwise
+        // read_oem_vid would short-circuit and this test wouldn't exercise the
+        // parse path.
         let m = profile::find_bundled(&known_vid_drive_id()).expect("profile match");
         assert!(
             m.profile.read_vid_cdb.is_some(),
@@ -242,27 +262,28 @@ mod tests {
             bytes_transferred: 36,
         };
         let got = LibreDrive::new()
-            .read_volume_id(&mut t, &known_vid_drive_id())
+            .read_oem_vid(&mut t, &known_vid_drive_id())
             .expect("parse ok");
-        assert_eq!(got, Some(vid), "VID parsed from [4..20]");
+        assert_eq!(got, Vid(vid), "VID parsed from [4..20]");
     }
 
-    /// A short response (fewer than 36 transferred bytes) → AacsVidRead.
+    /// A short response (fewer than 36 transferred bytes) → VidUnavailable
+    /// (unlocked but no readable VID → cert fallback).
     #[test]
-    fn read_vid_short_response_errors() {
+    fn read_oem_vid_short_response_is_vid_unavailable() {
         let mut t = FakeTransport {
             payload: vec![0u8; 36],
             bytes_transferred: 20,
         };
         let err = LibreDrive::new()
-            .read_volume_id(&mut t, &known_vid_drive_id())
+            .read_oem_vid(&mut t, &known_vid_drive_id())
             .expect_err("short response must error");
-        assert!(matches!(err, Error::AacsVidRead));
+        assert_eq!(err, UnlockError::VidUnavailable);
     }
 
-    /// A response whose 3-byte signature isn't `00 22 00` → AacsVidRead.
+    /// A response whose 3-byte signature isn't `00 22 00` → VidUnavailable.
     #[test]
-    fn read_vid_bad_header_errors() {
+    fn read_oem_vid_bad_header_is_vid_unavailable() {
         let mut payload = vec![0u8; 36];
         payload[0..3].copy_from_slice(&[0xDE, 0xAD, 0xBE]); // wrong signature
         let mut t = FakeTransport {
@@ -270,23 +291,38 @@ mod tests {
             bytes_transferred: 36,
         };
         let err = LibreDrive::new()
-            .read_volume_id(&mut t, &known_vid_drive_id())
+            .read_oem_vid(&mut t, &known_vid_drive_id())
             .expect_err("bad header must error");
-        assert!(matches!(err, Error::AacsVidRead));
+        assert_eq!(err, UnlockError::VidUnavailable);
     }
 
-    /// A drive with no matching profile → Ok(None) (cert fallback), and the
-    /// transport is never issued a CDB.
+    /// A drive with no matching profile → `read_oem_vid` is VidUnavailable
+    /// (cert fallback), and the transport is never issued a CDB.
     #[test]
-    fn read_vid_no_profile_is_none() {
+    fn read_oem_vid_no_profile_is_vid_unavailable() {
         let mut t = FakeTransport {
             payload: vec![0u8; 36],
             bytes_transferred: 36,
         };
-        let got = LibreDrive::new()
-            .read_volume_id(&mut t, &make_drive_id("FAKE-VND", "9.99", "XX12345", ""))
-            .expect("no-profile is Ok(None)");
-        assert!(got.is_none(), "no profile → cert fallback");
+        let err = LibreDrive::new()
+            .read_oem_vid(&mut t, &make_drive_id("FAKE-VND", "9.99", "XX12345", ""))
+            .expect_err("no profile → VidUnavailable");
+        assert_eq!(err, UnlockError::VidUnavailable);
+    }
+
+    /// `unlock` on a drive with no matching profile → FirmwareNotUnlockable
+    /// (this unlocker cannot put the firmware into extended mode), short-
+    /// circuiting before any firmware handshake is attempted.
+    #[test]
+    fn unlock_no_profile_is_firmware_not_unlockable() {
+        let mut t = FakeTransport {
+            payload: vec![0u8; 36],
+            bytes_transferred: 36,
+        };
+        let err = LibreDrive::new()
+            .unlock(&mut t, &make_drive_id("FAKE-VND", "9.99", "XX12345", ""))
+            .expect_err("no profile → FirmwareNotUnlockable");
+        assert_eq!(err, UnlockError::FirmwareNotUnlockable);
     }
 
     /// A transport that records the CDB issued (and how many CDBs it saw),
