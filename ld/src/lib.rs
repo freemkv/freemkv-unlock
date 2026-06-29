@@ -27,7 +27,7 @@ mod platform;
 
 use error::Result;
 use libfreemkv::aacs::Vid;
-use libfreemkv::{DriveId, ScsiTransport, UnlockError, Unlocker};
+use libfreemkv::{DriveId, ScsiTransport, Unlocked, UnlockError, Unlocker};
 use scsi::DataDirection;
 
 /// The LibreDrive unlocker.
@@ -147,7 +147,7 @@ impl Unlocker for LibreDrive {
         &self,
         scsi: &mut dyn ScsiTransport,
         id: &DriveId,
-    ) -> std::result::Result<Vid, UnlockError> {
+    ) -> std::result::Result<Unlocked, UnlockError> {
         let Some(m) = profile::find_bundled(id) else {
             // matches() returned true but the profile vanished — this unlocker
             // cannot put the firmware into extended mode.
@@ -167,8 +167,13 @@ impl Unlocker for LibreDrive {
         // zone speeds internally (best-effort — calibration failure must not
         // fail an otherwise-good unlock).
         let _ = mt.probe_disc(scsi);
-        // An unlocked drive must hand back its Volume ID in the same step.
-        self.read_oem_vid(scsi, id)
+        // An unlocked drive must hand back its Volume ID in the same step. The
+        // firmware route serves CLEAR content, so it carries no bus key.
+        let vid = self.read_oem_vid(scsi, id)?;
+        Ok(Unlocked {
+            vid: Some(vid),
+            read_data_key: None,
+        })
     }
 
     /// Raise the drive to its maximum read speed.
