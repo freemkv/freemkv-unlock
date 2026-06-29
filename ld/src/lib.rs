@@ -27,7 +27,7 @@ mod platform;
 
 use error::Result;
 use libfreemkv::aacs::Vid;
-use libfreemkv::{DriveId, ScsiTransport, Unlocked, UnlockError, Unlocker};
+use libfreemkv::{DriveId, ScsiTransport, UnlockCtx, UnlockError, Unlocked, Unlocker};
 use scsi::DataDirection;
 
 /// The LibreDrive unlocker.
@@ -128,8 +128,9 @@ impl Unlocker for LibreDrive {
         "LibreDrive"
     }
 
-    fn matches(&self, id: &DriveId) -> bool {
-        profile::find_bundled(id).is_some()
+    fn matches(&self, ctx: &UnlockCtx) -> bool {
+        // Firmware unlock keys off the drive identity; disc kind is irrelevant.
+        profile::find_bundled(ctx.drive_id).is_some()
     }
 
     /// Firmware-unlock the drive AND return the disc's OEM Volume ID in one step
@@ -146,8 +147,9 @@ impl Unlocker for LibreDrive {
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
-        id: &DriveId,
+        ctx: &UnlockCtx,
     ) -> std::result::Result<Unlocked, UnlockError> {
+        let id = ctx.drive_id;
         let Some(m) = profile::find_bundled(id) else {
             // matches() returned true but the profile vanished — this unlocker
             // cannot put the firmware into extended mode.
@@ -182,8 +184,8 @@ impl Unlocker for LibreDrive {
     /// `0xBB SET CD SPEED`-to-max command) over the raw transport. A profile
     /// without a `set_speed_max_cdb` (or no matching profile at all) is a
     /// no-op — the drive stays at its current speed.
-    fn set_max_read_speed(&self, scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<()> {
-        let Some(m) = profile::find_bundled(id) else {
+    fn set_max_read_speed(&self, scsi: &mut dyn ScsiTransport, ctx: &UnlockCtx) -> Result<()> {
+        let Some(m) = profile::find_bundled(ctx.drive_id) else {
             return Ok(());
         };
         let Some(cdb) = m.profile.set_speed_max_cdb else {
@@ -203,7 +205,14 @@ impl Unlocker for LibreDrive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libfreemkv::DiscKind;
     use scsi::{DataDirection, ScsiResult, ScsiTransport};
+
+    /// Drive-prep unlock context for a fake drive id (disc kind irrelevant to
+    /// the firmware unlocker — it keys off the drive identity).
+    fn ctx(id: &DriveId) -> UnlockCtx<'_> {
+        UnlockCtx::new(id, DiscKind::Unknown)
+    }
 
     /// A fake transport that fills the response buffer from a fixed payload
     /// and reports a configurable transferred-byte count. Exercises the OEM
@@ -325,7 +334,10 @@ mod tests {
             bytes_transferred: 36,
         };
         let err = LibreDrive::new()
-            .unlock(&mut t, &make_drive_id("FAKE-VND", "9.99", "XX12345", ""))
+            .unlock(
+                &mut t,
+                &ctx(&make_drive_id("FAKE-VND", "9.99", "XX12345", "")),
+            )
             .expect_err("no profile → FirmwareNotUnlockable");
         assert_eq!(err, UnlockError::FirmwareNotUnlockable);
     }
@@ -370,7 +382,7 @@ mod tests {
             calls: 0,
         };
         LibreDrive::new()
-            .set_max_read_speed(&mut t, &known_vid_drive_id())
+            .set_max_read_speed(&mut t, &ctx(&known_vid_drive_id()))
             .expect("set_max_read_speed ok");
         assert_eq!(t.calls, 1, "exactly one CDB issued");
         assert_eq!(
@@ -388,7 +400,10 @@ mod tests {
             calls: 0,
         };
         LibreDrive::new()
-            .set_max_read_speed(&mut t, &make_drive_id("FAKE-VND", "9.99", "XX12345", ""))
+            .set_max_read_speed(
+                &mut t,
+                &ctx(&make_drive_id("FAKE-VND", "9.99", "XX12345", "")),
+            )
             .expect("no-profile is a no-op Ok(())");
         assert_eq!(t.calls, 0, "no profile → no CDB issued");
     }
