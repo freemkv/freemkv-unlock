@@ -27,7 +27,7 @@ mod platform;
 
 use error::Result;
 use libfreemkv::aacs::Vid;
-use libfreemkv::{DriveId, ScsiTransport, UnlockCtx, UnlockError, Unlocked, Unlocker};
+use libfreemkv::{DiscKind, DriveId, ScsiTransport, UnlockCtx, UnlockError, Unlocked, Unlocker};
 use scsi::DataDirection;
 
 /// The LibreDrive unlocker.
@@ -129,8 +129,11 @@ impl Unlocker for LibreDrive {
     }
 
     fn matches(&self, ctx: &UnlockCtx) -> bool {
-        // Firmware unlock keys off the drive identity; disc kind is irrelevant.
-        profile::find_bundled(ctx.drive_id).is_some()
+        // Firmware unlock is a drive-prep concern: it runs before the disc kind
+        // is probed (ctx.kind == Unknown) and keys off the drive identity. It
+        // must NOT fire during the later content-keyed dispatch (kind Aacs/Css),
+        // or a DVD/Blu-ray in a profiled drive would be re-firmware-unlocked.
+        ctx.kind == DiscKind::Unknown && profile::find_bundled(ctx.drive_id).is_some()
     }
 
     /// Firmware-unlock the drive AND return the disc's OEM Volume ID in one step
