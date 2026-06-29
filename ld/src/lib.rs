@@ -178,6 +178,10 @@ impl Unlocker for LibreDrive {
         Ok(Unlocked {
             vid: Some(vid),
             read_data_key: None,
+            // Firmware unlock puts the drive in clear-content mode: AACS bus
+            // encryption is removed at the drive, so the gate needs no bus key.
+            drive_unlocked: true,
+            read_data_key_err: None,
         })
     }
 
