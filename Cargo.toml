@@ -6,9 +6,10 @@
 # unlocker is deleting that one line plus the dependency (delete-to-comply).
 #
 # Members:
-#   ld  — LibreDrive (MediaTek MT1959 firmware unlock)
-#   css — CSS (DVD-Video) bus-auth unlock
+#   ld   — LibreDrive (MediaTek MT1959 firmware unlock)
+#   aacs — AACS host-certificate bus-auth unlock (Blu-ray / UHD)
+#   css  — CSS (DVD-Video) bus-auth unlock
 #   (future unlockers go here as additional members)
 [workspace]
 resolver = "2"
-members = ["ld", "css"]
+members = ["ld", "aacs", "css"]
