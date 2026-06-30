@@ -1,6 +1,8 @@
-//! Internal error type shared by the unlocker modules (firmware / handshake /
-//! bus-auth). Distinct from [`crate::UnlockError`], which is the unlock OUTCOME
-//! the consumer sees; this is the low-level error the SCSI/crypto code uses.
+//! ld's internal error type for the firmware-unlock SCSI/handshake code.
+//! Distinct from [`crate::UnlockError`] (the unlock OUTCOME the consumer sees);
+//! this is the low-level error ld's code uses. Maps both ways: a generic
+//! [`crate::scsi::ScsiError`] transport fault converts IN, and an `Error`
+//! converts OUT to the contract's `UnlockError`.
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -45,5 +47,30 @@ impl Error {
             Error::ScsiError { status, sense: None, .. }
                 if *status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE
         )
+    }
+}
+
+/// A generic transport fault from the SCSI contract converts into ld's error
+/// (the opcode is unknown at the transport level).
+impl From<crate::scsi::ScsiError> for Error {
+    fn from(e: crate::scsi::ScsiError) -> Self {
+        Error::ScsiError {
+            opcode: 0,
+            status: e.status,
+            sense: e.sense,
+        }
+    }
+}
+
+/// ld's internal error converts OUT to the contract outcome: a dead bus is a
+/// hard `Transport` abort; any other firmware failure means "this unlocker
+/// didn't apply" → the consumer falls through to the next unlocker.
+impl From<Error> for crate::UnlockError {
+    fn from(e: Error) -> Self {
+        if e.is_transport_failure() {
+            crate::UnlockError::Transport
+        } else {
+            crate::UnlockError::NotApplicable
+        }
     }
 }
