@@ -13,8 +13,8 @@
 pub mod scsi;
 
 mod aacs;
+mod css;
 mod ld;
-// mod css;   // stage 3 — CSS bus-auth
 
 use scsi::ScsiTransport;
 
@@ -121,6 +121,6 @@ pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
     vec![
         Box::new(ld::LibreDrive::new()),
         Box::new(aacs::AacsCert::new()),
-        // Box::new(css::Css::new()),          // stage 3
+        Box::new(css::CssUnlocker::new()),
     ]
 }
