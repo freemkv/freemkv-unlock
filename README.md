@@ -1,21 +1,27 @@
 # freemkv-unlock
 
-Unlocker plugins for [libfreemkv](https://github.com/freemkv/libfreemkv).
+The unlock layer for the freemkv toolchain.
 
-libfreemkv ships only the pluggable `Unlocker` trait + registry and stays
-firmware-clean — it contains no concrete unlock code. Each crate in this
-workspace implements one unlocker and is registered into libfreemkv by a single
-line in the consuming binary:
+An **unlocker removes a drive-level bus-encryption barrier** so the drive serves
+readable (de-bus'd / de-scrambled) sectors. Content-key decryption is a separate
+concern — the consumer's job.
+
+This crate defines the `Unlocker` contract and a generic SCSI transport
+contract, and holds the self-contained unlocker modules. The consumer
+([libfreemkv](https://github.com/freemkv/libfreemkv)) depends on this crate and
+dispatches through `all_unlockers()`; it never names an individual unlocker, and
+clients of libfreemkv are oblivious to unlockers entirely (as they are to the
+SCSI layer).
 
 ```rust
-libfreemkv::register_unlocker(Box::new(my_unlocker::MyUnlocker::new()));
+for u in freemkv_unlock::all_unlockers() {
+    if u.matches(&ctx) {
+        return u.unlock(&mut scsi, &ctx);
+    }
+}
 ```
 
-Removing an unlocker is deleting that one line and the dependency
-(delete-to-comply).
-
-## Members
-
-Each member is a self-contained unlocker plugin — see its own README for details.
+To remove an unlocker, delete its module directory and its one line in
+`all_unlockers()` — nothing else changes.
 
 License: AGPL-3.0-only.
