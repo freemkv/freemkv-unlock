@@ -6,6 +6,8 @@ rust-version = "1.86"
 license = "AGPL-3.0-only"
 description = "Unlock layer for the freemkv toolchain: the Unlocker contract + self-contained firmware/AACS/CSS unlocker modules. libfreemkv depends on this and dispatches via all_unlockers()."
 repository = "https://github.com/freemkv/freemkv-unlock"
+# NEVER crates.io: this crate carries drive firmware. Consumed only by git tag.
+publish = false
 
 [features]
 # Off by default. Exposes ld's unlock-handshake wire format (`UNLOCK_MARKER`,
