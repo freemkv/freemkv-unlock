@@ -124,7 +124,7 @@ impl Mt1959 {
         let cdb = self.read_buffer_sub(sub_cmd, address, expected as u8);
         let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 5_000)?;
         if result.bytes_transferred != expected {
-            return Err(Error::ScsiError {
+            return Err(Error::Scsi {
                 opcode: SCSI_READ_BUFFER,
                 status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
                 sense: None,
@@ -217,7 +217,7 @@ impl Mt1959 {
                 return Ok(());
             }
         }
-        Err(Error::ScsiError {
+        Err(Error::Scsi {
             opcode: SCSI_READ_BUFFER,
             status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
             sense: None,
@@ -327,7 +327,7 @@ impl Mt1959 {
                 )
                 .is_err()
             {
-                return Err(Error::ScsiError {
+                return Err(Error::Scsi {
                     opcode: SCSI_READ_BUFFER,
                     status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
                     sense: None,

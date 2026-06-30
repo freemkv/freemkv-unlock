@@ -28,7 +28,7 @@ pub enum Error {
     /// A SCSI command failed. `status == SCSI_STATUS_TRANSPORT_FAILURE` with
     /// `sense: None` is a transport-layer fault; a CHECK CONDITION carries the
     /// parsed [`ScsiSense`].
-    ScsiError {
+    Scsi {
         /// CDB opcode that failed — diagnostic, carried for future logging.
         opcode: u8,
         status: u8,
@@ -54,14 +54,14 @@ impl Error {
             Error::AacsVidRead => 7012,
             Error::HandshakeRejected => 7013,
             Error::VidUnavailable => 7014,
-            Error::ScsiError { .. } => 7099,
+            Error::Scsi { .. } => 7099,
         }
     }
 
     /// The parsed sense for a CHECK CONDITION SCSI error, else `None`.
     pub fn scsi_sense(&self) -> Option<ScsiSense> {
         match self {
-            Error::ScsiError { sense, .. } => *sense,
+            Error::Scsi { sense, .. } => *sense,
             _ => None,
         }
     }
@@ -70,7 +70,7 @@ impl Error {
     pub fn is_scsi_transport_failure(&self) -> bool {
         matches!(
             self,
-            Error::ScsiError { status, sense: None, .. } if *status == SCSI_STATUS_TRANSPORT_FAILURE
+            Error::Scsi { status, sense: None, .. } if *status == SCSI_STATUS_TRANSPORT_FAILURE
         )
     }
 }
@@ -79,7 +79,7 @@ impl Error {
 /// at the transport level; sense parsed from the raw buffer when present).
 impl From<crate::scsi::ScsiError> for Error {
     fn from(e: crate::scsi::ScsiError) -> Self {
-        Error::ScsiError {
+        Error::Scsi {
             opcode: 0,
             status: e.status,
             sense: e.sense.map(|s| ScsiSense::from_buf(&s)),

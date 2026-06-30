@@ -16,7 +16,7 @@ pub enum Error {
     SignatureMismatch { expected: [u8; 4], got: [u8; 4] },
     /// A SCSI command failed. `status == SCSI_STATUS_TRANSPORT_FAILURE` with
     /// `sense: None` is a transport-layer fault (bridge crash / disconnect).
-    ScsiError {
+    Scsi {
         opcode: u8,
         status: u8,
         sense: Option<[u8; 32]>,
@@ -29,7 +29,7 @@ impl std::fmt::Display for Error {
             Error::ProfileParse => write!(f, "drive profile parse error"),
             Error::UnlockFailed => write!(f, "firmware unlock failed"),
             Error::SignatureMismatch { .. } => write!(f, "signature mismatch"),
-            Error::ScsiError { opcode, status, .. } => {
+            Error::Scsi { opcode, status, .. } => {
                 write!(f, "SCSI error (opcode {opcode:#04x}, status {status:#04x})")
             }
         }
@@ -44,7 +44,7 @@ impl Error {
     pub(crate) fn is_transport_failure(&self) -> bool {
         matches!(
             self,
-            Error::ScsiError { status, sense: None, .. }
+            Error::Scsi { status, sense: None, .. }
                 if *status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE
         )
     }
@@ -54,7 +54,7 @@ impl Error {
 /// (the opcode is unknown at the transport level).
 impl From<crate::scsi::ScsiError> for Error {
     fn from(e: crate::scsi::ScsiError) -> Self {
-        Error::ScsiError {
+        Error::Scsi {
             opcode: 0,
             status: e.status,
             sense: e.sense,
