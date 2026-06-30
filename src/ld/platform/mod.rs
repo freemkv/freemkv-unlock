@@ -2,7 +2,7 @@
 
 pub mod mt1959;
 
-use crate::error::Result;
+use crate::ld::error::Result;
 use crate::scsi::ScsiTransport;
 
 pub(crate) trait PlatformDriver: Send {

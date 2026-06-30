@@ -10,7 +10,6 @@
 //! never names an individual unlocker. To remove an unlocker, delete its module
 //! dir and its one line in [`all_unlockers`] — nothing else changes.
 
-pub mod error;
 pub mod scsi;
 
 mod ld;
@@ -91,21 +90,13 @@ pub enum UnlockError {
     Transport,
 }
 
-impl From<error::Error> for UnlockError {
-    fn from(e: error::Error) -> Self {
-        if e.is_transport_failure() {
-            UnlockError::Transport
-        } else {
-            // A logical firmware/handshake failure is not a dead bus — this
-            // unlocker simply didn't apply; the consumer falls through.
-            UnlockError::NotApplicable
-        }
-    }
-}
-
 /// An unlocker removes a drive-level bus-encryption barrier. Implementors are
 /// the self-contained modules in this crate; the consumer only ever sees the
-/// trait, via [`all_unlockers`].
+/// trait, via [`all_unlockers`]. (Each module owns its own conversion from its
+/// internal error to [`UnlockError`].)
+///
+/// NOTE: drive tuning (e.g. SET CD SPEED to lift riplock) is deliberately NOT
+/// here — that is the consumer's concern, not bus removal.
 pub trait Unlocker: Send + Sync {
     /// True if this unlocker applies to the given context (drive id + disc kind).
     fn matches(&self, ctx: &UnlockCtx) -> bool;
@@ -115,14 +106,6 @@ pub trait Unlocker: Send + Sync {
         scsi: &mut dyn ScsiTransport,
         ctx: &UnlockCtx,
     ) -> std::result::Result<Unlocked, UnlockError>;
-    /// Best-effort: raise the drive to its maximum read speed. Default no-op.
-    fn set_max_read_speed(
-        &self,
-        _scsi: &mut dyn ScsiTransport,
-        _ctx: &UnlockCtx,
-    ) -> error::Result<()> {
-        Ok(())
-    }
 }
 
 /// Every unlocker, in dispatch order (firmware → cert → css). This is the ONLY

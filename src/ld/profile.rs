@@ -1,6 +1,6 @@
 //! Drive profile loading and matching.
 
-use crate::error::{Error, Result};
+use crate::ld::error::{Error, Result};
 use serde::Deserialize;
 
 /// Top-level profiles file — keyed by chipset + variant.

@@ -18,6 +18,17 @@ pub struct ScsiResult {
     pub sense: [u8; 32],
 }
 
+/// A transport-layer SCSI failure (the command could not complete — bridge
+/// crash / disconnect), as opposed to a drive sense returned in [`ScsiResult`].
+#[derive(Debug, Clone)]
+pub struct ScsiError {
+    pub status: u8,
+    pub sense: Option<[u8; 32]>,
+}
+
+/// Transport-layer result.
+pub type Result<T> = std::result::Result<T, ScsiError>;
+
 /// The one capability an unlocker needs from the host: run a raw CDB. `Ok` even
 /// on a SCSI sense (inspect `status`); `Err` only on a transport-layer fault.
 pub trait ScsiTransport {
@@ -27,7 +38,7 @@ pub trait ScsiTransport {
         direction: DataDirection,
         data: &mut [u8],
         timeout_ms: u32,
-    ) -> crate::error::Result<ScsiResult>;
+    ) -> Result<ScsiResult>;
 }
 
 /// SCSI status byte for a transport-layer failure (bridge crash / disconnect).

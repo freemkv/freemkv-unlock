@@ -4,7 +4,7 @@ mod variant_a;
 mod variant_b;
 
 use super::PlatformDriver;
-use crate::error::{Error, Result};
+use crate::ld::error::{Error, Result};
 use crate::ld::profile::DriveProfile;
 use crate::scsi::{self, DataDirection, ScsiTransport};
 
@@ -414,7 +414,7 @@ mod tests {
             _dir: DataDirection,
             data: &mut [u8],
             _timeout_ms: u32,
-        ) -> Result<ScsiResult> {
+        ) -> crate::scsi::Result<ScsiResult> {
             let n = self.response.len().min(data.len());
             data[..n].copy_from_slice(&self.response[..n]);
             Ok(ScsiResult {
@@ -437,7 +437,7 @@ mod tests {
             _dir: DataDirection,
             _data: &mut [u8],
             _timeout_ms: u32,
-        ) -> Result<ScsiResult> {
+        ) -> crate::scsi::Result<ScsiResult> {
             self.cdbs.push(cdb.to_vec());
             // Empty response → do_unlock's signature check fails, so the unlock
             // loop exhausts — but the firmware-load CDBs (incl. the F1 verify)

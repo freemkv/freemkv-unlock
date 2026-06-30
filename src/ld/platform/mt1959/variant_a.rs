@@ -3,7 +3,7 @@
 //! WRITE_BUFFER (0x3B) → verify READ_BUFFER (0x45) → unlock × 2
 
 use super::Mt1959;
-use crate::error::Result;
+use crate::ld::error::Result;
 use crate::scsi::{DataDirection, ScsiTransport};
 
 use super::SCSI_WRITE_BUFFER;
@@ -17,7 +17,7 @@ const WRITE_BUFFER_MAX_LEN: usize = 0x00FF_FFFF;
 pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Result<()> {
     let firmware = &mt.profile.firmware;
     if firmware.is_empty() {
-        return Err(crate::error::Error::UnlockFailed);
+        return Err(crate::ld::error::Error::UnlockFailed);
     }
 
     // Upload firmware via WRITE_BUFFER. The CDB's length is a 24-bit field;
@@ -26,7 +26,7 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     // length-mismatched command.
     let len = firmware.len();
     if len > WRITE_BUFFER_MAX_LEN {
-        return Err(crate::error::Error::UnlockFailed);
+        return Err(crate::ld::error::Error::UnlockFailed);
     }
     let cdb = [
         SCSI_WRITE_BUFFER,

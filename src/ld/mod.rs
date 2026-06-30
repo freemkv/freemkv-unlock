@@ -7,10 +7,11 @@
 //! reporting the OEM Volume ID.
 
 mod cdb;
+mod error;
 mod platform;
 mod profile;
 
-use crate::error::Result;
+use crate::ld::error::Result;
 use crate::scsi::{DataDirection, ScsiTransport};
 use crate::{DriveId, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
@@ -122,21 +123,6 @@ impl Unlocker for LibreDrive {
             drive_unlocked: true,
         })
     }
-
-    /// Raise the drive to its max read speed via the matched profile's
-    /// `set_speed_max_cdb` (no-op if the profile carries none).
-    fn set_max_read_speed(&self, scsi: &mut dyn ScsiTransport, ctx: &UnlockCtx) -> Result<()> {
-        let Some(m) = profile::find_bundled(ctx.drive_id) else {
-            return Ok(());
-        };
-        let Some(cdb) = m.profile.set_speed_max_cdb else {
-            return Ok(());
-        };
-        let mut buf = [0u8; 0];
-        scsi.execute(&cdb, DataDirection::None, &mut buf, 5_000)?;
-        tracing::debug!(target: "freemkv::drive", phase = "set_max_read_speed", "issued SET CD SPEED (max) via unlocker");
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -164,7 +150,7 @@ mod tests {
             _dir: DataDirection,
             data: &mut [u8],
             _timeout_ms: u32,
-        ) -> Result<ScsiResult> {
+        ) -> crate::scsi::Result<ScsiResult> {
             let n = self.payload.len().min(data.len());
             data[..n].copy_from_slice(&self.payload[..n]);
             Ok(ScsiResult {
@@ -270,68 +256,5 @@ mod tests {
             )
             .expect_err("no profile → NotApplicable");
         assert_eq!(err, UnlockError::NotApplicable);
-    }
-
-    /// Records the CDB issued so the speed test can assert the exact CDB.
-    struct RecordingTransport {
-        last_cdb: Vec<u8>,
-        calls: usize,
-    }
-    impl ScsiTransport for RecordingTransport {
-        fn execute(
-            &mut self,
-            cdb: &[u8],
-            _dir: DataDirection,
-            _data: &mut [u8],
-            _timeout_ms: u32,
-        ) -> Result<ScsiResult> {
-            self.last_cdb = cdb.to_vec();
-            self.calls += 1;
-            Ok(ScsiResult {
-                status: 0,
-                bytes_transferred: 0,
-                sense: [0u8; 32],
-            })
-        }
-    }
-
-    /// A matched drive whose profile carries `set_speed_max_cdb` → that exact CDB.
-    #[test]
-    fn set_max_read_speed_issues_profile_cdb() {
-        let m = profile::find_bundled(&known_vid_drive_id()).expect("profile match");
-        let expected = m
-            .profile
-            .set_speed_max_cdb
-            .expect("test fixture drive must carry a set_speed_max_cdb");
-
-        let mut t = RecordingTransport {
-            last_cdb: Vec::new(),
-            calls: 0,
-        };
-        LibreDrive::new()
-            .set_max_read_speed(&mut t, &ctx(&known_vid_drive_id()))
-            .expect("set_max_read_speed ok");
-        assert_eq!(t.calls, 1, "exactly one CDB issued");
-        assert_eq!(
-            t.last_cdb,
-            expected.to_vec(),
-            "the profile's set_speed_max_cdb"
-        );
-    }
-
-    /// A drive with no matching profile → no-op: no CDB issued, Ok(()).
-    #[test]
-    fn set_max_read_speed_no_profile_is_noop() {
-        let mut t = RecordingTransport {
-            last_cdb: Vec::new(),
-            calls: 0,
-        };
-        LibreDrive::new()
-            .set_max_read_speed(
-                &mut t,
-                &ctx(&make_drive_id("FAKE-VND", "9.99", "XX12345", "")),
-            )
-            .expect("no-profile is a no-op Ok(())");
-        assert_eq!(t.calls, 0, "no profile → no CDB issued");
     }
 }
