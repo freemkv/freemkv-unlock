@@ -41,15 +41,41 @@ pub trait ScsiTransport {
     ) -> Result<ScsiResult>;
 }
 
+/// Parsed SCSI sense (the diagnostic an unlocker reads off a failed command).
+#[derive(Debug, Clone, Copy)]
+pub struct ScsiSense {
+    pub sense_key: u8,
+    pub asc: u8,
+    pub ascq: u8,
+}
+
+impl ScsiSense {
+    /// Parse the fixed-format sense buffer (key at byte 2, ASC at 12, ASCQ at 13).
+    pub fn from_buf(sense: &[u8; 32]) -> Self {
+        ScsiSense {
+            sense_key: sense[2] & 0x0F,
+            asc: sense[12],
+            ascq: sense[13],
+        }
+    }
+    /// ILLEGAL REQUEST (sense key 0x05) — the drive won't honor the command.
+    pub fn is_illegal_request(&self) -> bool {
+        self.sense_key == 0x05
+    }
+}
+
 /// SCSI status byte for a transport-layer failure (bridge crash / disconnect).
 pub(crate) const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
+/// SCSI status byte CHECK CONDITION (a drive sense is available).
+pub(crate) const SCSI_STATUS_CHECK_CONDITION: u8 = 0x02;
 
 // Common opcodes used by the unlocker modules.
-pub(crate) const SCSI_READ_CAPACITY: u8 = 0x25;
-pub(crate) const SCSI_WRITE_BUFFER: u8 = 0x3B;
-pub(crate) const SCSI_READ_BUFFER: u8 = 0x3C;
-pub(crate) const SCSI_MODE_SELECT: u8 = 0x55; // MODE SELECT (10)
 pub(crate) const SCSI_SET_CD_SPEED: u8 = 0xBB;
+pub(crate) const SCSI_SEND_KEY: u8 = 0xA3;
+pub(crate) const SCSI_REPORT_KEY: u8 = 0xA4;
+pub(crate) const SCSI_READ_DISC_STRUCTURE: u8 = 0xAD;
+/// AACS key class selector used in REPORT/SEND KEY CDBs.
+pub(crate) const AACS_KEY_CLASS: u8 = 0x02;
 
 /// Build a SET CD SPEED (0xBB) CDB requesting `read_speed` (KB/s; 0xFFFF = max).
 pub(crate) fn build_set_cd_speed(read_speed: u16) -> [u8; 12] {

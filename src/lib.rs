@@ -12,8 +12,8 @@
 
 pub mod scsi;
 
+mod aacs;
 mod ld;
-// mod aacs;  // stage 2 — AACS host-certificate handshake
 // mod css;   // stage 3 — CSS bus-auth
 
 use scsi::ScsiTransport;
@@ -41,8 +41,14 @@ pub enum DiscKind {
 /// these from its key sources and passes them in).
 #[derive(Debug, Clone)]
 pub struct HostCert {
+    /// AACS 1.0 host private key (20 bytes).
     pub private_key: [u8; 20],
+    /// AACS 1.0 host certificate (92 bytes).
     pub certificate: Vec<u8>,
+    /// AACS 2.0 host private key (P-256, 32 bytes). `None` for AACS 1.0 only.
+    pub private_key_v2: Option<[u8; 32]>,
+    /// AACS 2.0 host certificate (type 0x11). `None` for AACS 1.0 only.
+    pub certificate_v2: Option<Vec<u8>>,
 }
 
 /// Context handed to an unlocker: drive identity, disc kind, and (for the cert
@@ -114,7 +120,7 @@ pub trait Unlocker: Send + Sync {
 pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
     vec![
         Box::new(ld::LibreDrive::new()),
-        // Box::new(aacs::AacsCert::new()),   // stage 2
+        Box::new(aacs::AacsCert::new()),
         // Box::new(css::Css::new()),          // stage 3
     ]
 }
