@@ -3,7 +3,7 @@
 //! MODE SELECT (0x55) → read metadata → WRITE_BUFFER → vendor verify (0xF1) → unlock × 5+1
 
 use super::{Mt1959, SCSI_READ_BUFFER, SCSI_WRITE_BUFFER};
-use crate::error::Result;
+use crate::ld::error::Result;
 use crate::scsi::{DataDirection, ScsiTransport};
 
 const SCSI_MODE_SELECT: u8 = 0x55;
@@ -16,7 +16,7 @@ const VENDOR_VERIFY: [u8; 10] = [0xF1, 0x01, 0x02, 0x00, 0x0D, 0x30, 0x01, 0xF3,
 pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Result<()> {
     let firmware = &mt.profile.firmware;
     if firmware.is_empty() {
-        return Err(crate::error::Error::UnlockFailed);
+        return Err(crate::ld::error::Error::UnlockFailed);
     }
 
     // Step 1: Upload the firmware via MODE SELECT. The profile's `firmware` is
@@ -27,7 +27,7 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     // expressed in the CDB.
     let write_len = firmware.len();
     if write_len > u16::MAX as usize {
-        return Err(crate::error::Error::UnlockFailed);
+        return Err(crate::ld::error::Error::UnlockFailed);
     }
     let mode_select_cdb = [
         SCSI_MODE_SELECT,
