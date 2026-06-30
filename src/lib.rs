@@ -114,6 +114,13 @@ pub trait Unlocker: Send + Sync {
     ) -> std::result::Result<Unlocked, UnlockError>;
 }
 
+/// Name of the firmware unlocker that supports this drive (for drive-info "is
+/// this drive supported?" display), or `None`. A pure profile lookup — does NOT
+/// touch the drive or unlock anything.
+pub fn firmware_unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
+    ld::firmware_name(drive_id)
+}
+
 /// Every unlocker, in dispatch order (firmware → cert → css). This is the ONLY
 /// place an unlocker is named. Remove one = delete its line here + its module
 /// dir; the consumer never changes.

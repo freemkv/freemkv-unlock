@@ -34,6 +34,13 @@ impl Default for LibreDrive {
     }
 }
 
+/// The firmware-unlocker name for a drive that has a bundled profile (for
+/// drive-info "is this drive supported?" display), or `None`. A pure profile
+/// lookup — does NOT touch the drive or unlock anything.
+pub(crate) fn firmware_name(id: &DriveId) -> Option<&'static str> {
+    profile::find_bundled(id).map(|_| "LibreDrive")
+}
+
 impl LibreDrive {
     /// Read the OEM Volume ID via the matched profile's vendor CDB.
     ///
@@ -79,12 +86,12 @@ impl LibreDrive {
 }
 
 impl Unlocker for LibreDrive {
-    /// Applies when the drive matches a bundled firmware profile. Disc kind is
-    /// irrelevant — firmware unlock removes bus encryption at the drive for any
-    /// disc; it runs first, so a profiled drive is unlocked before the cert/CSS
-    /// unlockers are ever consulted.
+    /// Firmware unlock is a DRIVE-PREP concern: it runs before the disc kind is
+    /// probed (`kind == Unknown`) and keys off the drive identity. It must NOT
+    /// fire during the later content-keyed dispatch (Aacs/Css), or a DVD/Blu-ray
+    /// in a profiled drive would be re-firmware-unlocked.
     fn matches(&self, ctx: &UnlockCtx) -> bool {
-        profile::find_bundled(ctx.drive_id).is_some()
+        ctx.kind == crate::DiscKind::Unknown && profile::find_bundled(ctx.drive_id).is_some()
     }
 
     /// Firmware-unlock the drive and report its OEM Volume ID. The unlocked drive
