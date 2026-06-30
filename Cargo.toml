@@ -1,15 +1,14 @@
-# freemkv-unlock — unlocker plugins for libfreemkv.
-#
-# libfreemkv ships only the `Unlocker` trait + registry and stays firmware-clean.
-# Each member here is one concrete unlocker, registered into libfreemkv by a
-# single `register_unlocker(...)` line in the consuming binary — so dropping an
-# unlocker is deleting that one line plus the dependency (delete-to-comply).
-#
-# Members:
-#   ld   — LibreDrive (MediaTek MT1959 firmware unlock)
-#   aacs — AACS host-certificate bus-auth unlock (Blu-ray / UHD)
-#   css  — CSS (DVD-Video) bus-auth unlock
-#   (future unlockers go here as additional members)
-[workspace]
-resolver = "2"
-members = ["ld", "aacs", "css"]
+[package]
+name = "freemkv-unlock"
+version = "1.2.0"
+edition = "2024"
+rust-version = "1.86"
+license = "AGPL-3.0-only"
+description = "Unlock layer for the freemkv toolchain: the Unlocker contract + self-contained firmware/AACS/CSS unlocker modules. libfreemkv depends on this and dispatches via all_unlockers()."
+repository = "https://github.com/freemkv/freemkv-unlock"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22.1"
+tracing = "0.1"

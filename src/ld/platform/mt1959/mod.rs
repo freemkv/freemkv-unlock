@@ -5,7 +5,7 @@ mod variant_b;
 
 use super::PlatformDriver;
 use crate::error::{Error, Result};
-use crate::profile::DriveProfile;
+use crate::ld::profile::DriveProfile;
 use crate::scsi::{self, DataDirection, ScsiTransport};
 
 // ── Variant constants ──────────────────────────────────────────────────
@@ -397,7 +397,7 @@ impl PlatformDriver for Mt1959 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{DriveProfile, Identity};
+    use crate::ld::profile::{DriveProfile, Identity};
     use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
 
     /// Minimal mock transport that returns a scripted response to the
