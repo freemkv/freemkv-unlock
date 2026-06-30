@@ -7,6 +7,12 @@ license = "AGPL-3.0-only"
 description = "Unlock layer for the freemkv toolchain: the Unlocker contract + self-contained firmware/AACS/CSS unlocker modules. libfreemkv depends on this and dispatches via all_unlockers()."
 repository = "https://github.com/freemkv/freemkv-unlock"
 
+[features]
+# Off by default. Exposes ld's unlock-handshake wire format (`UNLOCK_MARKER`,
+# `is_unlock_read_buffer`) for the bdemu test-emulator, which impersonates an
+# ld-unlockable drive. Real clients never enable it and keep the generic API.
+emulation = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

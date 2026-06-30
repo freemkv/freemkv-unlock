@@ -6,6 +6,11 @@
 //! encryption AT THE DRIVE (the unlocked drive serves clear content) and
 //! reporting the OEM Volume ID.
 
+// `cdb` carries ONLY the unlock-handshake wire format that the bdemu emulator
+// needs (the real unlocker drives its CDBs from per-drive profile templates, not
+// these constants). Compile it only when the `emulation` feature exposes it, so
+// it never dead-codes in a normal build.
+#[cfg(feature = "emulation")]
 mod cdb;
 mod error;
 mod platform;
@@ -15,22 +20,48 @@ use crate::ld::error::Result;
 use crate::scsi::{DataDirection, ScsiTransport};
 use crate::{DriveId, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
-/// The LibreDrive unlocker.
+// ── Public profile catalog ──────────────────────────────────────────────────
+//
+// The catalog of drives the LibreDrive unlocker recognizes is the one piece of
+// ld worth exposing publicly: it answers "is this drive supported?" without
+// unlocking, and the bdemu test-emulator reads it to impersonate a supported
+// drive. The unlock *mechanism* (firmware blobs, upload sequence, CDB wire
+// format) stays private — only the catalog and its match result are public.
+
+pub use profile::{DriveProfile as Profile, Identity, Platform, ProfileMatch, Profiles};
+
+/// The bundled LibreDrive profile catalog (parsed once, process-cached), or
+/// `None` if the embedded JSON fails to parse (a build-time bug). Pair with
+/// [`Profiles::get`] to look up a specific drive:
+/// `freemkv_unlock::ld::profiles().and_then(|p| p.get(&drive_id))`.
+pub fn profiles() -> Option<&'static Profiles> {
+    profile::bundled()
+}
+
+/// The bundled profile matching a drive identity, if the drive is supported.
+/// Convenience over [`profiles`] + [`Profiles::get`].
+pub fn profile(drive_id: &DriveId) -> Option<ProfileMatch> {
+    profile::find_bundled(drive_id)
+}
+
+/// The unlock-handshake wire format the bdemu test-emulator needs to impersonate
+/// an ld-unlockable drive: the marker an unlocked drive returns and the
+/// READ BUFFER mode/buf-id that constitutes an unlock request. Behind the
+/// non-default `emulation` feature so real clients never see ld's wire format.
+#[cfg(feature = "emulation")]
+pub use cdb::{UNLOCK_MARKER, is_unlock_read_buffer};
+
+/// The LibreDrive unlocker. `pub(crate)` — clients reach it only through
+/// [`crate::all_unlockers`], never by name (the locked-design contract).
 ///
 /// Matches a drive against the bundled profile database and, on a hit,
 /// runs the MediaTek MT1959 firmware-unlock (and disc-speed calibration)
 /// handshake over the raw SCSI transport.
-pub struct LibreDrive;
+pub(crate) struct LibreDrive;
 
 impl LibreDrive {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LibreDrive
-    }
-}
-
-impl Default for LibreDrive {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

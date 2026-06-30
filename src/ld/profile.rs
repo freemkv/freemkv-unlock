@@ -3,15 +3,26 @@
 use crate::ld::error::{Error, Result};
 use serde::Deserialize;
 
-/// Top-level profiles file — keyed by chipset + variant.
+/// The LibreDrive profile catalog — the set of optical drives the firmware
+/// unlocker recognizes, keyed by chipset + variant. Loaded from the bundled
+/// JSON; the public entry point is [`crate::ld::profiles`].
 #[derive(Debug, Deserialize)]
-pub struct ProfilesFile {
+pub struct Profiles {
     #[serde(default)]
     pub mt1959_a: Vec<DriveProfile>,
     #[serde(default)]
     pub mt1959_b: Vec<DriveProfile>,
     #[serde(default)]
     pub renesas: Vec<DriveProfile>,
+}
+
+impl Profiles {
+    /// The profile matching a drive identity, if this catalog supports that
+    /// drive. Two-pass per platform section: exact (incl. firmware date) then a
+    /// looser vendor/revision/vendor-specific match. See [`find_by_drive_id`].
+    pub fn get(&self, drive_id: &crate::DriveId) -> Option<ProfileMatch> {
+        find_by_drive_id(self, drive_id)
+    }
 }
 
 /// Drive identity — matched against INQUIRY data.
@@ -235,12 +246,11 @@ where
 
 const BUNDLED_PROFILES: &str = include_str!("profiles.json");
 
-/// Parse the bundled profiles fresh into an owned [`ProfilesFile`].
-///
-/// Re-parses the embedded JSON (~800 KB) on every call; prefer
-/// [`bundled`] for the hot path, which parses once and caches. This
-/// owned form is kept for callers that need a mutable / independent copy.
-pub fn load_bundled() -> Result<ProfilesFile> {
+/// Parse the bundled profiles fresh into an owned [`Profiles`]. Test-only — the
+/// library hot path uses the cached [`bundled`]; tests use this owned form for
+/// independent copies.
+#[cfg(test)]
+pub fn load_bundled() -> Result<Profiles> {
     load_from_str(BUNDLED_PROFILES)
 }
 
@@ -250,9 +260,9 @@ pub fn load_bundled() -> Result<ProfilesFile> {
 /// Returns `None` if the embedded JSON fails to parse (a build-time bug —
 /// the bundled blob is fixed at compile time, so the first successful call
 /// guarantees all later calls succeed too).
-pub fn bundled() -> Option<&'static ProfilesFile> {
+pub fn bundled() -> Option<&'static Profiles> {
     use std::sync::OnceLock;
-    static CACHE: OnceLock<Option<ProfilesFile>> = OnceLock::new();
+    static CACHE: OnceLock<Option<Profiles>> = OnceLock::new();
     CACHE
         .get_or_init(|| load_from_str(BUNDLED_PROFILES).ok())
         .as_ref()
@@ -267,7 +277,7 @@ pub fn find_bundled(drive_id: &crate::DriveId) -> Option<ProfileMatch> {
     find_by_drive_id(bundled()?, drive_id)
 }
 
-fn load_from_str(data: &str) -> Result<ProfilesFile> {
+fn load_from_str(data: &str) -> Result<Profiles> {
     serde_json::from_str(data).map_err(|_| Error::ProfileParse)
 }
 
@@ -281,7 +291,7 @@ fn load_from_str(data: &str) -> Result<ProfilesFile> {
 /// on file still match a same-model profile. All comparisons are
 /// whitespace-trimmed. Returns the first section that yields a match.
 pub fn find_by_drive_id(
-    profiles: &ProfilesFile,
+    profiles: &Profiles,
     drive_id: &crate::DriveId,
 ) -> Option<ProfileMatch> {
     let v = drive_id.vendor_id.trim();
@@ -374,11 +384,11 @@ mod tests {
     fn bundled_is_cached_and_matches_fresh_parse() {
         let cached = bundled().expect("bundled profiles parse");
         let fresh = load_bundled().unwrap();
-        // Same data either way (compare section sizes — ProfilesFile isn't Eq).
+        // Same data either way (compare section sizes — Profiles isn't Eq).
         assert_eq!(cached.mt1959_a.len(), fresh.mt1959_a.len());
         // Cached accessor returns a stable address across calls.
-        let a = bundled().unwrap() as *const ProfilesFile;
-        let b = bundled().unwrap() as *const ProfilesFile;
+        let a = bundled().unwrap() as *const Profiles;
+        let b = bundled().unwrap() as *const Profiles;
         assert_eq!(a, b);
     }
 
@@ -449,7 +459,7 @@ mod tests {
 
     /// find_by_drive_id: exact match (including firmware_date) wins over loose match.
     /// Spec: two-pass — first an exact match including firmware_date, then looser.
-    /// Build two synthetic ProfilesFile entries that differ only by firmware_date,
+    /// Build two synthetic Profiles entries that differ only by firmware_date,
     /// and verify the correct one is selected.
     /// Mutation: doing only the loose pass would return the first entry regardless of date.
     #[test]
@@ -483,7 +493,7 @@ mod tests {
             ]
         })
         .to_string();
-        let profiles: ProfilesFile = serde_json::from_str(&profiles_json).unwrap();
+        let profiles: Profiles = serde_json::from_str(&profiles_json).unwrap();
 
         // "TESTDRV " (with space) fills 8 bytes; trim() → "TESTDRV" on both sides.
         let id_date1 = make_drive_id("TESTDRV ", "1.00", "XX00000", "200001010000");
@@ -528,7 +538,7 @@ mod tests {
             ]
         })
         .to_string();
-        let profiles: ProfilesFile = serde_json::from_str(&profiles_json).unwrap();
+        let profiles: Profiles = serde_json::from_str(&profiles_json).unwrap();
 
         // Drive with an unknown firmware date — no exact match, loose match should work.
         // "LOOSEDR " fills 8 bytes; "000000000000" is the unknown date.
@@ -542,11 +552,11 @@ mod tests {
     }
 
     /// load_from_str (via load_bundled) returns ProfileParse on invalid JSON.
-    /// Mutation: returning an empty ProfilesFile instead of an error silently
+    /// Mutation: returning an empty Profiles instead of an error silently
     ///           leaves the drive-profile database empty.
     #[test]
     fn load_from_str_returns_profile_parse_on_bad_json() {
-        let result: Result<ProfilesFile> =
+        let result: Result<Profiles> =
             serde_json::from_str("not valid json {{{{").map_err(|_| Error::ProfileParse);
         assert!(matches!(result, Err(Error::ProfileParse)));
     }
@@ -586,7 +596,7 @@ mod tests {
             ]
         })
         .to_string();
-        let profiles: ProfilesFile = serde_json::from_str(&json_str).unwrap();
+        let profiles: Profiles = serde_json::from_str(&json_str).unwrap();
         let p = &profiles.mt1959_a[0]; // DriveProfile directly
         // All optional CDB fields must be None when absent from JSON.
         assert!(
@@ -637,7 +647,7 @@ mod tests {
             ]
         })
         .to_string();
-        let profiles: ProfilesFile = serde_json::from_str(&json_str).unwrap();
+        let profiles: Profiles = serde_json::from_str(&json_str).unwrap();
         assert_eq!(
             profiles.mt1959_a[0].signature, [0u8; 4],
             "empty signature must deserialise as [0;4]"
