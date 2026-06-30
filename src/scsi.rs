@@ -74,6 +74,7 @@ pub(crate) const SCSI_SET_CD_SPEED: u8 = 0xBB;
 pub(crate) const SCSI_SEND_KEY: u8 = 0xA3;
 pub(crate) const SCSI_REPORT_KEY: u8 = 0xA4;
 pub(crate) const SCSI_READ_DISC_STRUCTURE: u8 = 0xAD;
+pub(crate) const SCSI_GET_CONFIGURATION: u8 = 0x46;
 /// AACS key class selector used in REPORT/SEND KEY CDBs.
 pub(crate) const AACS_KEY_CLASS: u8 = 0x02;
 
