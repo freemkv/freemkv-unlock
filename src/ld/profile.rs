@@ -233,7 +233,7 @@ where
 
 // ── Loading ────────────────────────────────────────────────────────────
 
-const BUNDLED_PROFILES: &str = include_str!("../profiles.json");
+const BUNDLED_PROFILES: &str = include_str!("profiles.json");
 
 /// Parse the bundled profiles fresh into an owned [`ProfilesFile`].
 ///
@@ -263,7 +263,7 @@ pub fn bundled() -> Option<&'static ProfilesFile> {
 /// Convenience wrapper over [`bundled`] + [`find_by_drive_id`] that skips
 /// the per-call re-parse. Returns `None` if no profile matches (or, in the
 /// build-bug case, if the bundled JSON failed to parse).
-pub fn find_bundled(drive_id: &libfreemkv::DriveId) -> Option<ProfileMatch> {
+pub fn find_bundled(drive_id: &crate::DriveId) -> Option<ProfileMatch> {
     find_by_drive_id(bundled()?, drive_id)
 }
 
@@ -282,7 +282,7 @@ fn load_from_str(data: &str) -> Result<ProfilesFile> {
 /// whitespace-trimmed. Returns the first section that yields a match.
 pub fn find_by_drive_id(
     profiles: &ProfilesFile,
-    drive_id: &libfreemkv::DriveId,
+    drive_id: &crate::DriveId,
 ) -> Option<ProfileMatch> {
     let v = drive_id.vendor_id.trim();
     let r = drive_id.product_revision.trim();
@@ -324,15 +324,15 @@ pub fn find_by_drive_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libfreemkv::DriveId;
+    use crate::DriveId;
 
     fn make_drive_id(vendor: &str, rev: &str, vs: &str, date: &str) -> DriveId {
-        let mut inquiry = vec![0u8; 96];
-        inquiry[8..8 + vendor.len().min(8)]
-            .copy_from_slice(&vendor.as_bytes()[..vendor.len().min(8)]);
-        inquiry[32..32 + rev.len().min(4)].copy_from_slice(&rev.as_bytes()[..rev.len().min(4)]);
-        inquiry[36..36 + vs.len().min(7)].copy_from_slice(&vs.as_bytes()[..vs.len().min(7)]);
-        DriveId::from_inquiry(&inquiry, date)
+        DriveId {
+            vendor_id: vendor.to_string(),
+            product_revision: rev.to_string(),
+            vendor_specific: vs.to_string(),
+            firmware_date: date.to_string(),
+        }
     }
 
     #[test]
