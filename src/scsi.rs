@@ -66,7 +66,10 @@ impl ScsiSense {
 
 /// SCSI status byte for a transport-layer failure (bridge crash / disconnect).
 pub(crate) const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
-/// SCSI status byte CHECK CONDITION (a drive sense is available).
+/// SCSI status byte CHECK CONDITION (a drive sense is available). Part of the
+/// status contract; currently referenced only by tests asserting the
+/// transport-vs-check-condition distinction.
+#[allow(dead_code)]
 pub(crate) const SCSI_STATUS_CHECK_CONDITION: u8 = 0x02;
 
 // Common opcodes used by the unlocker modules.

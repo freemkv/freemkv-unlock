@@ -14,7 +14,13 @@ pub mod scsi;
 
 mod aacs;
 mod css;
-mod ld;
+// `ld` is public ONLY for its drive-profile catalog (`ld::profiles` / the
+// `Profiles` object) and, under the `emulation` feature, the unlock-handshake
+// wire format the bdemu test-emulator needs. The unlocker impl itself
+// (`LibreDrive`) is `pub(crate)` — clients still reach unlockers only through
+// [`all_unlockers`]. `aacs` and `css` carry no such public catalog, so they
+// stay fully private.
+pub mod ld;
 
 use scsi::ScsiTransport;
 
@@ -114,10 +120,12 @@ pub trait Unlocker: Send + Sync {
     ) -> std::result::Result<Unlocked, UnlockError>;
 }
 
-/// Name of the firmware unlocker that supports this drive (for drive-info "is
-/// this drive supported?" display), or `None`. A pure profile lookup — does NOT
-/// touch the drive or unlock anything.
-pub fn firmware_unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
+/// Name of the unlocker that claims this drive by identity (for drive-info "is
+/// this drive supported?" display), or `None`. A pure lookup — does NOT touch
+/// the drive or unlock anything. Only the identity-keyed (drive-prep) unlocker
+/// can answer from a `DriveId` alone; the disc-kind-keyed unlockers (AACS / CSS)
+/// don't claim a drive sight-unseen, so they never match here.
+pub fn unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
     ld::firmware_name(drive_id)
 }
 

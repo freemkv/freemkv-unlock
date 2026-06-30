@@ -1350,7 +1350,7 @@ mod tests {
         // A transport wedge mid-handshake must NOT be reported as a cert/key
         // rejection — the operator needs to see the real (replug) cause, not
         // be sent down a keydb/host-cert rabbit hole.
-        let transport = Error::ScsiError {
+        let transport = Error::Scsi {
             opcode: 0xA3, // SEND KEY
             status: SCSI_STATUS_TRANSPORT_FAILURE,
             sense: None,
@@ -1363,7 +1363,7 @@ mod tests {
 
         // A genuine SCSI rejection (CHECK CONDITION) IS the drive saying no, so
         // it maps to the handshake-specific code as before.
-        let rejected = Error::ScsiError {
+        let rejected = Error::Scsi {
             opcode: 0xA3,
             status: SCSI_STATUS_CHECK_CONDITION,
             sense: Some(crate::scsi::ScsiSense {
