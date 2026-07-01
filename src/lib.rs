@@ -121,15 +121,6 @@ pub trait Unlocker: Send + Sync {
     /// whether to RUN it.
     fn matches(&self, ctx: &UnlockCtx) -> bool;
 
-    /// Report-only: would this unlocker apply to this drive + disc, for a
-    /// user-facing unlocker matrix? Distinct from [`matches`](Unlocker::matches),
-    /// which is phase-gated (e.g. the drive-prep unlocker only `matches` at the
-    /// Unknown-kind init phase). Default: same as `matches`; the drive-keyed
-    /// unlocker overrides it to report on drive identity regardless of disc kind.
-    fn applies_to(&self, ctx: &UnlockCtx) -> bool {
-        self.matches(ctx)
-    }
-
     /// Remove the bus-encryption barrier, returning what was learned.
     fn unlock(
         &self,
