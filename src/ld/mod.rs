@@ -125,6 +125,33 @@ impl Unlocker for LibreDrive {
         ctx.kind == crate::DiscKind::Unknown && profile::find_bundled(ctx.drive_id).is_some()
     }
 
+    /// Lift riplock on a profiled drive with STOCK MMC commands — no firmware
+    /// unlock, so it is safe for ANY disc including a CSS DVD (which must stay in
+    /// stock mode). We issue SET STREAMING (0xB6) — the modern command a slot-
+    /// loading BD combo honors when it ignores the legacy SET CD SPEED — and then
+    /// SET CD SPEED (0xBB) as a fallback for drives that only take the old one.
+    /// Self-gating: no bundled profile → no-op. Best-effort throughout: a drive
+    /// that rejects either command still rips, just slower, so every error is
+    /// swallowed (including a transport fault — the real reads that follow will
+    /// surface a dead bus).
+    fn apply_drive_features(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        ctx: &UnlockCtx,
+    ) -> std::result::Result<(), UnlockError> {
+        if profile::find_bundled(ctx.drive_id).is_none() {
+            return Ok(());
+        }
+        // SET STREAMING (max): CDB + 28-byte performance descriptor data-out.
+        let (cdb, mut descriptor) = crate::scsi::build_set_streaming(0xFFFF_FFFF);
+        let _ = scsi.execute(&cdb, DataDirection::ToDevice, &mut descriptor, 5_000);
+        // SET CD SPEED (max): no data-out.
+        let cdb = crate::scsi::build_set_cd_speed(0xFFFF);
+        let mut empty = [0u8; 0];
+        let _ = scsi.execute(&cdb, DataDirection::None, &mut empty, 5_000);
+        Ok(())
+    }
+
     /// Firmware-unlock the drive and report its OEM Volume ID. The unlocked drive
     /// serves CLEAR content, so `drive_unlocked: true` and there is no bus key.
     ///
@@ -294,5 +321,61 @@ mod tests {
             )
             .expect_err("no profile → NotApplicable");
         assert_eq!(err, UnlockError::NotApplicable);
+    }
+
+    /// A transport that records the opcode of every CDB it is handed.
+    struct RecordingTransport {
+        opcodes: Vec<u8>,
+    }
+    impl ScsiTransport for RecordingTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            _data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::scsi::Result<ScsiResult> {
+            self.opcodes.push(cdb[0]);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: 0,
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    /// A profiled drive gets the stock speed commands (SET STREAMING first, then
+    /// SET CD SPEED) — the riplock lift, for any disc.
+    #[test]
+    fn drive_features_issues_stock_speed_commands_on_profiled_drive() {
+        let mut t = RecordingTransport { opcodes: vec![] };
+        LibreDrive::new()
+            .apply_drive_features(&mut t, &ctx(&known_vid_drive_id()))
+            .expect("best-effort ok");
+        assert!(
+            t.opcodes.contains(&crate::scsi::SCSI_SET_STREAMING),
+            "SET STREAMING (0xB6) issued"
+        );
+        assert!(
+            t.opcodes.contains(&crate::scsi::SCSI_SET_CD_SPEED),
+            "SET CD SPEED (0xBB) issued"
+        );
+    }
+
+    /// An unrecognised drive: drive-features is a no-op (self-gating), so the
+    /// consumer can call it on every unlocker without side effects.
+    #[test]
+    fn drive_features_is_noop_on_unprofiled_drive() {
+        let mut t = RecordingTransport { opcodes: vec![] };
+        LibreDrive::new()
+            .apply_drive_features(
+                &mut t,
+                &ctx(&make_drive_id("FAKE-VND", "9.99", "XX12345", "")),
+            )
+            .expect("best-effort ok");
+        assert!(
+            t.opcodes.is_empty(),
+            "no commands issued for an unrecognised drive"
+        );
     }
 }

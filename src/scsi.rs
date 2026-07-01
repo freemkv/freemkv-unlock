@@ -74,6 +74,7 @@ pub(crate) const SCSI_STATUS_CHECK_CONDITION: u8 = 0x02;
 
 // Common opcodes used by the unlocker modules.
 pub(crate) const SCSI_SET_CD_SPEED: u8 = 0xBB;
+pub(crate) const SCSI_SET_STREAMING: u8 = 0xB6;
 pub(crate) const SCSI_SEND_KEY: u8 = 0xA3;
 pub(crate) const SCSI_REPORT_KEY: u8 = 0xA4;
 pub(crate) const SCSI_READ_DISC_STRUCTURE: u8 = 0xAD;
@@ -97,4 +98,84 @@ pub(crate) fn build_set_cd_speed(read_speed: u16) -> [u8; 12] {
         0x00,
         0x00,
     ]
+}
+
+/// Length of a SET STREAMING Performance Descriptor (MMC-6 §6.42).
+pub(crate) const SET_STREAMING_DESCRIPTOR_LEN: usize = 28;
+
+/// Build a SET STREAMING (0xB6) CDB + its 28-byte Performance Descriptor
+/// requesting maximum read performance across the whole disc. This is the modern
+/// riplock lift: many drives (notably slot-loading BD combos over a USB bridge)
+/// ignore the legacy SET CD SPEED (0xBB) but honor SET STREAMING, and unlike a
+/// firmware unlock it is a STOCK MMC command — safe to issue on a non-unlocked
+/// drive, so it never disturbs stock CSS auth.
+///
+/// `read_kbps` is the requested read size per 1000 ms window; `0xFFFF_FFFF` asks
+/// the drive for its maximum. Returns `(cdb, descriptor)`; the caller sends the
+/// descriptor as the CDB's data-out payload. The CDB's Parameter List Length
+/// (bytes 9–10, big-endian) is the descriptor length.
+pub(crate) fn build_set_streaming(
+    read_kbps: u32,
+) -> ([u8; 12], [u8; SET_STREAMING_DESCRIPTOR_LEN]) {
+    let len = SET_STREAMING_DESCRIPTOR_LEN as u16;
+    let cdb = [
+        SCSI_SET_STREAMING,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        (len >> 8) as u8, // Parameter List Length (MSB)
+        len as u8,        // Parameter List Length (LSB)
+        0x00,
+    ];
+    let mut d = [0u8; SET_STREAMING_DESCRIPTOR_LEN];
+    // byte 0: flags — RDD=0 (SET performance, don't restore defaults), Exact=0,
+    // RA=0. bytes 1–3 reserved.
+    // bytes 4..8: Start LBA = 0.
+    // bytes 8..12: End LBA = 0xFFFFFFFF (apply across the whole disc).
+    d[8..12].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+    // bytes 12..16: Read Size (kB per Read Time window).
+    d[12..16].copy_from_slice(&read_kbps.to_be_bytes());
+    // bytes 16..20: Read Time = 1000 ms.
+    d[16..20].copy_from_slice(&1000u32.to_be_bytes());
+    // bytes 20..24 / 24..28: Write Size / Write Time (mirror read; unused for a
+    // read-only rip but the descriptor requires them).
+    d[20..24].copy_from_slice(&read_kbps.to_be_bytes());
+    d[24..28].copy_from_slice(&1000u32.to_be_bytes());
+    (cdb, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SET STREAMING (0xB6) wire format: opcode, the 28-byte Parameter List
+    /// Length in CDB bytes 9–10, and the max-speed performance descriptor
+    /// (whole-disc End LBA + the requested read size).
+    #[test]
+    fn set_streaming_cdb_layout() {
+        let (cdb, d) = build_set_streaming(0xFFFF_FFFF);
+        assert_eq!(cdb[0], SCSI_SET_STREAMING);
+        assert_eq!(
+            u16::from_be_bytes([cdb[9], cdb[10]]) as usize,
+            SET_STREAMING_DESCRIPTOR_LEN,
+            "param list length = descriptor length"
+        );
+        assert_eq!(d.len(), SET_STREAMING_DESCRIPTOR_LEN);
+        assert_eq!(&d[8..12], &[0xFF, 0xFF, 0xFF, 0xFF], "whole-disc End LBA");
+        assert_eq!(
+            u32::from_be_bytes([d[12], d[13], d[14], d[15]]),
+            0xFFFF_FFFF,
+            "read size requests max"
+        );
+        assert_eq!(
+            u32::from_be_bytes([d[16], d[17], d[18], d[19]]),
+            1000,
+            "read time window = 1000 ms"
+        );
+    }
 }
