@@ -102,16 +102,39 @@ pub enum UnlockError {
     Transport,
 }
 
-/// An unlocker removes a drive-level bus-encryption barrier. Implementors are
-/// the self-contained modules in this crate; the consumer only ever sees the
-/// trait, via [`all_unlockers`]. (Each module owns its own conversion from its
-/// internal error to [`UnlockError`].)
+/// An unlocker provides drive/disc capabilities: **drive features** (speed /
+/// riplock lift — a property of the DRIVE, applied for any disc) and **bus
+/// removal** (AACS bus-decrypt + VID, or a CSS handshake — gated on the disc).
+/// Implementors are the self-contained modules in this crate; the consumer only
+/// ever sees the trait, via [`all_unlockers`]. (Each module owns its own
+/// conversion from its internal error to [`UnlockError`].)
 ///
-/// NOTE: drive tuning (e.g. SET CD SPEED to lift riplock) is deliberately NOT
-/// here — that is the consumer's concern, not bus removal.
+/// The two capabilities are independent so a disc can take one without the
+/// other. A CSS DVD, for example, wants a matched drive's [`apply_drive_features`]
+/// (speed) but must NOT take its firmware bus-unlock, which would break stock CSS
+/// auth. Keeping them separate lets the consumer apply only what the current
+/// (drive, disc) context needs.
+///
+/// [`apply_drive_features`]: Unlocker::apply_drive_features
 pub trait Unlocker: Send + Sync {
-    /// True if this unlocker applies to the given context (drive id + disc kind).
+    /// True if this unlocker's bus-removal [`unlock`](Unlocker::unlock) applies to
+    /// the given context (drive id + disc kind).
     fn matches(&self, ctx: &UnlockCtx) -> bool;
+
+    /// Apply drive-level feature tuning (max read speed / riplock lift) that this
+    /// unlocker enables purely by virtue of the DRIVE — **safe for any disc,
+    /// touches no bus encryption**. Self-gating: an unlocker that doesn't
+    /// recognise the drive returns `Ok(())` (a no-op), so the consumer can call
+    /// this on every unlocker regardless of disc kind. Best-effort: a rejected
+    /// command must NOT fail the rip (a slow drive still rips). Default: no-op.
+    fn apply_drive_features(
+        &self,
+        _scsi: &mut dyn ScsiTransport,
+        _ctx: &UnlockCtx,
+    ) -> std::result::Result<(), UnlockError> {
+        Ok(())
+    }
+
     /// Remove the bus-encryption barrier, returning what was learned.
     fn unlock(
         &self,
