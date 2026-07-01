@@ -160,6 +160,10 @@ impl Default for CssUnlocker {
 }
 
 impl crate::Unlocker for CssUnlocker {
+    fn name(&self) -> &'static str {
+        "CSS"
+    }
+
     fn matches(&self, ctx: &crate::UnlockCtx) -> bool {
         ctx.kind == crate::DiscKind::Css
     }
