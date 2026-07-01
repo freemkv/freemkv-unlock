@@ -129,14 +129,6 @@ impl Unlocker for LibreDrive {
         ctx.kind == crate::DiscKind::Unknown && profile::find_bundled(ctx.drive_id).is_some()
     }
 
-    /// For the report, the drive unlocker applies whenever it recognises the
-    /// DRIVE — independent of disc kind (its live `matches` is gated to the
-    /// Unknown-kind init phase, which would falsely read "no" once the disc kind
-    /// is known).
-    fn applies_to(&self, ctx: &UnlockCtx) -> bool {
-        profile::find_bundled(ctx.drive_id).is_some()
-    }
-
     /// Firmware-unlock the drive and report its OEM Volume ID. The unlocked drive
     /// serves CLEAR content, so `drive_unlocked: true` and there is no bus key.
     ///
