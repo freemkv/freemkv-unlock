@@ -110,8 +110,26 @@ pub enum UnlockError {
 /// NOTE: drive tuning (e.g. SET CD SPEED to lift riplock) is deliberately NOT
 /// here — that is the consumer's concern, not bus removal.
 pub trait Unlocker: Send + Sync {
-    /// True if this unlocker applies to the given context (drive id + disc kind).
+    /// Short, stable identifier for this unlocker (e.g. "LibreDrive", "AACS",
+    /// "CSS"). The ONE place a name lives — apps render the unlocker report from
+    /// [`all_unlockers`], never hardcoding names, so adding/removing an unlocker
+    /// updates every report with no app change.
+    fn name(&self) -> &'static str;
+
+    /// True if this unlocker applies to the given context (drive id + disc kind)
+    /// during live dispatch — the gate [`crate::all_unlockers`] uses to decide
+    /// whether to RUN it.
     fn matches(&self, ctx: &UnlockCtx) -> bool;
+
+    /// Report-only: would this unlocker apply to this drive + disc, for a
+    /// user-facing unlocker matrix? Distinct from [`matches`](Unlocker::matches),
+    /// which is phase-gated (e.g. the drive-prep unlocker only `matches` at the
+    /// Unknown-kind init phase). Default: same as `matches`; the drive-keyed
+    /// unlocker overrides it to report on drive identity regardless of disc kind.
+    fn applies_to(&self, ctx: &UnlockCtx) -> bool {
+        self.matches(ctx)
+    }
+
     /// Remove the bus-encryption barrier, returning what was learned.
     fn unlock(
         &self,
