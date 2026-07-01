@@ -290,10 +290,7 @@ fn load_from_str(data: &str) -> Result<Profiles> {
 /// profile; the looser pass lets a drive whose firmware date we don't have
 /// on file still match a same-model profile. All comparisons are
 /// whitespace-trimmed. Returns the first section that yields a match.
-pub fn find_by_drive_id(
-    profiles: &Profiles,
-    drive_id: &crate::DriveId,
-) -> Option<ProfileMatch> {
+pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Option<ProfileMatch> {
     let v = drive_id.vendor_id.trim();
     let r = drive_id.product_revision.trim();
     let vs = drive_id.vendor_specific.trim();

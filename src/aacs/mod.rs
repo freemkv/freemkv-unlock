@@ -44,6 +44,10 @@ impl Default for AacsCert {
 }
 
 impl Unlocker for AacsCert {
+    fn name(&self) -> &'static str {
+        "AACS"
+    }
+
     fn matches(&self, ctx: &UnlockCtx) -> bool {
         ctx.kind == DiscKind::Aacs
     }

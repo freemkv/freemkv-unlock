@@ -121,8 +121,20 @@ impl Unlocker for LibreDrive {
     /// probed (`kind == Unknown`) and keys off the drive identity. It must NOT
     /// fire during the later content-keyed dispatch (Aacs/Css), or a DVD/Blu-ray
     /// in a profiled drive would be re-firmware-unlocked.
+    fn name(&self) -> &'static str {
+        "LibreDrive"
+    }
+
     fn matches(&self, ctx: &UnlockCtx) -> bool {
         ctx.kind == crate::DiscKind::Unknown && profile::find_bundled(ctx.drive_id).is_some()
+    }
+
+    /// For the report, the drive unlocker applies whenever it recognises the
+    /// DRIVE — independent of disc kind (its live `matches` is gated to the
+    /// Unknown-kind init phase, which would falsely read "no" once the disc kind
+    /// is known).
+    fn applies_to(&self, ctx: &UnlockCtx) -> bool {
+        profile::find_bundled(ctx.drive_id).is_some()
     }
 
     /// Firmware-unlock the drive and report its OEM Volume ID. The unlocked drive
