@@ -48,15 +48,17 @@ impl Unlocker for AacsCert {
         "AACS"
     }
 
-    fn matches(&self, ctx: &UnlockCtx) -> bool {
-        ctx.kind == DiscKind::Aacs
-    }
-
-    fn unlock(
+    /// AACS removes BUS encryption via the host-cert handshake; it provides no
+    /// drive features. Self-guards on the disc kind (the consumer iterates every
+    /// unlocker's `unlock_bus`, so a non-AACS disc must decline here).
+    fn unlock_bus(
         &self,
         scsi: &mut dyn ScsiTransport,
         ctx: &UnlockCtx,
     ) -> std::result::Result<Unlocked, UnlockError> {
+        if ctx.kind != DiscKind::Aacs {
+            return Err(UnlockError::NotApplicable);
+        }
         if ctx.host_certs.is_empty() {
             // No host cert to authenticate with — the consumer falls back to a
             // VID-less / keysource path.
@@ -81,18 +83,29 @@ mod tests {
         crate::DriveId::default()
     }
 
-    /// AacsCert matches only `DiscKind::Aacs`.
+    /// `unlock_bus` self-guards on the disc kind: on a non-AACS disc it declines
+    /// (`NotApplicable`) WITHOUT touching the transport, so iterating it on a
+    /// CSS/unknown disc is safe.
     #[test]
-    fn matches_only_aacs_kind() {
-        let id = id();
-        let u = AacsCert::new();
-        for k in [DiscKind::Unknown, DiscKind::Unencrypted, DiscKind::Css] {
-            assert!(
-                !u.matches(&UnlockCtx::new(&id, k, &[])),
-                "must not match {k:?}"
-            );
+    fn unlock_bus_declines_non_aacs_kinds() {
+        struct DeadTransport;
+        impl ScsiTransport for DeadTransport {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: crate::scsi::DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+                panic!("transport must not be touched on a non-AACS disc");
+            }
         }
-        assert!(u.matches(&UnlockCtx::new(&id, DiscKind::Aacs, &[])));
+        let id = id();
+        let mut t = DeadTransport;
+        for k in [DiscKind::Unknown, DiscKind::Unencrypted, DiscKind::Css] {
+            let r = AacsCert::new().unlock_bus(&mut t, &UnlockCtx::new(&id, k, &[]));
+            assert_eq!(r.unwrap_err(), UnlockError::NotApplicable, "declines {k:?}");
+        }
     }
 
     /// With no host certs there is nothing to authenticate with → NoUsableHostCert,
@@ -113,7 +126,7 @@ mod tests {
         }
         let id = id();
         let mut t = DeadTransport;
-        let r = AacsCert::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Aacs, &[]));
+        let r = AacsCert::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Aacs, &[]));
         assert_eq!(r.unwrap_err(), UnlockError::NoUsableHostCert);
     }
 }
