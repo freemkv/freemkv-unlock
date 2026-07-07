@@ -3,6 +3,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00100",
         "firmware_date": "211711202000"
@@ -26,6 +27,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1X-U",
         "product_revision": "A104",
         "vendor_specific": "WM01001",
         "firmware_date": "211901041047"
@@ -49,6 +51,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1H-U",
         "product_revision": "A203",
         "vendor_specific": "WM01501",
         "firmware_date": "211801111117"
@@ -72,6 +75,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM01201",
         "firmware_date": "211711301218"
@@ -95,6 +99,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.04",
         "vendor_specific": "NM01201",
         "firmware_date": "211901041351"
@@ -118,6 +123,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.04",
         "vendor_specific": "NM01701",
         "firmware_date": "211901041338"
@@ -141,6 +147,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00200",
         "firmware_date": "211711231626"
@@ -164,6 +171,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.04",
         "vendor_specific": "NM01701",
         "firmware_date": "211901041342"
@@ -187,6 +195,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM00500",
         "firmware_date": "211711201953"
@@ -210,6 +219,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "NM00100",
         "firmware_date": "211711211006"
@@ -233,6 +243,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "U101",
         "vendor_specific": "MM01201",
         "firmware_date": "211711301153"
@@ -256,6 +267,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00500",
         "firmware_date": "211711161545"
@@ -279,6 +291,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1H-U",
         "product_revision": "A204",
         "vendor_specific": "WM01001",
         "firmware_date": "211901041044"
@@ -302,6 +315,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00000",
         "firmware_date": "211711281847"
@@ -325,6 +339,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "BN12",
         "vendor_specific": "0M01001",
         "firmware_date": "211905141415"
@@ -348,6 +363,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "NM00500",
         "firmware_date": "211804030945"
@@ -371,6 +387,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00400",
         "firmware_date": "212004211008"
@@ -394,6 +411,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "RM01801",
         "firmware_date": "211910161032"
@@ -417,6 +435,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "U100",
         "vendor_specific": "3M01801",
         "firmware_date": "211910161036"
@@ -440,6 +459,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1HT",
         "product_revision": "3.03",
         "vendor_specific": "WM00000",
         "firmware_date": "211801191558"
@@ -463,6 +483,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00800",
         "firmware_date": "212005070917"
@@ -486,6 +507,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.01",
         "vendor_specific": "NM00200",
         "firmware_date": "211711231550"
@@ -509,6 +531,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM00800",
         "firmware_date": "212005070935"
@@ -532,6 +555,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00300",
         "firmware_date": "212107081603"
@@ -555,6 +579,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00400",
         "firmware_date": "212004210958"
@@ -578,6 +603,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM01101",
         "firmware_date": "211901041359"
@@ -601,6 +627,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1HT",
         "product_revision": "3.10",
         "vendor_specific": "WM01601",
         "firmware_date": "211901041014"
@@ -624,6 +651,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.04",
         "vendor_specific": "NM00500",
         "firmware_date": "212005061142"
@@ -647,6 +675,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BC-12D2HT",
         "product_revision": "3.01",
         "vendor_specific": "WM00900",
         "firmware_date": "211711151926"
@@ -670,6 +699,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM01801",
         "firmware_date": "211905031515"
@@ -693,6 +723,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM01801",
         "firmware_date": "211905031534"
@@ -716,6 +747,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00600",
         "firmware_date": "212005081010"
@@ -739,6 +771,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.01",
         "vendor_specific": "NM00400",
         "firmware_date": "211711211606"
@@ -762,6 +795,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.05",
         "vendor_specific": "NM00400",
         "firmware_date": "212004211049"
@@ -785,6 +819,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BC-12B1ST",
         "product_revision": "3.01",
         "vendor_specific": "WM00900",
         "firmware_date": "211711291725"
@@ -808,6 +843,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.03",
         "vendor_specific": "NM00800",
         "firmware_date": "212005080959"
@@ -831,6 +867,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00000",
         "firmware_date": "211711201704"
@@ -854,6 +891,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM00300",
         "firmware_date": "212107081556"
@@ -877,6 +915,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00800",
         "firmware_date": "212005070924"
@@ -900,6 +939,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "RM00000",
         "firmware_date": "211712221221"
@@ -923,6 +963,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.V5",
         "vendor_specific": "NM00900",
         "firmware_date": "211802070957"
@@ -946,6 +987,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "BU12",
         "vendor_specific": "OM01001",
         "firmware_date": "211902230922"
@@ -969,6 +1011,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "NM00200",
         "firmware_date": "211711211720"
@@ -992,6 +1035,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00800",
         "firmware_date": "212005070929"
@@ -1015,6 +1059,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM00600",
         "firmware_date": "212005081014"
@@ -1038,6 +1083,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00200",
         "firmware_date": "211711231646"
@@ -1061,6 +1107,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.04",
         "vendor_specific": "NM00300",
         "firmware_date": "212005081025"
@@ -1084,6 +1131,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BC-12B1ST",
         "product_revision": "3.11",
         "vendor_specific": "WM00300",
         "firmware_date": "211902271321"
@@ -1107,6 +1155,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM00700",
         "firmware_date": "211811011016"
@@ -1130,6 +1179,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00600",
         "firmware_date": "211711211658"
@@ -1153,6 +1203,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00000",
         "firmware_date": "211712071200"
@@ -1176,6 +1227,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "RM00200",
         "firmware_date": "212012011716"
@@ -1199,6 +1251,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.05",
         "vendor_specific": "NM00900",
         "firmware_date": "212005061444"
@@ -1222,6 +1275,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "FR07",
         "vendor_specific": "JM02202",
         "firmware_date": "211801221536"
@@ -1245,6 +1299,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "SM00800",
         "firmware_date": "212009071143"
@@ -1268,6 +1323,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00000",
         "firmware_date": "211810241934"
@@ -1291,6 +1347,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00200",
         "firmware_date": "211711231615"
@@ -1314,6 +1371,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "NM00100",
         "firmware_date": "211810291936"
@@ -1337,6 +1395,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "NM00500",
         "firmware_date": "211711161557"
@@ -1360,6 +1419,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BC-12D2HT",
         "product_revision": "3.11",
         "vendor_specific": "WM00300",
         "firmware_date": "211902271319"
@@ -1383,6 +1443,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.05",
         "vendor_specific": "NM00900",
         "firmware_date": "212005061440"
@@ -1406,6 +1467,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.05",
         "vendor_specific": "NM00600",
         "firmware_date": "212005061331"
@@ -1429,6 +1491,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.03",
         "vendor_specific": "NM00800",
         "firmware_date": "212005080957"
@@ -1452,6 +1515,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00000",
         "firmware_date": "211711201943"
@@ -1475,6 +1539,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "NM00600",
         "firmware_date": "211711211653"
@@ -1498,6 +1563,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "BN11",
         "vendor_specific": "0M00300",
         "firmware_date": "211711201351"
@@ -1523,6 +1589,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "0420",
         "vendor_specific": "N000000",
         "firmware_date": "211605241901"
@@ -1543,6 +1610,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061510"
@@ -1563,6 +1631,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N1A12A1",
         "firmware_date": "211304042250"
@@ -1583,6 +1652,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "AS00",
         "vendor_specific": "S002102",
         "firmware_date": "211306141459"
@@ -1603,6 +1673,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N000500",
         "firmware_date": "211511051004"
@@ -1623,6 +1694,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A37A3",
         "firmware_date": "211204261630"
@@ -1643,6 +1715,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N004304",
         "firmware_date": "211412161016"
@@ -1663,6 +1736,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.D3",
         "vendor_specific": "N000700",
         "firmware_date": "211602041103"
@@ -1683,6 +1757,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-12B1ST",
         "product_revision": "1.00",
         "vendor_specific": "E101701",
         "firmware_date": "211304231147"
@@ -1703,6 +1778,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N003203",
         "firmware_date": "211412161022"
@@ -1723,6 +1799,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N001501",
         "firmware_date": "211504221534"
@@ -1743,6 +1820,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N0A20A2",
         "firmware_date": "211306131532"
@@ -1763,6 +1841,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N0C00C0",
         "firmware_date": "211505261638"
@@ -1783,6 +1862,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N002502",
         "firmware_date": "211508191146"
@@ -1803,6 +1883,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "AS00",
         "vendor_specific": "U101901",
         "firmware_date": "211304242023"
@@ -1823,6 +1904,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A29A2",
         "firmware_date": "211210311913"
@@ -1843,6 +1925,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "G005705",
         "firmware_date": "211504221429"
@@ -1863,6 +1946,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061535"
@@ -1883,6 +1967,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "R004504",
         "firmware_date": "211703231903"
@@ -1903,6 +1988,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A29A2",
         "firmware_date": "211210311917"
@@ -1923,6 +2009,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "N0A03A0",
         "firmware_date": "211403261115"
@@ -1943,6 +2030,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "BU10",
         "vendor_specific": "O002602",
         "firmware_date": "211701060941"
@@ -1963,6 +2051,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N000500",
         "firmware_date": "211511050956"
@@ -1983,6 +2072,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N001101",
         "firmware_date": "211703130907"
@@ -2003,6 +2093,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N1A12A1",
         "firmware_date": "211304042319"
@@ -2023,6 +2114,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1HT",
         "product_revision": "1.01",
         "vendor_specific": "W100600",
         "firmware_date": "211302051930"
@@ -2043,6 +2135,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-14D1XT",
         "product_revision": "1.00",
         "vendor_specific": "M103703",
         "firmware_date": "210000000000"
@@ -2063,6 +2156,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N002802",
         "firmware_date": "211702151823"
@@ -2083,6 +2177,7 @@
     {
       "identity": {
         "vendor_id": "hp",
+        "product_id": "BDRW",
         "product_revision": "BW20",
         "vendor_specific": "P018518",
         "firmware_date": "211504221413"
@@ -2103,6 +2198,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "BU10",
         "vendor_specific": "O003703",
         "firmware_date": "211705301728"
@@ -2123,6 +2219,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A102",
         "vendor_specific": "D0A22A2",
         "firmware_date": "211303262335"
@@ -2143,6 +2240,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N1A12A1",
         "firmware_date": "211304042252"
@@ -2163,6 +2261,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.02",
         "vendor_specific": "N0A05A0",
         "firmware_date": "211404241908"
@@ -2183,6 +2282,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000900",
         "firmware_date": "211609091048"
@@ -2203,6 +2303,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N0G43G4",
         "firmware_date": "211206262029"
@@ -2223,6 +2324,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N005505",
         "firmware_date": "211504221517"
@@ -2243,6 +2345,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "CCT5",
         "vendor_specific": "V000700",
         "firmware_date": "211705182023"
@@ -2263,6 +2366,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N001901",
         "firmware_date": "211703101630"
@@ -2283,6 +2387,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N0A13A1",
         "firmware_date": "211303221728"
@@ -2303,6 +2408,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000500",
         "firmware_date": "211512230930"
@@ -2323,6 +2429,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "AS00",
         "vendor_specific": "U008408",
         "firmware_date": "211607291602"
@@ -2343,6 +2450,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N002602",
         "firmware_date": "211409031732"
@@ -2363,6 +2471,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N002802",
         "firmware_date": "211702151828"
@@ -2383,6 +2492,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N005305",
         "firmware_date": "211504211939"
@@ -2403,6 +2513,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000800",
         "firmware_date": "211701031453"
@@ -2423,6 +2534,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N000200",
         "firmware_date": "211602231042"
@@ -2443,6 +2555,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BC-12B1ST",
         "product_revision": "3.00",
         "vendor_specific": "W004704",
         "firmware_date": "211512151340"
@@ -2463,6 +2576,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N1A12A1",
         "firmware_date": "211304042322"
@@ -2483,6 +2597,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A100",
         "vendor_specific": "D00D60D",
         "firmware_date": "211507301534"
@@ -2503,6 +2618,7 @@
     {
       "identity": {
         "vendor_id": "hp",
+        "product_id": "BDRW",
         "product_revision": "BW20",
         "vendor_specific": "P017417",
         "firmware_date": "211412160945"
@@ -2523,6 +2639,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N000200",
         "firmware_date": "211512111436"
@@ -2543,6 +2660,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N001601",
         "firmware_date": "211406161935"
@@ -2563,6 +2681,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.01",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061614"
@@ -2583,6 +2702,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1514",
         "vendor_specific": "N100400",
         "firmware_date": "211205301654"
@@ -2603,6 +2723,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1H-U",
         "product_revision": "A101",
         "vendor_specific": "W000600",
         "firmware_date": "211412080959"
@@ -2623,6 +2744,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "FR07",
         "vendor_specific": "J001101",
         "firmware_date": "211612201651"
@@ -2643,6 +2765,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061545"
@@ -2663,6 +2786,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1HT",
         "product_revision": "3.02",
         "vendor_specific": "W000800",
         "firmware_date": "211711241413"
@@ -2683,6 +2807,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "CCT2",
         "vendor_specific": "V000700",
         "firmware_date": "211703071420"
@@ -2703,6 +2828,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N000100",
         "firmware_date": "211512111503"
@@ -2723,6 +2849,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N003103",
         "firmware_date": "211612201528"
@@ -2743,6 +2870,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N1A12A1",
         "firmware_date": "211304042325"
@@ -2763,6 +2891,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A44A4",
         "firmware_date": "211206161825"
@@ -2783,6 +2912,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1HT",
         "product_revision": "3.00",
         "vendor_specific": "W004504",
         "firmware_date": "211508101633"
@@ -2803,6 +2933,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N003803",
         "firmware_date": "211406251441"
@@ -2823,6 +2954,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "T.00",
         "vendor_specific": "V003403",
         "firmware_date": "211606241658"
@@ -2843,6 +2975,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N0A00A0",
         "firmware_date": "211405071026"
@@ -2863,6 +2996,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A101",
         "vendor_specific": "D000100",
         "firmware_date": "211602241144"
@@ -2883,6 +3017,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N001401",
         "firmware_date": "211703101650"
@@ -2903,6 +3038,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000500",
         "firmware_date": "211704251756"
@@ -2923,6 +3059,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000700",
         "firmware_date": "211701030941"
@@ -2943,6 +3080,7 @@
     {
       "identity": {
         "vendor_id": "hp",
+        "product_id": "BD-RE",
         "product_revision": "B7C6",
         "vendor_specific": "P0A12A1",
         "firmware_date": "211303262313"
@@ -2963,6 +3101,7 @@
     {
       "identity": {
         "vendor_id": "hp",
+        "product_id": "BDDVDRW",
         "product_revision": "BC56",
         "vendor_specific": "P0B00B0",
         "firmware_date": "210000000000"
@@ -2983,6 +3122,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A26A2",
         "firmware_date": "211202091126"
@@ -3003,6 +3143,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N000500",
         "firmware_date": "211511051001"
@@ -3023,6 +3164,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N000900",
         "firmware_date": "211606090920"
@@ -3043,6 +3185,7 @@
     {
       "identity": {
         "vendor_id": "hp",
+        "product_id": "BD-RE",
         "product_revision": "BU24",
         "vendor_specific": "P005005",
         "firmware_date": "211504221344"
@@ -3063,6 +3206,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N001401",
         "firmware_date": "211508180940"
@@ -3083,6 +3227,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A1B0",
         "vendor_specific": "D015815",
         "firmware_date": "211703101705"
@@ -3103,6 +3248,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N006206",
         "firmware_date": "211512221501"
@@ -3123,6 +3269,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "R002202",
         "firmware_date": "211609090954"
@@ -3143,6 +3290,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N001501",
         "firmware_date": "211504221546"
@@ -3163,6 +3311,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000400",
         "firmware_date": "211502161437"
@@ -3183,6 +3332,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N1A03A0",
         "firmware_date": "210000000000"
@@ -3203,6 +3353,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N0A13A1",
         "firmware_date": "211303221725"
@@ -3223,6 +3374,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A100",
         "vendor_specific": "D032232",
         "firmware_date": "211701021159"
@@ -3243,6 +3395,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N000200",
         "firmware_date": "211512111440"
@@ -3263,6 +3416,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "EB02",
         "vendor_specific": "C000400",
         "firmware_date": "211610101049"
@@ -3283,6 +3437,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BC-12D2HT",
         "product_revision": "3.00",
         "vendor_specific": "W004704",
         "firmware_date": "211512091147"
@@ -3303,6 +3458,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "TSTQ",
         "vendor_specific": "N000500",
         "firmware_date": "211508121144"
@@ -3323,6 +3479,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N004204",
         "firmware_date": "211512221504"
@@ -3343,6 +3500,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N002802",
         "firmware_date": "211702151837"
@@ -3363,6 +3521,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "N0A09A0",
         "firmware_date": "211405071012"
@@ -3383,6 +3542,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000800",
         "firmware_date": "211603171336"
@@ -3403,6 +3563,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061658"
@@ -3423,6 +3584,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N005905",
         "firmware_date": "211408221631"
@@ -3443,6 +3605,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "T.02",
         "vendor_specific": "V001301",
         "firmware_date": "211405091428"
@@ -3463,6 +3626,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "GE02",
         "vendor_specific": "V000700",
         "firmware_date": "211705182030"
@@ -3483,6 +3647,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A12A1",
         "firmware_date": "211304041441"
@@ -3503,6 +3668,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1HT",
         "product_revision": "3.01",
         "vendor_specific": "W000800",
         "firmware_date": "211703311426"
@@ -3523,6 +3689,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N002202",
         "firmware_date": "211602231047"
@@ -3543,6 +3710,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A44A4",
         "firmware_date": "211206161828"
@@ -3563,6 +3731,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A100",
         "vendor_specific": "D031531",
         "firmware_date": "211608041137"
@@ -3583,6 +3752,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "TST5",
         "vendor_specific": "N000900",
         "firmware_date": "211708221604"
@@ -3603,6 +3773,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A101",
         "vendor_specific": "D000700",
         "firmware_date": "211703131630"
@@ -3623,6 +3794,7 @@
     {
       "identity": {
         "vendor_id": "hp",
+        "product_id": "BDDVDRW",
         "product_revision": "B1C0",
         "vendor_specific": "P015115",
         "firmware_date": "211307031530"
@@ -3643,6 +3815,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "GP01",
         "vendor_specific": "V001701",
         "firmware_date": "211504221450"
@@ -3663,6 +3836,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A11A1",
         "firmware_date": "211201171401"
@@ -3683,6 +3857,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N0A20A2",
         "firmware_date": "211306131457"
@@ -3703,6 +3878,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "DVDRWBD",
         "product_revision": "A101",
         "vendor_specific": "D000300",
         "firmware_date": "210000000000"
@@ -3723,6 +3899,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N001901",
         "firmware_date": "211703101637"
@@ -3743,6 +3920,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A44A4",
         "firmware_date": "211206161823"
@@ -3763,6 +3941,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1H-U",
         "product_revision": "A201",
         "vendor_specific": "W000000",
         "firmware_date": "211601141358"
@@ -3783,6 +3962,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061523"
@@ -3803,6 +3983,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "G002202",
         "firmware_date": "211405090917"
@@ -3823,6 +4004,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N1A37A3",
         "firmware_date": "211205021346"
@@ -3843,6 +4025,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "N0A09A0",
         "firmware_date": "211403261105"
@@ -3863,6 +4046,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "N0C06C0",
         "firmware_date": "211505261714"
@@ -3883,6 +4067,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N001401",
         "firmware_date": "211703101655"
@@ -3903,6 +4088,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "AS00",
         "vendor_specific": "U00B50B",
         "firmware_date": "211608041424"
@@ -3923,6 +4109,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "EB02",
         "vendor_specific": "C000900",
         "firmware_date": "211412181002"
@@ -3943,6 +4130,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N004904",
         "firmware_date": "211409041512"
@@ -3963,6 +4151,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N001401",
         "firmware_date": "211508180932"
@@ -3983,6 +4172,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061453"
@@ -4003,6 +4193,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "G004504",
         "firmware_date": "211412160950"
@@ -4023,6 +4214,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N005405",
         "firmware_date": "211703101612"
@@ -4043,6 +4235,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.03",
         "vendor_specific": "N0A05A0",
         "firmware_date": "211404241900"
@@ -4063,6 +4256,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N000600",
         "firmware_date": "211508191151"
@@ -4083,6 +4277,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.00",
         "vendor_specific": "N007307",
         "firmware_date": "211412161028"
@@ -4103,6 +4298,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.02",
         "vendor_specific": "N0A04A0",
         "firmware_date": "211403261141"
@@ -4123,6 +4319,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.00",
         "vendor_specific": "N002302",
         "firmware_date": "211512071657"
@@ -4143,6 +4340,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "0217",
         "vendor_specific": "N000700",
         "firmware_date": "211603081656"
@@ -4163,6 +4361,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BDDVDRW",
         "product_revision": "1.01",
         "vendor_specific": "N0A02A0",
         "firmware_date": "211312061625"
@@ -4183,6 +4382,7 @@
     {
       "identity": {
         "vendor_id": "ASUS",
+        "product_id": "BW-16D1HT",
         "product_revision": "3.00",
         "vendor_specific": "W006706",
         "firmware_date": "211511031110"
@@ -4203,6 +4403,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "CC01",
         "vendor_specific": "V000700",
         "firmware_date": "211706280934"
@@ -4223,6 +4424,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "A1B0",
         "vendor_specific": "D014214",
         "firmware_date": "211510131446"
@@ -4243,6 +4445,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.01",
         "vendor_specific": "N000000",
         "firmware_date": "211706291017"
@@ -4263,6 +4466,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.02",
         "vendor_specific": "N000100",
         "firmware_date": "211512111459"
@@ -4283,6 +4487,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "1.03",
         "vendor_specific": "N0C08C0",
         "firmware_date": "211505261653"
@@ -4303,6 +4508,7 @@
     {
       "identity": {
         "vendor_id": "HL-DT-ST",
+        "product_id": "BD-RE",
         "product_revision": "GS01",
         "vendor_specific": "V001701",
         "firmware_date": "211305020921"

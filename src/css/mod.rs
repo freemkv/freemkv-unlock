@@ -164,11 +164,10 @@ impl crate::Unlocker for CssUnlocker {
         "CSS"
     }
 
-    fn matches(&self, ctx: &crate::UnlockCtx) -> bool {
-        ctx.kind == crate::DiscKind::Css
-    }
-
-    fn unlock(
+    /// CSS removes the scrambled-sector barrier (a bus-level concern); it
+    /// provides no drive features. Self-guards against the hardware (below), so
+    /// it declines cleanly when the consumer iterates it on a non-DVD.
+    fn unlock_bus(
         &self,
         scsi: &mut dyn ScsiTransport,
         _ctx: &crate::UnlockCtx,
@@ -923,27 +922,28 @@ mod tests {
         assert_eq!(cdb[9], 0x04, "low byte of 2052-byte transfer");
     }
 
-    /// The CssUnlocker matches ONLY `DiscKind::Css` (never fires during
-    /// drive-prep or on a Blu-ray).
+    /// CssUnlocker provides bus removal only — it never provides drive features.
     #[test]
-    fn css_unlocker_matches_only_css_kind() {
-        use crate::{DiscKind, DriveId, UnlockCtx, Unlocker};
-        let id = DriveId {
-            vendor_id: "FAKEVNDR".to_string(),
-            ..Default::default()
-        };
-
-        let u = CssUnlocker::new();
-        assert!(
-            u.matches(&UnlockCtx::new(&id, DiscKind::Css, &[])),
-            "matches a CSS DVD"
-        );
-        for k in [DiscKind::Unknown, DiscKind::Unencrypted, DiscKind::Aacs] {
-            assert!(
-                !u.matches(&UnlockCtx::new(&id, k, &[])),
-                "CssUnlocker must not match {k:?}"
-            );
+    fn css_unlocker_provides_no_features() {
+        use crate::scsi::{DataDirection, ScsiResult};
+        use crate::{DiscKind, DriveId, UnlockCtx, UnlockError, Unlocker};
+        struct DeadTransport;
+        impl ScsiTransport for DeadTransport {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                panic!("unlock_features must not touch the transport");
+            }
         }
+        let id = DriveId::default();
+        let mut t = DeadTransport;
+        let r =
+            CssUnlocker::new().unlock_features(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
     }
 
     /// Defense in depth: even when the caller declares `DiscKind::Css`, the
@@ -994,7 +994,7 @@ mod tests {
         };
 
         let mut t = BdTransport { non_config_cdbs: 0 };
-        let r = CssUnlocker::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        let r = CssUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
         assert_eq!(
             r.unwrap_err(),
             UnlockError::NotApplicable,
