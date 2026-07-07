@@ -21,6 +21,9 @@ mod css;
 // [`all_unlockers`]. `aacs` and `css` carry no such public catalog, so they
 // stay fully private.
 pub mod ld;
+// `renesis` is public for its `is_renesas` drive-probe; the unlocker impl
+// (`Renesis`) is `pub(crate)` — reached only through [`all_unlockers`].
+pub mod renesis;
 
 use scsi::ScsiTransport;
 
@@ -29,6 +32,7 @@ use scsi::ScsiTransport;
 #[derive(Debug, Clone, Default)]
 pub struct DriveId {
     pub vendor_id: String,
+    pub product_id: String,
     pub product_revision: String,
     pub vendor_specific: String,
     pub firmware_date: String,
@@ -111,22 +115,39 @@ pub enum UnlockError {
 /// here — that is the consumer's concern, not bus removal.
 pub trait Unlocker: Send + Sync {
     /// Short, stable identifier for this unlocker (e.g. "LibreDrive", "AACS",
-    /// "CSS"). The ONE place a name lives — apps render the unlocker report from
-    /// [`all_unlockers`], never hardcoding names, so adding/removing an unlocker
-    /// updates every report with no app change.
+    /// "CSS", "Renesas"). The ONE place a name lives — apps render the unlocker
+    /// report from [`all_unlockers`], never hardcoding names, so adding/removing
+    /// an unlocker updates every report with no app change.
     fn name(&self) -> &'static str;
 
-    /// True if this unlocker applies to the given context (drive id + disc kind)
-    /// during live dispatch — the gate [`crate::all_unlockers`] uses to decide
-    /// whether to RUN it.
-    fn matches(&self, ctx: &UnlockCtx) -> bool;
-
-    /// Remove the bus-encryption barrier, returning what was learned.
-    fn unlock(
+    /// Unlock DRIVE FEATURES — riplock/speed, OEM Volume ID, OEM extended-access
+    /// reads. The consumer runs this at drive-prep, trying each unlocker until
+    /// one handles the drive. `Ok(_)` = this unlocker handled it (LibreDrive also
+    /// removes bus encryption at the drive, so its result carries
+    /// `drive_unlocked: true`); `Err(NotApplicable)` = not this unlocker's drive;
+    /// `Err(Transport)` = dead bus (the consumer aborts). Default: not provided.
+    fn unlock_features(
         &self,
         scsi: &mut dyn ScsiTransport,
         ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError>;
+    ) -> std::result::Result<Unlocked, UnlockError> {
+        let _ = (scsi, ctx);
+        Err(UnlockError::NotApplicable)
+    }
+
+    /// Remove BUS ENCRYPTION for the mounted disc (AACS host-cert handshake, or
+    /// CSS scrambled-sector auth). The consumer runs this only when the bus isn't
+    /// already clear, trying each unlocker until one handles it. Same `Ok` /
+    /// `Err(NotApplicable)` / `Err(Transport)` contract as [`unlock_features`].
+    /// Default: not provided.
+    fn unlock_bus(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        ctx: &UnlockCtx,
+    ) -> std::result::Result<Unlocked, UnlockError> {
+        let _ = (scsi, ctx);
+        Err(UnlockError::NotApplicable)
+    }
 }
 
 /// Name of the unlocker that claims this drive by identity (for drive-info "is
@@ -144,6 +165,7 @@ pub fn unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
 pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
     vec![
         Box::new(ld::LibreDrive::new()),
+        Box::new(renesis::Renesis::new()),
         Box::new(aacs::AacsCert::new()),
         Box::new(css::CssUnlocker::new()),
     ]

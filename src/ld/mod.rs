@@ -116,26 +116,17 @@ impl LibreDrive {
     }
 }
 
-impl Unlocker for LibreDrive {
-    /// Firmware unlock is a DRIVE-PREP concern: it runs before the disc kind is
-    /// probed (`kind == Unknown`) and keys off the drive identity. It must NOT
-    /// fire during the later content-keyed dispatch (Aacs/Css), or a DVD/Blu-ray
-    /// in a profiled drive would be re-firmware-unlocked.
-    fn name(&self) -> &'static str {
-        "LibreDrive"
-    }
-
-    fn matches(&self, ctx: &UnlockCtx) -> bool {
-        ctx.kind == crate::DiscKind::Unknown && profile::find_bundled(ctx.drive_id).is_some()
-    }
-
-    /// Firmware-unlock the drive and report its OEM Volume ID. The unlocked drive
-    /// serves CLEAR content, so `drive_unlocked: true` and there is no bus key.
+impl LibreDrive {
+    /// The MediaTek firmware unlock. Because LibreDrive removes AACS bus
+    /// encryption AT THE DRIVE (the unlocked drive serves CLEAR content), this ONE
+    /// operation satisfies BOTH the drive-features and the bus-removal capability
+    /// — so `unlock_features` and `unlock_bus` both delegate here. The result
+    /// carries `drive_unlocked: true` (no bus key needed) and the OEM Volume ID.
     ///
-    /// A no-firmware-route drive (Renesas) returns `NotApplicable` (fall through);
-    /// a transport fault propagates as `Transport`; a firmware failure that isn't
-    /// a dead bus also falls through (`NotApplicable`).
-    fn unlock(
+    /// A no-firmware-route drive (Renesas / no profile) returns `NotApplicable`; a
+    /// transport fault propagates as `Transport`; any other firmware failure also
+    /// falls through as `NotApplicable`.
+    fn firmware_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         ctx: &UnlockCtx,
@@ -145,25 +136,50 @@ impl Unlocker for LibreDrive {
             return Err(UnlockError::NotApplicable);
         };
         if matches!(m.platform, profile::Platform::Renesas) {
-            // Renesas firmware unlock is not implemented — fall through to cert.
+            // Renesas is a different platform (handled by the Renesas unlocker).
             return Err(UnlockError::NotApplicable);
         }
         let is_variant_b = matches!(m.platform, profile::Platform::Mt1959B);
         use platform::PlatformDriver;
         let mut mt = platform::mt1959::Mt1959::new(m.profile, is_variant_b);
-        // Firmware unlock. A transport fault → UnlockError::Transport; any other
-        // firmware failure → NotApplicable (via From<error::Error>).
+        // A transport fault → UnlockError::Transport; any other firmware failure
+        // → NotApplicable (via From<error::Error>).
         mt.init(scsi)?;
         // Prime the per-region speed table (best-effort — must not fail the unlock).
         let _ = mt.probe_disc(scsi);
-        // The unlocked drive hands back its Volume ID; firmware serves clear
-        // content, so no bus key and drive_unlocked = true.
         let vid = self.read_oem_vid(scsi, id)?;
         Ok(Unlocked {
             vid,
             bus_key: None,
             drive_unlocked: true,
         })
+    }
+}
+
+impl Unlocker for LibreDrive {
+    fn name(&self) -> &'static str {
+        "LibreDrive"
+    }
+
+    /// LibreDrive provides drive features (riplock/speed, OEM VID) — and, because
+    /// its firmware unlock serves clear content, bus removal comes free with it.
+    fn unlock_features(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        ctx: &UnlockCtx,
+    ) -> std::result::Result<Unlocked, UnlockError> {
+        self.firmware_unlock(scsi, ctx)
+    }
+
+    /// Same firmware code as [`unlock_features`]: LibreDrive removes the bus at
+    /// the drive. In practice the consumer skips this because drive-prep already
+    /// set `drive_unlocked`; it's here for completeness / a bus-first call order.
+    fn unlock_bus(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        ctx: &UnlockCtx,
+    ) -> std::result::Result<Unlocked, UnlockError> {
+        self.firmware_unlock(scsi, ctx)
     }
 }
 
@@ -212,6 +228,7 @@ mod tests {
     fn make_drive_id(vendor: &str, rev: &str, vs: &str, date: &str) -> DriveId {
         DriveId {
             vendor_id: vendor.to_string(),
+            product_id: String::new(),
             product_revision: rev.to_string(),
             vendor_specific: vs.to_string(),
             firmware_date: date.to_string(),
@@ -283,8 +300,8 @@ mod tests {
         assert_eq!(got, None);
     }
 
-    /// `unlock` on a drive with no matching profile → `NotApplicable` (fall
-    /// through), short-circuiting before any firmware handshake.
+    /// `unlock_features` on a drive with no matching profile → `NotApplicable`
+    /// (fall through), short-circuiting before any firmware handshake.
     #[test]
     fn unlock_no_profile_is_not_applicable() {
         let mut t = FakeTransport {
@@ -292,7 +309,7 @@ mod tests {
             bytes_transferred: 36,
         };
         let err = LibreDrive::new()
-            .unlock(
+            .unlock_features(
                 &mut t,
                 &ctx(&make_drive_id("FAKE-VND", "9.99", "XX12345", "")),
             )

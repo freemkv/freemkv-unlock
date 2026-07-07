@@ -31,6 +31,8 @@ pub struct Identity {
     #[serde(default)]
     pub vendor_id: String,
     #[serde(default)]
+    pub product_id: String,
+    #[serde(default)]
     pub product_revision: String,
     #[serde(default)]
     pub vendor_specific: String,
@@ -283,15 +285,16 @@ fn load_from_str(data: &str) -> Result<Profiles> {
 
 /// Find a profile matching a drive's INQUIRY fields.
 ///
-/// Two-pass per platform section (MT1959-A, then MT1959-B, then Renesas):
-/// first an exact match including `firmware_date`, then — if none — a
-/// looser match on vendor / revision / vendor-specific only. The exact
-/// pass wins so a drive with a known firmware date binds to its precise
-/// profile; the looser pass lets a drive whose firmware date we don't have
-/// on file still match a same-model profile. All comparisons are
-/// whitespace-trimmed. Returns the first section that yields a match.
+/// Per platform section (MT1959-A, then MT1959-B, then Renesas), tried in
+/// order of decreasing specificity: full match including `product_id` and
+/// `firmware_date` (skipped when the drive reports no product), then the same
+/// without `product_id`. Both require `firmware_date`; every profile carries a
+/// unique identity under these fields, so a match is exact — no looser
+/// vendor/revision fallback that could pick the wrong same-model variant. All
+/// comparisons are whitespace-trimmed. Returns the first section that matches.
 pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Option<ProfileMatch> {
     let v = drive_id.vendor_id.trim();
+    let prod = drive_id.product_id.trim();
     let r = drive_id.product_revision.trim();
     let vs = drive_id.vendor_specific.trim();
     let date = drive_id.firmware_date.trim();
@@ -301,22 +304,26 @@ pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Optio
         (Platform::Mt1959B, &profiles.mt1959_b),
         (Platform::Renesas, &profiles.renesas),
     ] {
-        if let Some(p) = list.iter().find(|p| {
-            p.identity.vendor_id.trim() == v
-                && p.identity.product_revision.trim() == r
-                && p.identity.vendor_specific.trim() == vs
-                && p.identity.firmware_date.trim() == date
-        }) {
-            return Some(ProfileMatch {
-                profile: p.clone(),
-                platform,
-            });
+        if !prod.is_empty() {
+            if let Some(p) = list.iter().find(|p| {
+                p.identity.vendor_id.trim() == v
+                    && p.identity.product_id.trim() == prod
+                    && p.identity.product_revision.trim() == r
+                    && p.identity.vendor_specific.trim() == vs
+                    && p.identity.firmware_date.trim() == date
+            }) {
+                return Some(ProfileMatch {
+                    profile: p.clone(),
+                    platform,
+                });
+            }
         }
 
         if let Some(p) = list.iter().find(|p| {
             p.identity.vendor_id.trim() == v
                 && p.identity.product_revision.trim() == r
                 && p.identity.vendor_specific.trim() == vs
+                && p.identity.firmware_date.trim() == date
         }) {
             return Some(ProfileMatch {
                 profile: p.clone(),
@@ -336,10 +343,49 @@ mod tests {
     fn make_drive_id(vendor: &str, rev: &str, vs: &str, date: &str) -> DriveId {
         DriveId {
             vendor_id: vendor.to_string(),
+            product_id: String::new(),
             product_revision: rev.to_string(),
             vendor_specific: vs.to_string(),
             firmware_date: date.to_string(),
         }
+    }
+
+    /// When two profiles share vendor/rev/vs/date and differ only in product_id,
+    /// the full pass binds to the one whose product matches; the looser passes
+    /// would return the first regardless.
+    #[test]
+    fn find_by_drive_id_product_id_breaks_a_tie() {
+        use serde_json::json;
+        let profiles: Profiles = serde_json::from_str(
+            &json!({
+                "mt1959_a": [
+                    {"identity": {"vendor_id":"TIE","product_id":"MODEL-A",
+                        "product_revision":"1.00","vendor_specific":"XX00000",
+                        "firmware_date":"200001010000"},
+                        "signature":"aaaaaaaa","firmware":""},
+                    {"identity": {"vendor_id":"TIE","product_id":"MODEL-B",
+                        "product_revision":"1.00","vendor_specific":"XX00000",
+                        "firmware_date":"200001010000"},
+                        "signature":"bbbbbbbb","firmware":""}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut id = make_drive_id("TIE", "1.00", "XX00000", "200001010000");
+        id.product_id = "MODEL-B".to_string();
+        let m = find_by_drive_id(&profiles, &id).unwrap();
+        assert_eq!(
+            m.profile.signature,
+            [0xbb, 0xbb, 0xbb, 0xbb],
+            "product_id must select MODEL-B over the first entry"
+        );
+
+        // No product_id → falls back to the 4-field pass → first entry.
+        let id0 = make_drive_id("TIE", "1.00", "XX00000", "200001010000");
+        let m0 = find_by_drive_id(&profiles, &id0).unwrap();
+        assert_eq!(m0.profile.signature, [0xaa, 0xaa, 0xaa, 0xaa]);
     }
 
     #[test]
@@ -512,14 +558,12 @@ mod tests {
         );
     }
 
-    /// find_by_drive_id: loose match (no date) still works when an entry has
-    /// the same vendor/revision/vs but an unknown firmware_date.
-    /// Mutation: making the loose pass require a date match means "no date" drives
-    ///           always return None even though a same-model profile exists.
+    /// find_by_drive_id: a drive whose firmware_date does NOT match any profile
+    /// gets no match — there is no loose vendor/rev/vs fallback that could bind
+    /// the wrong same-model variant.
     #[test]
-    fn find_by_drive_id_loose_match_when_date_unknown() {
+    fn find_by_drive_id_no_match_when_date_differs() {
         use serde_json::json;
-        // "LOOSEDR " fills 8 bytes; trim() → "LOOSEDR".
         let profiles_json = json!({
             "mt1959_a": [
                 {
@@ -537,15 +581,9 @@ mod tests {
         .to_string();
         let profiles: Profiles = serde_json::from_str(&profiles_json).unwrap();
 
-        // Drive with an unknown firmware date — no exact match, loose match should work.
-        // "LOOSEDR " fills 8 bytes; "000000000000" is the unknown date.
+        // Same vendor/rev/vs but a different date — must NOT match.
         let id = make_drive_id("LOOSEDR ", "2.00", "YY11111", "000000000000");
-        let m = find_by_drive_id(&profiles, &id).unwrap();
-        assert_eq!(
-            m.profile.signature,
-            [0xde, 0xad, 0xbe, 0xef],
-            "loose match must bind the same-model profile when date differs"
-        );
+        assert!(find_by_drive_id(&profiles, &id).is_none());
     }
 
     /// load_from_str (via load_bundled) returns ProfileParse on invalid JSON.

@@ -487,6 +487,7 @@ mod tests {
         DriveProfile {
             identity: Identity {
                 vendor_id: "TEST".into(),
+                product_id: String::new(),
                 product_revision: String::new(),
                 vendor_specific: String::new(),
                 firmware_date: String::new(),
