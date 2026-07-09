@@ -1,16 +1,10 @@
-//! renesis — the Renesas-platform unlocker (Pioneer + HL-DT-ST Renesas drives).
+//! renesis — Renesas-platform detection (Pioneer + HL-DT-ST Renesas drives).
 //!
 //! Optical drives split into two controller families: MediaTek (handled by
-//! [`crate::ld`], per-drive firmware) and Renesas. This module owns the Renesas
-//! side. Detection is a single vendor probe — a Renesas controller serves the
-//! READ_BUFFER 0x02/0xF1 identity block (ASCII `SAT` interface marker at
-//! `[16..19]`); a MediaTek drive rejects the command with ILLEGAL REQUEST. See
-//! [`is_renesas`].
-//!
-//! renesis provides the drive-FEATURES capability ([`Renesis::unlock_features`])
-//! and NOT bus removal (the cert handles the bus). The feature unlock is a no-op
-//! for now — it recognizes the drive and reports the match, deferring the bus to
-//! the cert stage.
+//! [`crate::ld`]) and Renesas. This module identifies the Renesas side via a
+//! single vendor identity probe (see [`is_renesas`]) and reports the match so a
+//! Renesas drive is named honestly. It does not modify drive state; AACS bus
+//! decryption is handled by the host cert.
 
 use crate::scsi::{DataDirection, ScsiTransport};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
@@ -21,17 +15,6 @@ const RB_F1_LEN: usize = 48;
 /// The ASCII interface marker a Renesas controller returns at `[16..19]`.
 const RENESAS_MARKER: &[u8] = b"SAT";
 const RENESAS_MARKER_OFFSET: usize = 16;
-
-/// Renesas feature-unlock command (RS8xxx+ platforms). A single fixed vendor
-/// WRITE BUFFER (opcode `0x3B`, mode `0x02`, buffer id `0x41`): issuing it
-/// authenticates the host and enables the drive's extended feature set.
-///
-/// Platform-invariant — the same command unlocks every supported Renesas
-/// firmware; it does not vary per drive or per firmware revision. Sent by
-/// [`Renesis::unlock_features`]. (Verify on hardware before relying on it.)
-#[allow(dead_code)]
-const RENESAS_CHALLENGE_CDB: [u8; 10] =
-    [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00];
 
 /// True if `scsi` is a Renesas-platform drive (Pioneer or HL-DT-ST Renesas).
 ///
@@ -68,12 +51,10 @@ impl Unlocker for Renesis {
         "Renesas"
     }
 
-    /// `if is_renesas() { recognized }`. Renesas is a distinct platform from
-    /// LibreDrive (MediaTek): it provides DRIVE FEATURES only — it does NOT remove
-    /// AACS bus encryption (`unlock_bus` is left at the default, so the cert stage
-    /// handles the bus). The feature unlock itself is not implemented yet (no-op),
-    /// but the match IS reported (`Ok`, `drive_unlocked: false`) so the drive is
-    /// recognized as Renesas. A non-Renesas drive → `NotApplicable`.
+    /// Report whether the drive is a Renesas platform. On a match, returns `Ok`
+    /// with `drive_unlocked: false` — the drive is recognized but its state is
+    /// not modified here (AACS bus decryption is handled by the host cert). A
+    /// non-Renesas drive → `NotApplicable`.
     fn unlock_features(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -82,12 +63,10 @@ impl Unlocker for Renesis {
         if !is_renesas(scsi) {
             return Err(UnlockError::NotApplicable);
         }
-        // Recognized Renesas drive (Pioneer / HL-DT-ST Renesas). Feature unlock:
-        // TODO. `drive_unlocked: false` → bus encryption is left for the cert.
         tracing::debug!(
             target: "freemkv::disc",
             phase = "renesas_recognized",
-            "Renesas drive recognized; feature unlock TODO, bus deferred to cert"
+            "Renesas drive recognized; bus handled by cert"
         );
         Ok(Unlocked {
             vid: None,
