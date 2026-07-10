@@ -1,9 +1,9 @@
 [package]
 name = "freemkv-unlock"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2024"
 rust-version = "1.86"
-license = "AGPL-3.0-only"
+license = "MIT"
 description = "Unlock layer for the freemkv toolchain: the Unlocker contract + self-contained firmware/AACS/CSS unlocker modules. libfreemkv depends on this and dispatches via all_unlockers()."
 repository = "https://github.com/freemkv/freemkv-unlock"
 # NEVER crates.io: this crate carries drive firmware. Consumed only by git tag.

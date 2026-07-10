@@ -24,4 +24,4 @@ for u in freemkv_unlock::all_unlockers() {
 To remove an unlocker, delete its module directory and its one line in
 `all_unlockers()` — nothing else changes.
 
-License: AGPL-3.0-only.
+License: MIT.
