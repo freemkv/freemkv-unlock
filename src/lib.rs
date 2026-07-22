@@ -115,7 +115,7 @@ pub enum UnlockError {
 /// here — that is the consumer's concern, not bus removal.
 pub trait Unlocker: Send + Sync {
     /// Short, stable identifier for this unlocker (e.g. "LibreDrive", "AACS",
-    /// "CSS", "Renesas"). The ONE place a name lives — apps render the unlocker
+    /// "DVD", "Renesas"). The ONE place a name lives — apps render the unlocker
     /// report from [`all_unlockers`], never hardcoding names, so adding/removing
     /// an unlocker updates every report with no app change.
     fn name(&self) -> &'static str;
@@ -167,6 +167,6 @@ pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
         Box::new(ld::LibreDrive::new()),
         Box::new(renesis::Renesis::new()),
         Box::new(aacs::AacsCert::new()),
-        Box::new(css::CssUnlocker::new()),
+        Box::new(css::DvdUnlocker::new()),
     ]
 }

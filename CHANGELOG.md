@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.2] — UNRELEASED
+
+### Changed
+
+- The DVD read-unlocker (bus-auth) is renamed `CSS` → `DVD`: it reports the
+  medium it unlocks, not whether a title-key crack ran. The unlocker report now
+  reads `DVD: yes` on any DVD.
+
 ## [1.4.1] — 2026-07-14
 
 Version sync with the workspace; inherits libfreemkv 1.4.1.
