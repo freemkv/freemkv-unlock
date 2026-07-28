@@ -10,8 +10,8 @@ decryption is a separate concern, handled by the consumer.
 
 Clients never name this module directly —
 [libfreemkv](https://github.com/freemkv/libfreemkv) dispatches through
-`freemkv_unlock::all_unlockers()`, and this module answers `matches()` /
-`unlock()` when the drive identity is one it supports.
+`freemkv_unlock::all_unlockers()`, and this module answers `unlock_features()` /
+`unlock_bus()` when the drive identity is one it supports.
 
 ## Scope: non-persistent unlock only
 
