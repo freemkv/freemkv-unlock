@@ -14,9 +14,17 @@ clients of libfreemkv are oblivious to unlockers entirely (as they are to the
 SCSI layer).
 
 ```rust
+use freemkv_unlock::UnlockError;
+
+// Drive-prep: try each unlocker's feature unlock until one claims the drive.
+// `NotApplicable` means "not this unlocker's drive" — move on; a transport
+// error means a dead bus — abort. `unlock_bus` follows the same contract for
+// removing per-disc bus encryption.
 for u in freemkv_unlock::all_unlockers() {
-    if u.matches(&ctx) {
-        return u.unlock(&mut scsi, &ctx);
+    match u.unlock_features(&mut scsi, &ctx) {
+        Ok(unlocked) => return Ok(unlocked),
+        Err(UnlockError::NotApplicable) => continue,
+        Err(e) => return Err(e),
     }
 }
 ```
