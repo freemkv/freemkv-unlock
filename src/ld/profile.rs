@@ -141,7 +141,7 @@ pub struct ProfileMatch {
 /// translatable English message.
 fn decode_hex(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err("hex");
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
@@ -304,19 +304,19 @@ pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Optio
         (Platform::Mt1959B, &profiles.mt1959_b),
         (Platform::Renesas, &profiles.renesas),
     ] {
-        if !prod.is_empty() {
-            if let Some(p) = list.iter().find(|p| {
+        if !prod.is_empty()
+            && let Some(p) = list.iter().find(|p| {
                 p.identity.vendor_id.trim() == v
                     && p.identity.product_id.trim() == prod
                     && p.identity.product_revision.trim() == r
                     && p.identity.vendor_specific.trim() == vs
                     && p.identity.firmware_date.trim() == date
-            }) {
-                return Some(ProfileMatch {
-                    profile: p.clone(),
-                    platform,
-                });
-            }
+            })
+        {
+            return Some(ProfileMatch {
+                profile: p.clone(),
+                platform,
+            });
         }
 
         if let Some(p) = list.iter().find(|p| {
