@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    # `dev` is where work lands and where CI must be green. `main` only ever
+    # moves at release time, to the tagged commit, so a push to it is the
+    # release validation run rather than day-to-day feedback.
+    branches: [main, dev]
+  pull_request:
+
+# freemkv-unlock is the BASE of the whole ecosystem: libfreemkv path-deps it,
+# bdemu path-deps it with the `emulation` feature, and every other crate pulls
+# it in transitively. It has no freemkv dependencies of its own, so no sibling
+# checkout is needed here — but it is also the crate whose breakage takes all
+# seven others down with it, which is why it gets the full OS matrix rather
+# than a token Linux run.
+#
+# Cargo.lock is gitignored (library convention), so `--locked` is deliberately
+# NOT used: with no committed lockfile it fails rather than resolves.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-unlock-ci
+      - run: cargo fmt --check
+      # --all-targets so the test code is linted too, not just the library.
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-unlock-ci
+      - run: cargo test --tests
+      # `emulation` is off by default and is the face bdemu builds against. A
+      # feature nothing compiles is a feature that breaks at release time.
+      - run: cargo test --tests --features emulation
+
+  # The crate ships on macOS and Windows through its consumers, so it has to
+  # compile there. Build the tests (not just `cargo check`) — that forces
+  # codegen and catches errors in test-only code, which `check` skips.
+  check-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-unlock-ci
+      - run: cargo build --tests --all-features
+
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-unlock-ci
+      - run: cargo build --tests --all-features
