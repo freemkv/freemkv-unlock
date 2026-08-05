@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.6.1]
+
+Version sync with the workspace. No functional change in this crate.
+
 ## [1.6.0] — 2026-08-03
 
 Version sync with the workspace. No functional change in this crate.
