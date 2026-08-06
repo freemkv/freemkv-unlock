@@ -2,10 +2,12 @@ name: CI
 
 on:
   push:
-    # `dev` is where work lands and where CI must be green. `main` only ever
-    # moves at release time, to the tagged commit, so a push to it is the
-    # release validation run rather than day-to-day feedback.
-    branches: [main, dev]
+    # dev -> qa -> main. `dev` is where work lands and is meant to be pushed
+    # to often: these are the FAST checks, so a mistake surfaces in minutes.
+    # `qa` is the release candidate — it runs these too, plus the expensive
+    # suite in qa.yml. `main` only ever moves at release time, to a tagged
+    # commit that was already green on qa.
+    branches: [main, dev, qa]
   pull_request:
 
 # freemkv-unlock is the BASE of the whole ecosystem: libfreemkv path-deps it,
