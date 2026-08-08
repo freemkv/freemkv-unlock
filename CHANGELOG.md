@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.6.1] — UNRELEASED
+## [1.6.1] — 2026-08-07
 
 Version sync with the workspace. No functional change in this crate.
 
