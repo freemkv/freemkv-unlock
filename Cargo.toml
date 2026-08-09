@@ -18,7 +18,7 @@ emulation = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22.1"
+base64 = "0.23.1"
 tracing = "0.1"
 num-bigint = "0.4"
 num-traits = "0.2"
