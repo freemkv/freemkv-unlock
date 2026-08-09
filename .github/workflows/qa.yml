@@ -43,7 +43,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Stamp the next rc
@@ -71,7 +71,7 @@ jobs:
         os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -87,7 +87,7 @@ jobs:
   cross-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -107,7 +107,7 @@ jobs:
   windows-build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@1.97.0
