@@ -9,7 +9,7 @@ mod error;
 mod handshake;
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
 
 use crate::scsi::ScsiTransport;
 use crate::{DiscKind, UnlockCtx, UnlockError, Unlocked, Unlocker};
@@ -17,8 +17,8 @@ use crate::{DiscKind, UnlockCtx, UnlockError, Unlocked, Unlocker};
 /// AES-128-ECB decrypt a single 16-byte block — used to decrypt the bus key /
 /// read_data_key the drive returns after the handshake.
 pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let mut block = GenericArray::clone_from_slice(data);
+    let cipher = Aes128::new(&(*key).into());
+    let mut block: Array<u8, _> = (*data).into();
     cipher.decrypt_block(&mut block);
     let mut out = [0u8; 16];
     out.copy_from_slice(&block);
