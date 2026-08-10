@@ -299,8 +299,8 @@ fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     // handshake.
     let mut host_challenge = [0u8; 10];
     {
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut host_challenge);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut host_challenge);
     }
     let mut hc_buf = [0u8; 16];
     hc_buf[0] = 0x00;

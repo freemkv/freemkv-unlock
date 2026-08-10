@@ -391,8 +391,8 @@ fn ecdsa_sign(priv_key: &[u8; 20], data: &[u8]) -> ([u8; 20], [u8; 20]) {
         // two); a biased ECDSA nonce is a known key-recovery weakness, so
         // we reject and redraw any candidate >= n instead.
         let mut k_bytes = [0u8; 20];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut k_bytes);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut k_bytes);
         let k = BigUint::from_bytes_be(&k_bytes);
         if k.is_zero() || k >= n {
             continue;
@@ -490,8 +490,8 @@ fn ecdsa_sign_p256(priv_key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32]) {
         // (avoid the modulo bias that reducing raw RNG bytes mod n would
         // introduce).
         let mut k_bytes = [0u8; 32];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut k_bytes);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut k_bytes);
         let k = BigUint::from_bytes_be(&k_bytes);
         if k.is_zero() || k >= n {
             continue;
@@ -703,8 +703,8 @@ fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
 
     let (d, q) = loop {
         let mut priv_bytes = [0u8; 32];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut priv_bytes);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut priv_bytes);
         // d == 0 (prob ~1/n) would yield the point at infinity / an
         // all-zero key and degenerate the bus key — reject and retry,
         // matching the AACS 1.0 sibling generate_host_key_pair.
@@ -735,8 +735,8 @@ fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
 
     let (d, q) = loop {
         let mut priv_bytes = [0u8; 20];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut priv_bytes);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut priv_bytes);
         let d = BigUint::from_bytes_be(&priv_bytes) % &n;
         if d.is_zero() {
             continue;
@@ -771,13 +771,13 @@ fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
 /// padding.
 fn aes_cmac_16(data: &[u8; 16], key: &[u8; 16]) -> [u8; 16] {
     use aes::Aes128;
-    use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 
-    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let cipher = Aes128::new(&(*key).into());
 
     // For single-block CMAC:
     // 1. Generate subkey K1
-    let mut l = GenericArray::clone_from_slice(&[0u8; 16]);
+    let mut l: Array<u8, _> = [0u8; 16].into();
     cipher.encrypt_block(&mut l);
 
     let mut k1 = [0u8; 16];
@@ -795,7 +795,7 @@ fn aes_cmac_16(data: &[u8; 16], key: &[u8; 16]) -> [u8; 16] {
     for i in 0..16 {
         block[i] = data[i] ^ k1[i];
     }
-    let mut ga = GenericArray::clone_from_slice(&block);
+    let mut ga: Array<u8, _> = block.into();
     cipher.encrypt_block(&mut ga);
 
     let mut mac = [0u8; 16];
@@ -903,8 +903,8 @@ pub fn aacs_authenticate(
 
     // Step 3: Generate host nonce and ephemeral key pair
     let mut host_nonce = [0u8; 20];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut host_nonce);
+    use rand::Rng;
+    rand::rng().fill_bytes(&mut host_nonce);
     let (host_key, host_key_point_x, host_key_point_y) = generate_host_key_pair();
 
     // Step 4: Send host certificate + nonce (SEND KEY format 0x01)
@@ -1066,8 +1066,8 @@ fn aacs2_authenticate_p256(
 
     // Step 3: Generate host nonce + P-256 ephemeral key pair
     let mut host_nonce = [0u8; 20];
-    use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut host_nonce);
+    use rand::Rng;
+    rand::rng().fill_bytes(&mut host_nonce);
     let (host_eph_key, host_eph_pub_x, host_eph_pub_y) = generate_host_key_pair_p256();
 
     // Step 4: Send AACS 2.0 host certificate + nonce
@@ -1490,8 +1490,8 @@ mod tests {
 
         // Generate random P-256 key pair
         let mut priv_bytes = [0u8; 32];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut priv_bytes);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut priv_bytes);
         let d = BigUint::from_bytes_be(&priv_bytes) % &n;
         let priv_key: [u8; 32] = to_bytes_be_padded(&d, 32).try_into().unwrap();
 
@@ -1514,9 +1514,9 @@ mod tests {
 
         let mut pa = [0u8; 32];
         let mut pb = [0u8; 32];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut pa);
-        rand::thread_rng().fill_bytes(&mut pb);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut pa);
+        rand::rng().fill_bytes(&mut pb);
         let da = BigUint::from_bytes_be(&pa) % &n;
         let db = BigUint::from_bytes_be(&pb) % &n;
         let priv_a: [u8; 32] = to_bytes_be_padded(&da, 32).try_into().unwrap();
