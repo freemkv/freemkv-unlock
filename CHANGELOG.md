@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.6.3] — 2026-08-10
+
+### Changed
+
+- **Housekeeping only — nothing about how a drive is unlocked has changed.** The
+  cryptography and compression crates this crate builds on were moved to their
+  current releases and brought into line with the versions the rest of freemkv
+  uses, so one version of each is built instead of two.
+
 ## [1.6.2] — 2026-08-08
 
 Version sync with the workspace. No functional change in this crate.
