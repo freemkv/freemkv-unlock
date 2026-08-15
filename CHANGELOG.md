@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.4] — UNRELEASED
+
+### Changed
+
+- **No functional change.** This crate ships alongside the rest of freemkv at a
+  matching version; its behaviour is untouched.
+
 ## [1.6.3] — 2026-08-10
 
 ### Changed
