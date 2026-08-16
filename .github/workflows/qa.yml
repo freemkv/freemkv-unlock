@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-unlock
@@ -90,7 +90,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -110,7 +110,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
-      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-unlock
