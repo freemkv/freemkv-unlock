@@ -21,7 +21,8 @@ mod css;
 // [`all_unlockers`]. `aacs` and `css` carry no such public catalog, so they
 // stay fully private.
 pub mod ld;
-// `renesis` is public for its `is_renesas` drive-probe; the unlocker impl
+// `renesis` is public for its `is_renesas` drive-probe (which reports a dead
+// bus as `Err(UnlockError::Transport)` rather than "not a Renesas drive"); the unlocker impl
 // (`Renesis`) is `pub(crate)` — reached only through [`all_unlockers`].
 pub mod renesis;
 
@@ -138,7 +139,8 @@ pub trait Unlocker: Send + Sync {
     /// Remove BUS ENCRYPTION for the mounted disc (AACS host-cert handshake, or
     /// CSS scrambled-sector auth). The consumer runs this only when the bus isn't
     /// already clear, trying each unlocker until one handles it. Same `Ok` /
-    /// `Err(NotApplicable)` / `Err(Transport)` contract as [`unlock_features`].
+    /// `Err(NotApplicable)` / `Err(Transport)` contract as
+    /// [`Unlocker::unlock_features`].
     /// Default: not provided.
     fn unlock_bus(
         &self,
@@ -169,4 +171,68 @@ pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
         Box::new(aacs::AacsCert::new()),
         Box::new(css::DvdUnlocker::new()),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dispatch order is a documented contract (`firmware → cert → css`) and
+    /// had NO test: `all_unlockers` is the one place an unlocker is named, and
+    /// the consumer stops at the first that doesn't decline, so reordering this
+    /// list silently changes which unlocker claims a drive. Catches a reorder,
+    /// a rename, and an accidental addition/removal.
+    #[test]
+    fn all_unlockers_dispatch_order_is_firmware_then_cert_then_css() {
+        let names: Vec<&'static str> = all_unlockers().iter().map(|u| u.name()).collect();
+        assert_eq!(names, vec!["LibreDrive", "Renesas", "AACS", "DVD"]);
+    }
+
+    /// Every unlocker declines by default rather than claiming a capability it
+    /// does not provide — and declines WITHOUT touching the transport, so the
+    /// consumer can iterate the whole registry on any drive.
+    #[test]
+    fn unlockers_decline_capabilities_they_do_not_provide() {
+        struct DeadTransport;
+        impl scsi::ScsiTransport for DeadTransport {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: scsi::DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> scsi::Result<scsi::ScsiResult> {
+                panic!("a declining unlocker must not issue a CDB");
+            }
+        }
+        let id = DriveId::default(); // matches no bundled profile
+        let ctx = UnlockCtx::new(&id, DiscKind::Unencrypted, &[]);
+        let mut t = DeadTransport;
+        for u in all_unlockers() {
+            // AACS/DVD provide no drive features; LibreDrive/Renesas are the
+            // feature unlockers but decline an unknown drive identity.
+            let name = u.name();
+            if name == "AACS" || name == "DVD" {
+                assert_eq!(
+                    u.unlock_features(&mut t, &ctx).unwrap_err(),
+                    UnlockError::NotApplicable,
+                    "{name} must not claim drive features"
+                );
+            }
+            if name == "Renesas" {
+                assert_eq!(
+                    u.unlock_bus(&mut t, &ctx).unwrap_err(),
+                    UnlockError::NotApplicable,
+                    "{name} leaves bus removal to the cert unlocker"
+                );
+            }
+        }
+    }
+
+    /// `unlocker_name` is a PURE lookup — it must answer from the `DriveId`
+    /// alone, and only the identity-keyed unlocker can claim a drive this way.
+    #[test]
+    fn unlocker_name_is_a_pure_identity_lookup() {
+        assert_eq!(unlocker_name(&DriveId::default()), None);
+    }
 }

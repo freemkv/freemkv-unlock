@@ -19,6 +19,31 @@ impl Error {
             Error::Scsi(_) => 7299,
         }
     }
+
+    /// True if this is a transport-layer SCSI failure (bus dead).
+    pub fn is_transport_failure(&self) -> bool {
+        matches!(
+            self,
+            Error::Scsi(s)
+                if s.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && s.sense.is_none()
+        )
+    }
+}
+
+/// Collapse a SCSI-layer failure from a bus-auth step onto the CSS auth code —
+/// but NEVER a transport fault.
+///
+/// Every step used to do `.map_err(|_| Error::CssAuthFailed)?`, which discarded
+/// the `ScsiError` whole. That made the `Transport` arm of the conversion below
+/// UNREACHABLE from any real call site: a dead bus arrived at the consumer as
+/// `NotApplicable`, so it fell through and kept probing a bus that was gone.
+pub fn step_err(e: crate::scsi::ScsiError) -> Error {
+    let err = Error::Scsi(e);
+    if err.is_transport_failure() {
+        err
+    } else {
+        Error::CssAuthFailed
+    }
 }
 
 impl From<crate::scsi::ScsiError> for Error {
@@ -31,11 +56,37 @@ impl From<crate::scsi::ScsiError> for Error {
 /// "this unlocker didn't apply" (a transport fault still surfaces as Transport).
 impl From<Error> for crate::UnlockError {
     fn from(e: Error) -> Self {
-        match e {
-            Error::Scsi(s) if s.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE => {
-                crate::UnlockError::Transport
-            }
-            _ => crate::UnlockError::NotApplicable,
+        if e.is_transport_failure() {
+            crate::UnlockError::Transport
+        } else {
+            crate::UnlockError::NotApplicable
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::UnlockError;
+    use crate::scsi::{SCSI_STATUS_CHECK_CONDITION, SCSI_STATUS_TRANSPORT_FAILURE, ScsiError};
+
+    /// Catches restoring the `.map_err(|_| CssAuthFailed)` that made the
+    /// `Transport` arm unreachable: a dead bus must classify as `Transport`
+    /// (consumer aborts), a drive rejection as `NotApplicable` (fall through).
+    #[test]
+    fn transport_fault_survives_the_step_mapping() {
+        let dead = step_err(ScsiError {
+            status: SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        });
+        assert!(dead.is_transport_failure());
+        assert_eq!(UnlockError::from(dead), UnlockError::Transport);
+
+        let refused = step_err(ScsiError {
+            status: SCSI_STATUS_CHECK_CONDITION,
+            sense: Some([0u8; 32]),
+        });
+        assert!(matches!(refused, Error::CssAuthFailed));
+        assert_eq!(UnlockError::from(refused), UnlockError::NotApplicable);
     }
 }

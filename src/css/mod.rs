@@ -6,11 +6,54 @@
 //! actually opens scrambled-sector reads), then a best-effort, non-fatal
 //! disc-key REPORT KEY. The bytes are NOT used as keys: the descramble title
 //! key is recovered keylessly by the Stevenson known-plaintext attack (see
-//! [`super::crack_key`]).
+//! libfreemkv's `crack_key`).
 
 mod error;
-use crate::css::error::{Error, Result};
-use crate::scsi::ScsiTransport;
+use crate::css::error::{Error, Result, step_err};
+use crate::scsi::{DataDirection, ScsiTransport};
+
+/// Issue ONE CSS bus-auth CDB, honouring the transport contract.
+///
+/// The single seam every bus-auth step now goes through. It closes two holes
+/// that each step open-coded before:
+///   * `Err` was collapsed to `CssAuthFailed`, so a dead bus looked like "this
+///     unlocker doesn't apply" and the consumer kept probing it ([`step_err`]);
+///   * `Ok` was never inspected, but per the contract a CHECK CONDITION arrives
+///     as `Ok` with a non-zero `status` — so a refused command handed the step
+///     back its own zero-filled buffer to parse as drive data.
+///
+/// `min_bytes` is the number of bytes the step must actually receive (0 for a
+/// write / no-data command, whose transferred count no transport promises).
+fn css_scsi(
+    scsi: &mut dyn ScsiTransport,
+    cdb: &[u8],
+    dir: DataDirection,
+    buf: &mut [u8],
+    min_bytes: usize,
+) -> Result<()> {
+    let r = scsi.execute(cdb, dir, buf, 5_000).map_err(step_err)?;
+    if r.status != 0 {
+        tracing::debug!(
+            target: "freemkv::css",
+            phase = "css_step_check_condition",
+            opcode = cdb.first().copied().unwrap_or(0),
+            status = r.status,
+            "CSS bus-auth step returned a drive sense"
+        );
+        return Err(Error::CssAuthFailed);
+    }
+    if r.bytes_transferred < min_bytes {
+        tracing::debug!(
+            target: "freemkv::css",
+            phase = "css_step_short_response",
+            opcode = cdb.first().copied().unwrap_or(0),
+            bytes_transferred = r.bytes_transferred,
+            "CSS bus-auth step returned a short response"
+        );
+        return Err(Error::CssAuthFailed);
+    }
+    Ok(())
+}
 
 // ── CryptKey tables ───────────────────────────────────────────────────────
 
@@ -124,7 +167,7 @@ const PERM_VARIANT: [[u8; 32]; 2] = [
 /// what actually unlocks scrambled-sector reads), then a best-effort,
 /// non-fatal disc-key REPORT KEY. The title-key REPORT KEY is NOT issued: it
 /// is unnecessary (the descramble key is recovered keylessly by the Stevenson
-/// attack in [`super::crack_key`]) and its hard failure on some USB bridges
+/// attack in libfreemkv's `crack_key`) and its hard failure on some USB bridges
 /// used to abort the whole unlock (the 7014 bug). The bytes are discarded.
 pub fn unlock_css_reads(scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
     let t0 = std::time::Instant::now();
@@ -187,7 +230,7 @@ impl crate::Unlocker for DvdUnlocker {
         // DiscKind alone. If the drive does not report a DVD profile, refuse
         // (NotApplicable) WITHOUT issuing any CSS CDB, so a mis-routed
         // Blu-ray/UHD is never sent CSS bus-auth.
-        if !mounted_disc_is_dvd(scsi) {
+        if !mounted_disc_is_dvd(scsi)? {
             tracing::debug!(
                 target: "freemkv::css",
                 phase = "dvd_unlocker_not_dvd",
@@ -206,7 +249,14 @@ impl crate::Unlocker for DvdUnlocker {
 /// Transport-level "is the mounted disc a DVD?" probe (GET CONFIGURATION
 /// current-profile, DVD family `0x0010..=0x001F`). Lets the DvdUnlocker
 /// self-verify against the drive instead of trusting the caller's DiscKind.
-fn mounted_disc_is_dvd(scsi: &mut dyn ScsiTransport) -> bool {
+///
+/// `Err(Transport)` on a dead bus. This is the FIRST command the DVD unlocker
+/// issues, and its match had no `Err` arm at all: a transport fault fell into
+/// `_ => false`, which the caller turned into `NotApplicable` — a dead bus read
+/// as "not a DVD", with nothing logged anywhere on the path.
+fn mounted_disc_is_dvd(
+    scsi: &mut dyn ScsiTransport,
+) -> std::result::Result<bool, crate::UnlockError> {
     // RT=0: the 8-byte feature header carries the Current Profile in bytes 6-7.
     let cdb = [
         crate::scsi::SCSI_GET_CONFIGURATION,
@@ -221,17 +271,34 @@ fn mounted_disc_is_dvd(scsi: &mut dyn ScsiTransport) -> bool {
         0x00,
     ];
     let mut buf = [0u8; 8];
-    match scsi.execute(
-        &cdb,
-        crate::scsi::DataDirection::FromDevice,
-        &mut buf,
-        5_000,
-    ) {
-        Ok(r) if r.bytes_transferred >= 8 => {
+    match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
+        Ok(r) if r.status == 0 && r.bytes_transferred >= 8 => {
             let profile = ((buf[6] as u16) << 8) | buf[7] as u16;
-            (0x0010..=0x001F).contains(&profile)
+            Ok((0x0010..=0x001F).contains(&profile))
         }
-        _ => false,
+        // A drive sense or a short reply genuinely means "can't tell / not a
+        // DVD" — decline, but say so.
+        Ok(r) => {
+            tracing::debug!(
+                target: "freemkv::css",
+                phase = "dvd_profile_probe_inconclusive",
+                status = r.status,
+                bytes_transferred = r.bytes_transferred,
+                "GET CONFIGURATION did not report a current profile"
+            );
+            Ok(false)
+        }
+        Err(e) => {
+            let err = crate::css::error::step_err(e);
+            tracing::warn!(
+                target: "freemkv::css",
+                phase = "dvd_profile_probe_failed",
+                error_code = err.code(),
+                transport_failure = err.is_transport_failure(),
+                "GET CONFIGURATION failed while probing for a DVD"
+            );
+            Err(crate::UnlockError::from(err))
+        }
     }
 }
 
@@ -268,32 +335,46 @@ fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()>
 /// derived: descrambling is keyless (the Stevenson known-plaintext attack), so
 /// the bus key has no consumer.
 fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
-    // Invalidate all AGIDs via REPORT KEY format 0x3F
+    // Invalidate all AGIDs via REPORT KEY format 0x3F. This is also what makes
+    // an abandoned AGID self-heal — which is not a reason to abandon one.
     for agid in 0..4u8 {
-        let mut cdb = [0u8; 12];
-        cdb[0] = crate::scsi::SCSI_REPORT_KEY;
-        // alloc_len = 0 (no data transfer)
-        cdb[10] = (agid << 6) | 0x3F;
-        let mut buf = [0u8; 8];
-        let _ = scsi.execute(
-            &cdb,
-            crate::scsi::DataDirection::FromDevice,
-            &mut buf,
-            5_000,
-        );
+        release_agid(scsi, agid);
     }
 
     // Allocate AGID
     let mut buf = [0u8; 8];
-    scsi.execute(
+    css_scsi(
+        scsi,
         &report_key_cdb(0, 0x00, 8),
-        crate::scsi::DataDirection::FromDevice,
+        DataDirection::FromDevice,
         &mut buf,
-        5_000,
-    )
-    .map_err(|_| Error::CssAuthFailed)?;
+        8,
+    )?;
     let agid = (buf[7] >> 6) & 0x03;
 
+    // From here on we hold the AGID; release it on any failure (see
+    // [`release_agid`]) instead of abandoning it.
+    let r = authenticate_with_agid(scsi, agid);
+    if r.is_err() {
+        release_agid(scsi, agid);
+    }
+    r.map(|()| agid)
+}
+
+/// Release an AGID (REPORT KEY format 0x3F). Best-effort: a failure to release
+/// is not a failure of the operation that is already failing.
+fn release_agid(scsi: &mut dyn ScsiTransport, agid: u8) {
+    let mut cdb = [0u8; 12];
+    cdb[0] = crate::scsi::SCSI_REPORT_KEY;
+    cdb[10] = (agid << 6) | 0x3F;
+    let mut buf = [0u8; 8];
+    let _ = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000);
+}
+
+/// The challenge-response half of [`establish_authenticated_session`], with the
+/// AGID already allocated. Split out so its caller can release the AGID on any
+/// failure without a Drop guard or a release at each early return.
+fn authenticate_with_agid(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
     // Host sends challenge. The spec wants a fresh per-session random nonce,
     // not a fixed constant — a predictable challenge weakens the bus-auth
     // handshake.
@@ -308,23 +389,23 @@ fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     for i in 0..10 {
         hc_buf[4 + i] = host_challenge[9 - i];
     }
-    scsi.execute(
+    css_scsi(
+        scsi,
         &send_key_cdb(agid, 0x01, 16),
-        crate::scsi::DataDirection::ToDevice,
+        DataDirection::ToDevice,
         &mut hc_buf,
-        5_000,
-    )
-    .map_err(|_| Error::CssAuthFailed)?;
+        0,
+    )?;
 
     // Get Key1 from drive
     let mut dk_buf = [0u8; 12];
-    scsi.execute(
+    css_scsi(
+        scsi,
         &report_key_cdb(agid, 0x02, 12),
-        crate::scsi::DataDirection::FromDevice,
+        DataDirection::FromDevice,
         &mut dk_buf,
-        5_000,
-    )
-    .map_err(|_| Error::CssAuthFailed)?;
+        12,
+    )?;
     let mut key1 = [0u8; 5];
     for i in 0..5 {
         key1[i] = dk_buf[4 + (4 - i)];
@@ -342,13 +423,13 @@ fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
 
     // Get drive challenge
     let mut dc_buf = [0u8; 16];
-    scsi.execute(
+    css_scsi(
+        scsi,
         &report_key_cdb(agid, 0x01, 16),
-        crate::scsi::DataDirection::FromDevice,
+        DataDirection::FromDevice,
         &mut dc_buf,
-        5_000,
-    )
-    .map_err(|_| Error::CssAuthFailed)?;
+        16,
+    )?;
     let mut drive_challenge = [0u8; 10];
     for i in 0..10 {
         drive_challenge[i] = dc_buf[4 + (9 - i)];
@@ -362,25 +443,26 @@ fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     for i in 0..5 {
         hk_buf[4 + i] = key2[4 - i];
     }
-    scsi.execute(
+    css_scsi(
+        scsi,
         &send_key_cdb(agid, 0x03, 12),
-        crate::scsi::DataDirection::ToDevice,
+        DataDirection::ToDevice,
         &mut hk_buf,
-        5_000,
-    )
-    .map_err(|_| Error::CssAuthFailed)?;
+        0,
+    )?;
 
     // The authenticated session (ASF=1) is now established — scrambled-sector
     // reads are unlocked, which is the only thing we needed. The CSS bus key
     // would be CryptKey(2, variant, key1 || key2), but it has no consumer
     // (descrambling is keyless via the Stevenson attack), so it is not derived.
-    Ok(agid)
+    Ok(())
 }
 
 // ── Step 2: Disc Key ──────────────────────────────────────────────────────
 
-/// Issue READ DVD STRUCTURE format 0x02 (Copyright Information — opcode 0xAD,
-/// NOT the REPORT KEY 0xA4 disc-key block) purely for the bus-auth unlock side
+/// Issue READ DVD STRUCTURE format 0x02 (the Disc Key block — opcode 0xAD, NOT
+/// the REPORT KEY 0xA4 disc-key block; format 0x01 is Copyright Information)
+/// purely for the bus-auth unlock side
 /// effect. The returned block contents are not used — the descramble title key
 /// is recovered keylessly elsewhere, so the genuine disc-key REPORT KEY is
 /// intentionally skipped. (If a drive is ever found where bus-auth alone does
@@ -397,14 +479,10 @@ fn read_disc_key(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
     cdb[9] = alloc_len as u8;
     cdb[10] = agid << 6;
 
+    // Best-effort by design (the caller logs and continues), but a transport
+    // fault still has to be distinguishable from a drive that declined.
     let mut buf = vec![0u8; alloc_len as usize];
-    let dvd_result = scsi.execute(
-        &cdb,
-        crate::scsi::DataDirection::FromDevice,
-        &mut buf,
-        5_000,
-    );
-    dvd_result.map_err(|_| Error::CssAuthFailed)?;
+    css_scsi(scsi, &cdb, DataDirection::FromDevice, &mut buf, 0)?;
 
     Ok(())
 }
@@ -1025,5 +1103,126 @@ mod tests {
             t.non_config_cdbs, 0,
             "no CSS CDB may be issued at a non-DVD drive"
         );
+    }
+    // ── Transport-contract tests ────────────────────────────────────────────
+
+    use crate::scsi::mock::{MockTransport, Reply};
+    use crate::{DiscKind, DriveId, UnlockCtx, UnlockError, Unlocker};
+
+    /// THE defect-7 test. `mounted_disc_is_dvd` is the FIRST command the DVD
+    /// unlocker issues and its match had no `Err` arm: a transport fault fell
+    /// into `_ => false`, so a dead bus was reported as "not a DVD"
+    /// (`NotApplicable`) and the consumer kept probing it — with nothing logged
+    /// anywhere on the path. Catches restoring that catch-all arm.
+    #[test]
+    fn transport_fault_probing_for_a_dvd_aborts() {
+        let id = DriveId::default();
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        assert_eq!(r.unwrap_err(), UnlockError::Transport);
+        assert_eq!(
+            t.calls(),
+            1,
+            "must abort on the first command, not probe on"
+        );
+    }
+
+    /// A drive that REFUSES GET CONFIGURATION (CHECK CONDITION, delivered as
+    /// `Ok` per the contract) is inconclusive, not a dead bus → decline. Guards
+    /// against over-correcting defect 7 into "any probe failure aborts the rip".
+    #[test]
+    fn check_condition_probing_for_a_dvd_declines() {
+        let id = DriveId::default();
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
+    }
+
+    /// A DVD is mounted, then the bus dies during bus-auth. THE defect-2 test:
+    /// every CSS step used to do `.map_err(|_| CssAuthFailed)`, discarding the
+    /// `ScsiError` and making the `Transport` arm of the error conversion
+    /// unreachable from any real call site — so a dead bus arrived as
+    /// `NotApplicable` and the consumer went on probing it.
+    #[test]
+    fn transport_fault_during_bus_auth_aborts() {
+        let id = DriveId::default();
+        // GET CONFIGURATION reports a DVD-ROM profile (0x0010), then the bus dies.
+        let mut config = vec![0u8; 8];
+        config[6] = 0x00;
+        config[7] = 0x10;
+        let mut t = MockTransport::scripted(vec![Reply::good(config)], Reply::TransportFault);
+        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        assert_eq!(r.unwrap_err(), UnlockError::Transport);
+    }
+
+    /// The same shape with the drive REFUSING the bus-auth commands: a CSS
+    /// auth failure is a fall-through, not an abort.
+    #[test]
+    fn drive_refusing_bus_auth_is_not_applicable() {
+        let id = DriveId::default();
+        let mut config = vec![0u8; 8];
+        config[7] = 0x10;
+        let mut t = MockTransport::scripted(vec![Reply::good(config)], Reply::illegal_request());
+        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
+    }
+
+    /// A conforming transport answering the AGID allocation with a CHECK
+    /// CONDITION must NOT let the handshake carry on off the caller's own
+    /// zero-filled buffer (agid 0, a challenge answered by zeros). Catches
+    /// dropping the `status` check in `css_scsi`.
+    #[test]
+    fn agid_allocation_check_condition_fails_the_auth() {
+        // 4 AGID invalidations are best-effort; the 5th command is the alloc.
+        let mut t = MockTransport::scripted(
+            vec![
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+            ],
+            Reply::illegal_request(),
+        );
+        let e = establish_authenticated_session(&mut t).expect_err("refused alloc");
+        assert!(matches!(e, Error::CssAuthFailed));
+    }
+
+    /// Defect 18: an AGID allocated and then lost to a failed challenge must be
+    /// RELEASED (REPORT KEY format 0x3F), not abandoned. A drive has four; the
+    /// leak self-heals because the next session invalidates all of them, but
+    /// leaving a drive short between attempts is a state we should not create.
+    #[test]
+    fn a_failed_handshake_releases_the_agid_it_allocated() {
+        let mut t = MockTransport::scripted(
+            vec![
+                Reply::good(vec![0u8; 8]), // 4 × AGID invalidate
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]), // AGID allocated
+            ],
+            Reply::illegal_request(), // every challenge step is refused
+        );
+        establish_authenticated_session(&mut t).expect_err("refused challenge");
+        let last = t.cdbs.last().expect("commands were issued");
+        assert_eq!(last[0], crate::scsi::SCSI_REPORT_KEY);
+        assert_eq!(last[10] & 0x3F, 0x3F, "AGID released on the failure path");
+    }
+
+    /// A short AGID-allocation response is equally unusable — the AGID would be
+    /// read out of bytes the drive never sent.
+    #[test]
+    fn short_agid_allocation_fails_the_auth() {
+        let mut t = MockTransport::scripted(
+            vec![
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+                Reply::good(vec![0u8; 8]),
+            ],
+            Reply::short(vec![0u8; 8], 3),
+        );
+        let e = establish_authenticated_session(&mut t).expect_err("short alloc");
+        assert!(matches!(e, Error::CssAuthFailed));
     }
 }
