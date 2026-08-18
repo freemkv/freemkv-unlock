@@ -43,7 +43,12 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     let mut data = firmware.clone();
     scsi.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
 
-    // Verify firmware loaded (non-fatal — different buffer_id 0x45)
+    // Verify the firmware loaded (non-fatal — different buffer_id 0x45). There
+    // is no documented expected payload to compare against, so the outcome is
+    // TRACED rather than asserted: discarding it with `let _ =` meant a corrupt
+    // upload proceeded straight into the do_unlock retries with no diagnostic
+    // whatsoever, which is exactly the silent-failure shape this crate exists to
+    // avoid.
     let verify_cdb = [
         super::SCSI_READ_BUFFER,
         super::MODE_A,
@@ -57,12 +62,43 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         0x00,
     ];
     let mut verify_resp = [0u8; super::VALIDATE_RESPONSE_SIZE as usize];
-    let _ = scsi.execute(
+    match scsi.execute(
         &verify_cdb,
         DataDirection::FromDevice,
         &mut verify_resp,
         5_000,
-    );
+    ) {
+        Ok(r) if r.status == 0 && r.bytes_transferred == verify_resp.len() => {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "mt1959a_fw_verify_ok",
+                "variant-A firmware verify read returned a full response"
+            );
+        }
+        Ok(r) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "mt1959a_fw_verify_bad",
+                status = r.status,
+                bytes_transferred = r.bytes_transferred,
+                "variant-A firmware verify read did not return a full good response"
+            );
+        }
+        // A dead bus mid-upload must abort, not be swallowed into the unlock
+        // retries below.
+        Err(e) => {
+            let err = crate::ld::error::Error::from(e);
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "mt1959a_fw_verify_failed",
+                transport_failure = err.is_transport_failure(),
+                "variant-A firmware verify read failed"
+            );
+            if err.is_transport_failure() {
+                return Err(err);
+            }
+        }
+    }
 
     // Double unlock after firmware upload. The first establishes the
     // unlock and is fatal on failure; the second is a confirmation pass and

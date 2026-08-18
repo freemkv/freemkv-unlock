@@ -13,6 +13,47 @@ const FIRMWARE_EXTRA: [u8; 16] = [0; 16];
 /// that drive — real profiles must supply their own (see `DriveProfile`).
 const VENDOR_VERIFY: [u8; 10] = [0xF1, 0x01, 0x02, 0x00, 0x0D, 0x30, 0x01, 0xF3, 0xAD, 0x23];
 
+/// Trace the outcome of a best-effort firmware-upload step and swallow
+/// everything EXCEPT a transport fault. These steps are advisory (the unlock
+/// retries below are the real gate) but their results were previously thrown
+/// away entirely, so a firmware upload could fail end to end and leave nothing
+/// in the log to say so — and a dead bus kept the sequence running.
+fn trace_step(phase: &'static str, r: crate::scsi::Result<crate::scsi::ScsiResult>) -> Result<()> {
+    match r {
+        Ok(res) if res.status == 0 => {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase,
+                bytes_transferred = res.bytes_transferred,
+                "firmware upload step ok"
+            );
+            Ok(())
+        }
+        Ok(res) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase,
+                status = res.status,
+                "firmware upload step returned a drive sense"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let err = crate::ld::error::Error::from(e);
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase,
+                transport_failure = err.is_transport_failure(),
+                "firmware upload step failed"
+            );
+            if err.is_transport_failure() {
+                return Err(err);
+            }
+            Ok(())
+        }
+    }
+}
+
 pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Result<()> {
     let firmware = &mt.profile.firmware;
     if firmware.is_empty() {
@@ -58,12 +99,15 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         0x00,
     ];
     let mut meta_resp = [0u8; 16];
-    let _ = scsi.execute(
-        &read_meta_cdb,
-        DataDirection::FromDevice,
-        &mut meta_resp,
-        5_000,
-    );
+    trace_step(
+        "mt1959b_fw_meta",
+        scsi.execute(
+            &read_meta_cdb,
+            DataDirection::FromDevice,
+            &mut meta_resp,
+            5_000,
+        ),
+    )?;
 
     // Step 3: Write extra firmware data (all zeros)
     let write_extra_cdb = [
@@ -79,14 +123,24 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         0x00,
     ];
     let mut data2 = FIRMWARE_EXTRA.to_vec();
-    let _ = scsi.execute(&write_extra_cdb, DataDirection::ToDevice, &mut data2, 5_000);
+    trace_step(
+        "mt1959b_fw_extra",
+        scsi.execute(&write_extra_cdb, DataDirection::ToDevice, &mut data2, 5_000),
+    )?;
 
     // Step 4: Vendor verify (0xF1 — B-only, not standard SCSI). PER-DRIVE: take
     // it from the profile (39 distinct values across the 140 B drives). The
     // const is only a legacy fallback — it carries one drive's token.
+    // The result used to be discarded with `let _ =` despite the comment calling
+    // this a verify step: a corrupt upload proceeded straight to the do_unlock
+    // retries with no diagnostic. There is no documented expected payload, so
+    // the outcome is TRACED; only a dead bus aborts.
     let verify_cdb = mt.profile.fw_verify_cdb.unwrap_or(VENDOR_VERIFY);
     let mut dummy = [0u8; 0];
-    let _ = scsi.execute(&verify_cdb, DataDirection::None, &mut dummy, 5_000);
+    trace_step(
+        "mt1959b_fw_verify",
+        scsi.execute(&verify_cdb, DataDirection::None, &mut dummy, 5_000),
+    )?;
 
     // Step 5: Unlock retries (up to 5, then a final fatal attempt). On a
     // successful unlock we issue one confirmation pass; its result is
@@ -94,9 +148,14 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     // unlock state, so a hiccup on the redundant confirmation must not fail
     // an otherwise-good unlock.
     for _attempt in 0..5 {
-        if mt.do_unlock(scsi).is_ok() {
-            let _ = mt.do_unlock(scsi);
-            return Ok(());
+        match mt.do_unlock(scsi) {
+            Ok(_) => {
+                let _ = mt.do_unlock(scsi);
+                return Ok(());
+            }
+            // A dead bus will not recover across five more unlock attempts.
+            Err(e) if e.is_transport_failure() => return Err(e),
+            Err(_) => {}
         }
     }
     mt.do_unlock(scsi)?;

@@ -19,7 +19,7 @@ pub struct Profiles {
 impl Profiles {
     /// The profile matching a drive identity, if this catalog supports that
     /// drive. Two-pass per platform section: exact (incl. firmware date) then a
-    /// looser vendor/revision/vendor-specific match. See [`find_by_drive_id`].
+    /// looser vendor/revision/vendor-specific match. See `find_by_drive_id`.
     pub fn get(&self, drive_id: &crate::DriveId) -> Option<ProfileMatch> {
         find_by_drive_id(self, drive_id)
     }
@@ -41,6 +41,22 @@ pub struct Identity {
 }
 
 /// Per-drive profile.
+///
+/// VISIBILITY: only `identity` and `signature` are public — they are what the
+/// catalog is public FOR ("is this drive supported?", and the emulator's
+/// impersonation). Everything below them is unlock MECHANISM: the MediaTek
+/// firmware image and the per-drive vendor CDB templates. `Cargo.toml` says this
+/// crate is never published because it carries drive firmware; re-exporting
+/// `DriveProfile` with a `pub firmware: Vec<u8>` handed that firmware, and every
+/// vendor CDB, to any downstream crate that called `ld::profile()`. They are
+/// `pub(crate)` so the mechanism stays inside the unlocker.
+///
+/// `allow(dead_code)`: this is the on-disk catalog schema, and several captured
+/// CDB templates have no in-crate consumer yet. They were `pub` before, so the
+/// compiler saw the (external) use; making them `pub(crate)` is what exposes
+/// them as unread. Deleting them would silently drop fields from the format the
+/// profile-extraction pipeline emits.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct DriveProfile {
     pub identity: Identity,
@@ -53,7 +69,7 @@ pub struct DriveProfile {
     /// firmware-load step). JSON-encoded as standard base64; empty when
     /// the profile carries no firmware blob.
     #[serde(default, deserialize_with = "deserialize_base64")]
-    pub firmware: Vec<u8>,
+    pub(crate) firmware: Vec<u8>,
 
     // ── OEM-extended-access CDB templates ──────────────────────────────
     //
@@ -62,39 +78,39 @@ pub struct DriveProfile {
     // in the JSON as lowercase hex strings without separators
     // (e.g. `"3c014410e29100002400"` for a 10-byte CDB).
     #[serde(default)]
-    pub unlock_init_value: u8,
+    pub(crate) unlock_init_value: u8,
     #[serde(default)]
-    pub unlock_response_size: u8,
+    pub(crate) unlock_response_size: u8,
 
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub read_vid_cdb: Option<[u8; 10]>,
+    pub(crate) read_vid_cdb: Option<[u8; 10]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub read_disc_keys_cdb: Option<[u8; 10]>,
+    pub(crate) read_disc_keys_cdb: Option<[u8; 10]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_12")]
-    pub drive_nominal_speed_cdb: Option<[u8; 12]>,
+    pub(crate) drive_nominal_speed_cdb: Option<[u8; 12]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_12")]
-    pub set_speed_max_cdb: Option<[u8; 12]>,
+    pub(crate) set_speed_max_cdb: Option<[u8; 12]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub read10_raw_2sec_cdb: Option<[u8; 10]>,
+    pub(crate) read10_raw_2sec_cdb: Option<[u8; 10]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub read10_raw_1sec_cdb: Option<[u8; 10]>,
+    pub(crate) read10_raw_1sec_cdb: Option<[u8; 10]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub read_buffer_verify_cdb: Option<[u8; 10]>,
+    pub(crate) read_buffer_verify_cdb: Option<[u8; 10]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub write_buffer_cdb: Option<[u8; 10]>,
+    pub(crate) write_buffer_cdb: Option<[u8; 10]>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub read_buffer_unlock_cdb: Option<[u8; 10]>,
+    pub(crate) read_buffer_unlock_cdb: Option<[u8; 10]>,
     /// Variant-B vendor verify (0xF1) CDB. PER-DRIVE: 39 distinct values across
     /// the 140 B drives, so it CANNOT be a hardcoded constant. `variant_b`'s old
     /// `VENDOR_VERIFY` const was one drive's token, wrong for the other ~139.
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes_10")]
-    pub fw_verify_cdb: Option<[u8; 10]>,
+    pub(crate) fw_verify_cdb: Option<[u8; 10]>,
 
     // Per-drive identifier tables — variable-length hex strings.
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes")]
-    pub speed_zone_table: Option<Vec<u8>>,
+    pub(crate) speed_zone_table: Option<Vec<u8>>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes")]
-    pub speed_calc_table: Option<Vec<u8>>,
+    pub(crate) speed_calc_table: Option<Vec<u8>>,
 }
 
 /// Chipset + variant — determined by which section the profile was found in.
@@ -266,7 +282,24 @@ pub fn bundled() -> Option<&'static Profiles> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Option<Profiles>> = OnceLock::new();
     CACHE
-        .get_or_init(|| load_from_str(BUNDLED_PROFILES).ok())
+        .get_or_init(|| match load_from_str(BUNDLED_PROFILES) {
+            Ok(p) => Some(p),
+            // The `None` is cached PERMANENTLY (correctly — the blob is fixed at
+            // compile time), which means a bad shipped profiles.json makes
+            // LibreDrive report "drive not supported" for every drive for the
+            // life of the process. Unlogged, that is indistinguishable from a
+            // genuinely uncataloged drive; log it once, loudly, at the one place
+            // the parse happens.
+            Err(e) => {
+                tracing::error!(
+                    target: "freemkv::disc",
+                    phase = "bundled_profiles_parse_failed",
+                    error_code = e.code(),
+                    "bundled LibreDrive profile catalog failed to parse; no drive can match"
+                );
+                None
+            }
+        })
         .as_ref()
 }
 

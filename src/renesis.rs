@@ -16,23 +16,48 @@ const RB_F1_LEN: usize = 48;
 const RENESAS_MARKER: &[u8] = b"SAT";
 const RENESAS_MARKER_OFFSET: usize = 16;
 
-/// True if `scsi` is a Renesas-platform drive (Pioneer or HL-DT-ST Renesas).
+/// `Ok(true)` if `scsi` is a Renesas-platform drive (Pioneer or HL-DT-ST
+/// Renesas).
 ///
 /// Issues the vendor READ_BUFFER 0x02/0xF1 probe: a Renesas controller serves a
 /// 48-byte identity block whose bytes `[16..19]` are the ASCII `SAT` interface
-/// tag. A MediaTek drive rejects it (ILLEGAL REQUEST → `Err`), and a transport
-/// fault also yields `Err`; both return `false`. This is the definitive
-/// Renesas-vs-MediaTek split.
-pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> bool {
+/// tag. A MediaTek drive rejects it — as a CHECK CONDITION (`Ok` with a
+/// non-zero status) or, through a non-conforming transport, as an `Err`
+/// carrying a sense — which is `Ok(false)`: not a Renesas drive. This is the
+/// definitive Renesas-vs-MediaTek split.
+///
+/// A TRANSPORT fault is `Err(Transport)`. It used to be folded into the same
+/// `false` as a drive rejection, and because this probe is the first SCSI
+/// command the unlocker issues, a dead bus read as "not a Renesas drive" — the
+/// consumer then walked the remaining unlockers against a bus that was gone.
+pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
     let mut buf = [0u8; RB_F1_LEN];
     match scsi.execute(&RB_F1_CDB, DataDirection::FromDevice, &mut buf, 5_000) {
         Ok(r) => {
             let end = RENESAS_MARKER_OFFSET + RENESAS_MARKER.len();
-            r.status == 0
+            Ok(r.status == 0
                 && r.bytes_transferred >= end
-                && &buf[RENESAS_MARKER_OFFSET..end] == RENESAS_MARKER
+                && &buf[RENESAS_MARKER_OFFSET..end] == RENESAS_MARKER)
         }
-        Err(_) => false,
+        // Only a senseless transport-failure status is a dead bus; anything
+        // else the transport reports as `Err` is the drive refusing.
+        Err(e) => {
+            if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "renesas_probe_transport_fault",
+                    "transport fault on the Renesas identity probe; aborting"
+                );
+                return Err(UnlockError::Transport);
+            }
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "renesas_probe_rejected",
+                status = e.status,
+                "Renesas identity probe rejected by the drive; not a Renesas platform"
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -60,7 +85,7 @@ impl Unlocker for Renesis {
         scsi: &mut dyn ScsiTransport,
         _ctx: &UnlockCtx,
     ) -> std::result::Result<Unlocked, UnlockError> {
-        if !is_renesas(scsi) {
+        if !is_renesas(scsi)? {
             return Err(UnlockError::NotApplicable);
         }
         tracing::debug!(
@@ -104,7 +129,11 @@ mod tests {
         }
     }
 
-    /// Rejects the command (a MediaTek drive → ILLEGAL REQUEST → transport `Err`).
+    /// Rejects the command the way a MediaTek drive does: ILLEGAL REQUEST. The
+    /// sense is what distinguishes this from a dead bus — the old fixture sent
+    /// `sense: None`, which is the wire shape of a TRANSPORT fault, and the test
+    /// built on it asserted `NotApplicable`, pinning exactly the
+    /// misclassification this file had.
     struct RejectingTransport;
     impl ScsiTransport for RejectingTransport {
         fn execute(
@@ -114,9 +143,12 @@ mod tests {
             _data: &mut [u8],
             _timeout_ms: u32,
         ) -> Result<ScsiResult> {
+            let mut sense = [0u8; 32];
+            sense[2] = 0x05; // ILLEGAL REQUEST
+            sense[12] = 0x20; // invalid command operation code
             Err(ScsiError {
                 status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
-                sense: None,
+                sense: Some(sense),
             })
         }
     }
@@ -133,13 +165,13 @@ mod tests {
         let mut t = RenesasTransport {
             payload: renesas_payload(),
         };
-        assert!(is_renesas(&mut t));
+        assert!(is_renesas(&mut t).expect("no transport fault"));
     }
 
     #[test]
     fn is_renesas_false_when_command_rejected() {
         let mut t = RejectingTransport;
-        assert!(!is_renesas(&mut t));
+        assert!(!is_renesas(&mut t).expect("a drive rejection is not a bus fault"));
     }
 
     #[test]
@@ -148,7 +180,7 @@ mod tests {
         let mut t = RenesasTransport {
             payload: vec![0u8; 48],
         };
-        assert!(!is_renesas(&mut t));
+        assert!(!is_renesas(&mut t).expect("no transport fault"));
     }
 
     #[test]
@@ -157,7 +189,7 @@ mod tests {
         let mut t = RenesasTransport {
             payload: vec![0x20u8; 8],
         };
-        assert!(!is_renesas(&mut t));
+        assert!(!is_renesas(&mut t).expect("no transport fault"));
     }
 
     #[test]
@@ -179,6 +211,8 @@ mod tests {
         assert_eq!(u.bus_key, None);
     }
 
+    /// A drive REJECTION (ILLEGAL REQUEST, with a sense) is "not a Renesas
+    /// drive" → fall through to the next unlocker.
     #[test]
     fn features_not_applicable_on_non_renesas() {
         let mut t = RejectingTransport;
@@ -186,6 +220,35 @@ mod tests {
         let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
         let err = Renesis::new().unlock_features(&mut t, &ctx).unwrap_err();
         assert_eq!(err, UnlockError::NotApplicable);
+    }
+
+    /// The same rejection delivered the way a CONFORMING transport delivers it —
+    /// `Ok` with a CHECK CONDITION status — must reach the same answer. Catches
+    /// dropping the `r.status == 0` check, which would read the probe buffer's
+    /// zero fill as an identity block.
+    #[test]
+    fn check_condition_is_not_a_renesas_drive() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut t = MockTransport::always(Reply::illegal_request());
+        assert!(!is_renesas(&mut t).expect("a drive sense is not a bus fault"));
+    }
+
+    /// THE defect-8 test: a dead bus on the FIRST command the unlocker issues
+    /// must abort the consumer, not be reported as "not a Renesas drive".
+    /// Catches restoring the `Err(_) => false` arm.
+    #[test]
+    fn transport_fault_aborts_instead_of_declining() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut t = MockTransport::always(Reply::TransportFault);
+        assert_eq!(is_renesas(&mut t).unwrap_err(), UnlockError::Transport);
+
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
+        assert_eq!(
+            Renesis::new().unlock_features(&mut t, &ctx).unwrap_err(),
+            UnlockError::Transport
+        );
     }
 
     #[test]

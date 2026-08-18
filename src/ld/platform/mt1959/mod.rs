@@ -37,6 +37,9 @@ const FIRMWARE_ACTIVE_SIG: [u8; 4] = [0x4D, 0x4D, 0x6B, 0x76];
 /// response, not a stale image's residual buffer.
 const FIRMWARE_MODE_OFFSET: usize = 16;
 const FIRMWARE_MODE_SIG: [u8; 4] = [0x4C, 0x62, 0x44, 0x72];
+/// Fewest bytes an unlock response must carry before ANY of its three checks
+/// mean anything — through the secondary marker at [16..20].
+const MIN_UNLOCK_RESPONSE: usize = FIRMWARE_MODE_OFFSET + 4;
 
 // ── Init address (per disc type) ──────────────────────────────────────
 const INIT_ADDR_BD: u16 = 0x0100;
@@ -123,11 +126,17 @@ impl Mt1959 {
         );
         let cdb = self.read_buffer_sub(sub_cmd, address, expected as u8);
         let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 5_000)?;
-        if result.bytes_transferred != expected {
+        // A drive sense arrives as `Ok` with a non-zero status (the transport
+        // contract), and a merely SHORT response is the drive answering badly —
+        // neither is a dead bus. Fabricating a transport-failure status here
+        // turned a short probe reply into a hard abort of a rip that would
+        // otherwise have succeeded; a real transport fault still propagates
+        // through the `?` above with its own status.
+        if result.status != 0 || result.bytes_transferred != expected {
             return Err(Error::Scsi {
                 opcode: SCSI_READ_BUFFER,
-                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
-                sense: None,
+                status: result.status,
+                sense: Some(result.sense),
             });
         }
         Ok(result.bytes_transferred)
@@ -158,23 +167,48 @@ impl Mt1959 {
         let mut response = vec![0u8; UNLOCK_RESPONSE_SIZE as usize];
         let result = scsi.execute(&cdb, DataDirection::FromDevice, &mut response, 30_000)?;
 
+        // A drive sense arrives as `Ok` with a non-zero status; treating it as
+        // a successful unlock would validate the caller's own zero fill.
+        if result.status != 0 {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "mt1959_unlock_check_condition",
+                status = result.status,
+                "unlock READ_BUFFER returned a drive sense"
+            );
+            return Err(Error::Scsi {
+                opcode: SCSI_READ_BUFFER,
+                status: result.status,
+                sense: Some(result.sense),
+            });
+        }
+
         // `response` is a fixed 64-byte buffer, so `response.len()` is
         // always >= every offset below — the meaningful bound is how many
-        // bytes the drive actually delivered. Validate against
-        // `bytes_transferred` so a short/partial transfer (stale trailing
-        // zeros) can't be read as if the drive sent real marker bytes.
+        // bytes the drive actually delivered. Every marker check MUST be
+        // reachable: when the checks were each guarded by their own `n >= ..`
+        // the drive delivering ZERO bytes skipped all three and `do_unlock`
+        // returned `Ok` on a buffer the drive never wrote. Require enough bytes
+        // to actually validate, up front.
         let n = result.bytes_transferred.min(response.len());
+        if n < MIN_UNLOCK_RESPONSE {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "mt1959_unlock_short_response",
+                bytes_transferred = result.bytes_transferred,
+                "unlock response too short to validate"
+            );
+            return Err(Error::UnlockFailed);
+        }
 
-        if n >= 4 && response[0..4] != self.profile.signature {
+        if response[0..4] != self.profile.signature {
             return Err(Error::SignatureMismatch {
                 expected: self.profile.signature,
                 got: response[0..4].try_into().unwrap_or([0; 4]),
             });
         }
 
-        if n >= FIRMWARE_ACTIVE_OFFSET + 4
-            && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] != FIRMWARE_ACTIVE_SIG
-        {
+        if response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] != FIRMWARE_ACTIVE_SIG {
             return Err(Error::UnlockFailed);
         }
 
@@ -187,9 +221,8 @@ impl Mt1959 {
         // the rest of the response. Requiring both before we tell the
         // upper layer "OEM path is live" keeps any partial / corrupted
         // response from steering us off the cert-auth fallback.
-        self.unlocked = n >= FIRMWARE_MODE_OFFSET + 4
-            && response[FIRMWARE_ACTIVE_OFFSET..FIRMWARE_ACTIVE_OFFSET + 4] == FIRMWARE_ACTIVE_SIG
-            && response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
+        self.unlocked =
+            response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
 
         self.init_complete = true;
         Ok(response)
@@ -210,52 +243,116 @@ impl Mt1959 {
                 0x00,
             ];
             let mut resp = [0u8; 4];
-            if scsi
-                .execute(&cdb, DataDirection::FromDevice, &mut resp, 5_000)
-                .is_ok()
-            {
-                return Ok(());
+            match scsi.execute(&cdb, DataDirection::FromDevice, &mut resp, 5_000) {
+                // A drive sense arrives as `Ok`; only a GOOD status is a pass.
+                Ok(r) if r.status == 0 => return Ok(()),
+                Ok(r) => {
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_validate_check_condition",
+                        status = r.status,
+                        "validate READ_BUFFER returned a drive sense"
+                    );
+                }
+                // A dead bus will not recover across five more retries, and
+                // labelling every other failure "transport" made the consumer
+                // abort rips it could have completed. Propagate the real fault.
+                Err(e) => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_validate_transport_fault",
+                        "transport fault during validate; aborting"
+                    );
+                    return Err(Error::from(e));
+                }
             }
         }
-        Err(Error::Scsi {
-            opcode: SCSI_READ_BUFFER,
-            status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
-            sense: None,
-        })
+        Err(Error::UnlockFailed)
     }
 
     // ── Init (unlock + firmware) ───────────────────────────────────────
 
     fn run_init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
-        let mut succeeded = false;
-        for _attempt in 0..3 {
+        let mut last_err = Error::UnlockFailed;
+        for attempt in 0..3 {
             match self.do_unlock(scsi) {
                 Ok(_) => {
-                    succeeded = true;
-                    break;
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_unlock_ok",
+                        attempt,
+                        unlocked = self.unlocked,
+                        "MT1959 unlock handshake completed"
+                    );
+                    return Ok(());
                 }
                 Err(Error::SignatureMismatch { .. }) => {
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_signature_mismatch",
+                        attempt,
+                        "unlock response carried another drive's signature"
+                    );
                     return Err(Error::UnlockFailed);
                 }
-                Err(_) => {
+                // A transport fault means the bus is gone. Re-uploading firmware
+                // into a dead bus three times accomplishes nothing and the
+                // generic UnlockFailed it used to end on is classified as
+                // "unlocker not applicable", so the consumer kept probing a dead
+                // drive instead of aborting. Surface the fault unchanged.
+                Err(e) if e.is_transport_failure() => {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_transport_fault",
+                        attempt,
+                        "transport fault during unlock; aborting"
+                    );
+                    return Err(e);
+                }
+                Err(e) => {
+                    last_err = e;
                     let loaded = if self.mode == MODE_A {
-                        variant_a::load_firmware(self, scsi).is_ok()
+                        variant_a::load_firmware(self, scsi)
                     } else {
-                        variant_b::load_firmware(self, scsi).is_ok()
+                        variant_b::load_firmware(self, scsi)
                     };
-                    if !loaded {
-                        continue;
+                    match loaded {
+                        // Same rule on the upload path: a dead bus aborts.
+                        Err(e) if e.is_transport_failure() => {
+                            tracing::warn!(
+                                target: "freemkv::disc",
+                                phase = "mt1959_transport_fault",
+                                attempt,
+                                "transport fault during firmware upload; aborting"
+                            );
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                target: "freemkv::disc",
+                                phase = "mt1959_firmware_upload_failed",
+                                attempt,
+                                error = %e,
+                                "firmware upload failed; retrying unlock"
+                            );
+                            last_err = e;
+                            continue;
+                        }
+                        Ok(()) => {
+                            // Firmware upload resets the drive. Give it time to
+                            // fully recover before retrying unlock.
+                            std::thread::sleep(std::time::Duration::from_secs(10));
+                        }
                     }
-                    // Firmware upload resets the drive. Give it time to
-                    // fully recover before retrying unlock.
-                    std::thread::sleep(std::time::Duration::from_secs(10));
                 }
             }
         }
-        if !succeeded {
-            return Err(Error::UnlockFailed);
-        }
-        Ok(())
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "mt1959_unlock_exhausted",
+            "MT1959 unlock did not succeed after 3 attempts"
+        );
+        Err(last_err)
     }
 
     // ── Probe disc ─────────────────────────────────────────────────────
@@ -285,10 +382,12 @@ impl Mt1959 {
             0x00,
         ];
         let mut cap_buf = [0u8; READ_CAPACITY_RESPONSE_SIZE];
-        let disc_sectors = if scsi
-            .execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000)
-            .is_ok()
-        {
+        // A transport fault here is a dead bus: propagate it (the caller
+        // classifies it as `Transport` and aborts) instead of silently
+        // defaulting the disc type. A drive sense (`Ok`, non-zero status) or a
+        // short reply just means "capacity unknown" -> assume BD.
+        let cap = scsi.execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000)?;
+        let disc_sectors = if cap.status == 0 && cap.bytes_transferred >= 4 {
             // last_lba + 1 = sector count. A 0xFFFFFFFF last-LBA is the
             // READ CAPACITY(10) "capacity exceeds 32 bits" sentinel; saturate
             // rather than wrap to 0 (which would misclassify a huge disc as
@@ -325,19 +424,30 @@ impl Mt1959 {
                     &mut resp,
                     PROBE_RESPONSE_SIZE as usize,
                 )
+                .inspect_err(|e| {
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_probe_failed",
+                        addr,
+                        error = %e,
+                        "coarse speed probe failed"
+                    );
+                })
                 .is_err()
             {
-                return Err(Error::Scsi {
-                    opcode: SCSI_READ_BUFFER,
-                    status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
-                    sense: None,
-                });
+                // Surface the drive's OWN failure. Re-labelling it as a
+                // transport failure turned a short/rejected probe response into
+                // a hard abort of the whole rip.
+                return Err(Error::UnlockFailed);
             }
             addr = addr.wrapping_add(PROBE_STEP);
         }
 
-        // Pass 2: fine scan
-        let mut addr: u32 = 0;
+        // Pass 2: continue past the coarse range. It used to restart at 0 with
+        // the SAME PROBE_STEP, re-issuing all 88 pass-1 addresses verbatim — 88
+        // redundant SCSI round-trips per disc, which dominates drive prep at
+        // real bus latency and teaches the drive's speed table nothing new.
+        let mut addr: u32 = PROBE_COARSE_END as u32;
         while addr < PROBE_FINE_END {
             let mut resp = [0u8; PROBE_RESPONSE_SIZE as usize];
             if self
@@ -481,6 +591,176 @@ mod tests {
             .expect("MODE SELECT issued");
         let len = ((ms[7] as usize) << 8) | ms[8] as usize;
         assert_eq!(len, 2208, "MODE SELECT length = firmware.len(), not 2496");
+    }
+
+    /// variant_a had no direct test at all (variant_b did). Pins its upload
+    /// sequence: WRITE_BUFFER carrying the firmware at its real per-drive
+    /// length in the CDB's 24-bit length field, then the 0x45 verify READ_BUFFER
+    /// whose result used to be discarded outright.
+    #[test]
+    fn variant_a_uploads_at_the_real_length_and_issues_the_verify_read() {
+        let mut profile = fixture_profile([0x11, 0x22, 0x33, 0x44]);
+        profile.firmware = vec![0u8; 2208];
+
+        let mut mt = Mt1959::new(profile, false);
+        let mut t = RecordingTransport { cdbs: Vec::new() };
+        let _ = variant_a::load_firmware(&mut mt, &mut t);
+
+        let wb = t
+            .cdbs
+            .iter()
+            .find(|c| c.first() == Some(&SCSI_WRITE_BUFFER))
+            .expect("WRITE_BUFFER issued");
+        let len = ((wb[6] as usize) << 16) | ((wb[7] as usize) << 8) | wb[8] as usize;
+        assert_eq!(len, 2208, "24-bit CDB length must be firmware.len()");
+
+        assert!(
+            t.cdbs
+                .iter()
+                .any(|c| c.first() == Some(&SCSI_READ_BUFFER) && c.get(2) == Some(&0x45)),
+            "the 0x45 verify READ_BUFFER must be issued"
+        );
+    }
+
+    /// An EMPTY firmware blob cannot be uploaded — catches a profile whose
+    /// firmware failed to decode being pushed at the drive as a zero-length
+    /// WRITE_BUFFER.
+    #[test]
+    fn variant_a_refuses_an_empty_firmware_blob() {
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let mut t = RecordingTransport { cdbs: Vec::new() };
+        let e = variant_a::load_firmware(&mut mt, &mut t).expect_err("no firmware");
+        assert!(matches!(e, Error::UnlockFailed));
+        assert!(t.cdbs.is_empty(), "no CDB may reach the drive");
+    }
+
+    /// THE defect-15 test. A drive that returns ZERO bytes used to skip the
+    /// signature check, the firmware-active check AND the mode check — every
+    /// gate was individually guarded by its own `n >= ..` — so `do_unlock`
+    /// returned `Ok(vec![0u8; 64])` and (with the old `drive_unlocked: true`)
+    /// reported a fully unlocked drive. Catches restoring those per-check
+    /// guards.
+    #[test]
+    fn do_unlock_rejects_a_zero_length_response() {
+        let sig = [0x99, 0x9E, 0xC3, 0x75];
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::zero_transfer(64));
+        let mut mt = Mt1959::new(fixture_profile(sig), false);
+        let e = mt.do_unlock(&mut t).expect_err("no bytes is not an unlock");
+        assert!(matches!(e, Error::UnlockFailed));
+        assert!(!mt.init_complete);
+        assert!(!mt.is_unlocked());
+    }
+
+    /// A response truncated just below the secondary marker is equally
+    /// unverifiable — the checks must not run against the caller's zero fill.
+    #[test]
+    fn do_unlock_rejects_a_response_too_short_to_validate() {
+        let sig = [0x99, 0x9E, 0xC3, 0x75];
+        let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(response, 19));
+        let mut mt = Mt1959::new(fixture_profile(sig), false);
+        let e = mt
+            .do_unlock(&mut t)
+            .expect_err("19 bytes cannot carry the markers");
+        assert!(matches!(e, Error::UnlockFailed));
+    }
+
+    /// A CHECK CONDITION arrives as `Ok` per the transport contract; treating it
+    /// as an unlock would validate the caller's own zero fill.
+    #[test]
+    fn do_unlock_rejects_a_check_condition() {
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::illegal_request());
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let e = mt
+            .do_unlock(&mut t)
+            .expect_err("a drive sense is not an unlock");
+        assert!(!e.is_transport_failure(), "a sense is not a dead bus");
+    }
+
+    /// THE defect-16 test (the inverse misclassification). A merely SHORT probe
+    /// response used to be fabricated into a transport-failure status, which
+    /// hard-aborts a rip that would otherwise have succeeded. Catches
+    /// reintroducing the fabricated 0xFF.
+    #[test]
+    fn short_probe_response_is_not_a_transport_failure() {
+        let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(
+            vec![0u8; 4],
+            2,
+        ));
+        let mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let mut buf = [0u8; 4];
+        let e = mt
+            .read_buffer_probe(&mut t, SUB_CMD_PROBE, 0, &mut buf, 4)
+            .expect_err("short probe");
+        assert!(
+            !e.is_transport_failure(),
+            "a short probe response must not abort the rip"
+        );
+        assert_eq!(
+            crate::UnlockError::from(e),
+            crate::UnlockError::NotApplicable
+        );
+    }
+
+    /// A genuine transport fault on the probe still propagates as one.
+    #[test]
+    fn transport_fault_on_probe_is_a_transport_failure() {
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
+        let mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let mut buf = [0u8; 4];
+        let e = mt
+            .read_buffer_probe(&mut t, SUB_CMD_PROBE, 0, &mut buf, 4)
+            .expect_err("dead bus");
+        assert!(e.is_transport_failure());
+    }
+
+    /// THE defect-4 test. A dead bus must abort `run_init` at once. It used to
+    /// match `Err(_)` and re-upload firmware into the dead bus on all three
+    /// attempts, then return the generic `UnlockFailed`, which classifies as
+    /// `NotApplicable` — so the consumer kept probing. Catches removing the
+    /// `is_transport_failure` arm.
+    #[test]
+    fn run_init_aborts_on_a_transport_fault_without_reloading_firmware() {
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let e = mt.init(&mut t).expect_err("dead bus");
+        assert!(e.is_transport_failure());
+        assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
+        assert_eq!(t.calls(), 1, "one command, then abort — no firmware reload");
+    }
+
+    /// THE defect-14 test. The two probe passes used to walk the SAME addresses
+    /// at the SAME step: pass 2 restarted at 0 and re-issued all 88 pass-1
+    /// probes verbatim. Catches restoring the overlap.
+    #[test]
+    fn probe_passes_do_not_reissue_the_same_addresses() {
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::good(vec![0u8; 8]));
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let _ = mt.run_probe(&mut t);
+
+        // Every SUB_CMD_PROBE CDB carries its address at bytes 4-5.
+        let mut probes: Vec<u16> = t
+            .cdbs
+            .iter()
+            .filter(|c| c.first() == Some(&SCSI_READ_BUFFER) && c.get(3) == Some(&SUB_CMD_PROBE))
+            .map(|c| ((c[4] as u16) << 8) | c[5] as u16)
+            .collect();
+        let issued = probes.len();
+        probes.sort_unstable();
+        probes.dedup();
+        assert_eq!(
+            issued,
+            probes.len(),
+            "no probe address may be issued twice ({} duplicates)",
+            issued - probes.len()
+        );
     }
 
     fn fixture_profile(signature: [u8; 4]) -> DriveProfile {

@@ -25,6 +25,15 @@ pub enum Error {
     AacsVidRead,
     HandshakeRejected,
     VidUnavailable,
+    /// A handshake step returned FEWER bytes than the protocol step requires.
+    /// The buffer the step would have parsed is the caller's own zero fill, so
+    /// consuming it would turn a failed command into a "successful" handshake
+    /// step built entirely out of zeros.
+    ShortTransfer {
+        opcode: u8,
+        expected: usize,
+        got: usize,
+    },
     /// A SCSI command failed. `status == SCSI_STATUS_TRANSPORT_FAILURE` with
     /// `sense: None` is a transport-layer fault; a CHECK CONDITION carries the
     /// parsed [`ScsiSense`].
@@ -54,6 +63,7 @@ impl Error {
             Error::AacsVidRead => 7012,
             Error::HandshakeRejected => 7013,
             Error::VidUnavailable => 7014,
+            Error::ShortTransfer { .. } => 7015,
             Error::Scsi { .. } => 7099,
         }
     }

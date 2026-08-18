@@ -10,7 +10,10 @@
 // needs (the real unlocker drives its CDBs from per-drive profile templates, not
 // these constants). Compile it only when the `emulation` feature exposes it, so
 // it never dead-codes in a normal build.
-#[cfg(feature = "emulation")]
+// Compiled under `cfg(test)` as well as the feature: its tests pin the unlock
+// wire format, and gating the whole module on a non-default feature meant CI
+// (which builds with default features) never ran them.
+#[cfg(any(feature = "emulation", test))]
 mod cdb;
 mod error;
 mod platform;
@@ -75,23 +78,42 @@ pub(crate) fn firmware_name(id: &DriveId) -> Option<&'static str> {
 impl LibreDrive {
     /// Read the OEM Volume ID via the matched profile's vendor CDB.
     ///
+    /// Takes the profile the caller ALREADY matched rather than re-running
+    /// `find_bundled`: the catalog is 206 entries and drive-prep used to scan it
+    /// twice per drive (once here, once in `firmware_unlock`) for the same
+    /// answer.
+    ///
     /// `Ok(Some(vid))` on a well-formed 36-byte response (signature `00 22 00`,
     /// VID at `[4..20]`); `Ok(None)` when there is no OEM-VID CDB or the response
-    /// is short / bad-signature (the drive is still unlocked, just no VID); `Err`
-    /// only on a transport fault.
-    fn read_oem_vid(&self, scsi: &mut dyn ScsiTransport, id: &DriveId) -> Result<Option<[u8; 16]>> {
+    /// is short / bad-signature / drive-rejected (the drive is still unlocked,
+    /// just no VID); `Err` only on a transport fault.
+    fn read_oem_vid(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        profile: &profile::DriveProfile,
+    ) -> Result<Option<[u8; 16]>> {
         const RESPONSE_LEN: usize = 36;
         const EXPECTED_HEADER: [u8; 3] = [0x00, 0x22, 0x00];
 
-        let Some(m) = profile::find_bundled(id) else {
-            return Ok(None);
-        };
-        let Some(cdb) = m.profile.read_vid_cdb else {
+        let Some(cdb) = profile.read_vid_cdb else {
             return Ok(None);
         };
 
         let mut buf = vec![0u8; RESPONSE_LEN];
         let result = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
+        // Per the transport contract a drive sense arrives as `Ok` with a
+        // non-zero `status`, NOT as `Err`. Without this check a CHECK CONDITION
+        // would be read as a successful 36-byte response and the caller's own
+        // zero fill parsed as a Volume ID.
+        if result.status != 0 {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "oem_vid_check_condition",
+                status = result.status,
+                "OEM VID CDB returned a drive sense"
+            );
+            return Ok(None);
+        }
         if result.bytes_transferred < RESPONSE_LEN {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -141,13 +163,39 @@ impl LibreDrive {
         }
         let is_variant_b = matches!(m.platform, profile::Platform::Mt1959B);
         use platform::PlatformDriver;
-        let mut mt = platform::mt1959::Mt1959::new(m.profile, is_variant_b);
+        let mut mt = platform::mt1959::Mt1959::new(m.profile.clone(), is_variant_b);
         // A transport fault → UnlockError::Transport; any other firmware failure
         // → NotApplicable (via From<error::Error>).
         mt.init(scsi)?;
-        // Prime the per-region speed table (best-effort — must not fail the unlock).
-        let _ = mt.probe_disc(scsi);
-        let vid = self.read_oem_vid(scsi, id)?;
+        // `init` only proves the handshake COMPLETED — `do_unlock` returns Ok on
+        // a response that carried the per-drive signature but not both firmware
+        // markers. Only `is_unlocked()` means the drive actually reached the
+        // extended-access state and serves clear content. Reporting
+        // `drive_unlocked: true` off `init` alone told the consumer the bus was
+        // clear on a half-unlocked drive, which suppressed the cert-auth
+        // fallback and shipped ciphertext at rc=0. A partial unlock must fall
+        // through to the next unlocker.
+        if !mt.is_unlocked() {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "firmware_unlock_incomplete",
+                "firmware handshake completed but the drive is not in the extended-access state; falling through"
+            );
+            return Err(UnlockError::NotApplicable);
+        }
+        // Prime the per-region speed table. Best-effort — it must not fail the
+        // unlock — but NOT silent: speed calibration can fail completely, and an
+        // unlogged `let _ =` made a fully-failed calibration indistinguishable
+        // from a successful one in the rip log.
+        if let Err(e) = mt.probe_disc(scsi) {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "probe_disc_failed",
+                transport_failure = e.is_transport_failure(),
+                "disc speed calibration failed; continuing with the drive's default speed table"
+            );
+        }
+        let vid = self.read_oem_vid(scsi, &m.profile)?;
         Ok(Unlocked {
             vid,
             bus_key: None,
@@ -235,16 +283,21 @@ mod tests {
         }
     }
 
-    /// A well-formed 36-byte response (signature 00 22 00, VID at [4..20]) parses
-    /// to `Some(vid)`.
-    #[test]
-    fn read_oem_vid_parses_well_formed_response() {
+    /// The bundled profile of the fixture drive (the one carrying a real
+    /// `read_vid_cdb`).
+    fn known_vid_profile() -> profile::DriveProfile {
         let m = profile::find_bundled(&known_vid_drive_id()).expect("profile match");
         assert!(
             m.profile.read_vid_cdb.is_some(),
             "test fixture drive must carry an OEM VID CDB"
         );
+        m.profile
+    }
 
+    /// A well-formed 36-byte response (signature 00 22 00, VID at [4..20]) parses
+    /// to `Some(vid)`.
+    #[test]
+    fn read_oem_vid_parses_well_formed_response() {
         let mut payload = vec![0u8; 36];
         payload[0..3].copy_from_slice(&[0x00, 0x22, 0x00]);
         let vid = [0x3Cu8; 16];
@@ -254,7 +307,7 @@ mod tests {
             bytes_transferred: 36,
         };
         let got = LibreDrive::new()
-            .read_oem_vid(&mut t, &known_vid_drive_id())
+            .read_oem_vid(&mut t, &known_vid_profile())
             .expect("parse ok");
         assert_eq!(got, Some(vid), "VID parsed from [4..20]");
     }
@@ -267,7 +320,7 @@ mod tests {
             bytes_transferred: 20,
         };
         let got = LibreDrive::new()
-            .read_oem_vid(&mut t, &known_vid_drive_id())
+            .read_oem_vid(&mut t, &known_vid_profile())
             .expect("short response is Ok(None)");
         assert_eq!(got, None);
     }
@@ -282,21 +335,49 @@ mod tests {
             bytes_transferred: 36,
         };
         let got = LibreDrive::new()
-            .read_oem_vid(&mut t, &known_vid_drive_id())
+            .read_oem_vid(&mut t, &known_vid_profile())
             .expect("bad header is Ok(None)");
         assert_eq!(got, None);
     }
 
-    /// A drive with no matching profile → `read_oem_vid` is `Ok(None)`.
+    /// Catches dropping the `result.status` check: a CHECK CONDITION arrives as
+    /// `Ok` per the transport contract, so without it the caller's zero-filled
+    /// buffer is parsed as a real 36-byte response.
     #[test]
-    fn read_oem_vid_no_profile_is_none() {
+    fn read_oem_vid_check_condition_is_none_not_a_vid() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let got = LibreDrive::new()
+            .read_oem_vid(&mut t, &known_vid_profile())
+            .expect("a drive sense is not a transport fault");
+        assert_eq!(got, None, "a CHECK CONDITION must never yield a VID");
+    }
+
+    /// Catches swallowing a transport fault in the OEM-VID read: a dead bus must
+    /// propagate (→ `UnlockError::Transport`), never become `Ok(None)`.
+    #[test]
+    fn read_oem_vid_transport_fault_propagates() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let err = LibreDrive::new()
+            .read_oem_vid(&mut t, &known_vid_profile())
+            .expect_err("a dead bus must not be Ok(None)");
+        assert!(err.is_transport_failure());
+        assert_eq!(UnlockError::from(err), UnlockError::Transport);
+    }
+
+    /// A profile with no OEM-VID CDB → `Ok(None)` without touching the drive.
+    #[test]
+    fn read_oem_vid_no_cdb_is_none() {
+        let mut p = known_vid_profile();
+        p.read_vid_cdb = None;
         let mut t = FakeTransport {
             payload: vec![0u8; 36],
             bytes_transferred: 36,
         };
         let got = LibreDrive::new()
-            .read_oem_vid(&mut t, &make_drive_id("FAKE-VND", "9.99", "XX12345", ""))
-            .expect("no profile is Ok(None)");
+            .read_oem_vid(&mut t, &p)
+            .expect("no CDB is Ok(None)");
         assert_eq!(got, None);
     }
 
@@ -315,5 +396,70 @@ mod tests {
             )
             .expect_err("no profile → NotApplicable");
         assert_eq!(err, UnlockError::NotApplicable);
+    }
+
+    /// THE defect-1 test. The drive answers every unlock READ_BUFFER with a
+    /// response carrying the per-drive signature and the primary firmware marker
+    /// but NOT the secondary one — `do_unlock` returns `Ok` and `init()`
+    /// succeeds, yet the drive is NOT in the extended-access state. Reporting
+    /// `drive_unlocked: true` here suppresses the cert-auth fallback. Catches
+    /// removing the `is_unlocked()` gate in `firmware_unlock`.
+    #[test]
+    fn half_unlocked_drive_falls_through_instead_of_claiming_unlocked() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let id = known_vid_drive_id();
+        let sig = profile::find_bundled(&id)
+            .expect("profile")
+            .profile
+            .signature;
+
+        // 64-byte unlock response: signature + primary marker "MMkv" at [12..16],
+        // secondary marker at [16..20] left zeroed.
+        let mut resp = vec![0u8; 64];
+        resp[0..4].copy_from_slice(&sig);
+        resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
+
+        let mut t = MockTransport::always(Reply::good(resp));
+        let err = LibreDrive::new()
+            .unlock_features(&mut t, &ctx(&id))
+            .expect_err("a half-unlocked drive must fall through to cert-auth");
+        assert_eq!(err, UnlockError::NotApplicable);
+    }
+
+    /// The whole-unlock happy path still reports `drive_unlocked` when BOTH
+    /// firmware markers are present — the `is_unlocked()` gate must not have
+    /// made a genuinely unlocked drive fall through.
+    #[test]
+    fn fully_unlocked_drive_reports_drive_unlocked() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let id = known_vid_drive_id();
+        let sig = profile::find_bundled(&id)
+            .expect("profile")
+            .profile
+            .signature;
+
+        let mut resp = vec![0u8; 64];
+        resp[0..4].copy_from_slice(&sig);
+        resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
+        resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
+
+        let mut t = MockTransport::always(Reply::good(resp));
+        let u = LibreDrive::new()
+            .unlock_features(&mut t, &ctx(&id))
+            .expect("both markers → unlocked");
+        assert!(u.drive_unlocked);
+    }
+
+    /// Catches classifying a dead bus as "not this unlocker's drive": the very
+    /// first unlock command faulting at the transport layer must abort the
+    /// consumer (`Transport`), not fall through to the next unlocker.
+    #[test]
+    fn transport_fault_during_unlock_is_transport_not_not_applicable() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let err = LibreDrive::new()
+            .unlock_features(&mut t, &ctx(&known_vid_drive_id()))
+            .expect_err("dead bus");
+        assert_eq!(err, UnlockError::Transport);
     }
 }
