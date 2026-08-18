@@ -45,17 +45,67 @@ fn handshake_err(err: Error, fallback: Error) -> Error {
 }
 
 /// Execute a SCSI command that reads data from the device.
+///
+/// THE contract this crate is built on ([`ScsiTransport::execute`]) returns
+/// `Ok` on a SCSI sense and `Err` ONLY on a transport-layer fault. These two
+/// helpers used to propagate the `?` and nothing else — so a CHECK CONDITION
+/// (`Ok`, non-zero `status`) handed the caller back its own ZERO-FILLED buffer
+/// and every REPORT/SEND KEY step consumed zeros as valid drive data: a drive
+/// certificate of zeros, a key point of zeros, a Volume ID of zeros, all
+/// reported as success. It has not fired in production only because the sole
+/// transport implementor violates the contract in the opposite direction (it
+/// returns `Err` for any non-zero status). Plugging in a CONFORMING transport
+/// would have turned the whole handshake into a zero-buffer success, so the
+/// status and the transferred length are checked here, at the seam.
 fn scsi_read(session: &mut dyn ScsiTransport, cdb: &[u8], len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    session.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
+    let r = session.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
+    check_status(cdb, &r)?;
+    if r.bytes_transferred < len {
+        return Err(Error::ShortTransfer {
+            opcode: cdb.first().copied().unwrap_or(0),
+            expected: len,
+            got: r.bytes_transferred,
+        });
+    }
     Ok(buf)
 }
 
-/// Execute a SCSI command that writes data to the device.
+/// Execute a SCSI command that writes data to the device. Same contract
+/// reasoning as [`scsi_read`]: a drive that REFUSES the host certificate
+/// answers with `Ok` + CHECK CONDITION, and treating that as a successful send
+/// carried the handshake on against a drive that never accepted it.
 fn scsi_write(session: &mut dyn ScsiTransport, cdb: &[u8], data: &[u8]) -> Result<()> {
     let mut buf = data.to_vec();
-    session.execute(cdb, DataDirection::ToDevice, &mut buf, 5_000)?;
-    Ok(())
+    let r = session.execute(cdb, DataDirection::ToDevice, &mut buf, 5_000)?;
+    check_status(cdb, &r)
+}
+
+/// Turn a non-GOOD SCSI status into the structured `Scsi` error, carrying the
+/// parsed sense so the wedge guard in [`run_cert_handshake`] can still read
+/// ILLEGAL REQUEST off it.
+fn check_status(cdb: &[u8], r: &crate::scsi::ScsiResult) -> Result<()> {
+    if r.status == 0 {
+        return Ok(());
+    }
+    Err(Error::Scsi {
+        opcode: cdb.first().copied().unwrap_or(0),
+        status: r.status,
+        sense: Some(crate::scsi::ScsiSense::from_buf(&r.sense)),
+    })
+}
+
+/// Release an AGID by issuing REPORT KEY format 0x3F for it.
+///
+/// A drive has only four AGIDs. Every error path out of an authentication
+/// attempt used to abandon the one it had allocated; the leak self-heals
+/// because each attempt starts by invalidating all four, but leaving a drive
+/// with three of four AGIDs held between attempts is a state we should not be
+/// creating. Best-effort by construction — a failure to release is not a
+/// failure of the operation that is already failing.
+fn release_agid(session: &mut dyn ScsiTransport, agid: u8) {
+    let cdb = cdb_report_key(agid, 0x3F, 2);
+    let _ = scsi_read(session, &cdb, 2);
 }
 
 // ── AACS 1.0 elliptic curve parameters (160-bit) ───────────────────────────
@@ -901,6 +951,24 @@ pub fn aacs_authenticate(
         scsi_read(session, &cdb, 8).map_err(|e| handshake_err(e, Error::AacsAgidAlloc))?;
     let agid = (response[7] >> 6) & 0x03;
 
+    // From here on we HOLD the AGID. Every failure below used to abandon it
+    // (see [`release_agid`]); release it on the way out instead.
+    let r = aacs_authenticate_with_agid(session, agid, host_priv_key, host_cert);
+    if r.is_err() {
+        release_agid(session, agid);
+    }
+    r
+}
+
+/// Steps 3-9 of [`aacs_authenticate`], with the AGID already allocated. Split
+/// out so the single caller can release the AGID on ANY failure without a Drop
+/// guard or a release call at each of the seven early returns.
+fn aacs_authenticate_with_agid(
+    session: &mut dyn ScsiTransport,
+    agid: u8,
+    host_priv_key: &[u8; 20],
+    host_cert: &[u8],
+) -> Result<AacsAuth> {
     // Step 3: Generate host nonce and ephemeral key pair
     let mut host_nonce = [0u8; 20];
     use rand::Rng;
@@ -1168,6 +1236,16 @@ fn aacs2_authenticate_p256(
     })
 }
 
+/// Constant-time equality for two 16-byte MACs — no early exit, so the time
+/// taken does not depend on WHERE the first difference is.
+fn ct_eq_16(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..16 {
+        diff |= a[i] ^ b[i];
+    }
+    std::hint::black_box(diff) == 0
+}
+
 /// Read Volume ID after successful authentication.
 pub fn read_volume_id(session: &mut dyn ScsiTransport, auth: &mut AacsAuth) -> Result<[u8; 16]> {
     // REPORT DISC STRUCTURE format 0x80
@@ -1180,9 +1258,12 @@ pub fn read_volume_id(session: &mut dyn ScsiTransport, auth: &mut AacsAuth) -> R
     vid.copy_from_slice(&response[4..20]);
     mac.copy_from_slice(&response[20..36]);
 
-    // Verify MAC: AES-CMAC(VID, bus_key) should equal mac
+    // Verify MAC: AES-CMAC(VID, bus_key) should equal mac. Compared in constant
+    // time: `!=` on a byte array short-circuits at the first differing byte, and
+    // the adversary here is a malicious USB bridge that can time the host's
+    // reply and learn the MAC prefix byte by byte. Cheap to close.
     let calc_mac = aes_cmac_16(&vid, &auth.bus_key);
-    if calc_mac != mac {
+    if !ct_eq_16(&calc_mac, &mac) {
         return Err(Error::AacsVidMac);
     }
 
@@ -1205,6 +1286,18 @@ pub fn read_data_keys(
     enc_rdk.copy_from_slice(&response[4..20]);
     enc_wdk.copy_from_slice(&response[20..36]);
 
+    // Unlike the Volume ID block, format 0x84 carries no MAC — both 16-byte
+    // slots are key material, so there is nothing to authenticate the response
+    // against. What we CAN refuse is a response the drive plainly did not fill:
+    // an all-zero key block AES-decrypts to two perfectly plausible-looking
+    // 16-byte values, and returning those as `Ok((key, key))` is precisely the
+    // failure-that-looks-like-success shape — a bus-encrypted disc would be
+    // "decrypted" with a garbage key and rc=0. (`scsi_read` already guarantees
+    // the full 36 bytes arrived with a GOOD status.)
+    if enc_rdk == [0u8; 16] && enc_wdk == [0u8; 16] {
+        return Err(Error::AacsDataKey);
+    }
+
     // Decrypt with bus key (AES-ECB)
     let read_data_key = crate::aacs::aes_ecb_decrypt(&auth.bus_key, &enc_rdk);
     let write_data_key = crate::aacs::aes_ecb_decrypt(&auth.bus_key, &enc_wdk);
@@ -1224,6 +1317,19 @@ pub struct CertHandshake {
     pub volume_id: [u8; 16],
     pub read_data_key: Option<[u8; 16]>,
     pub read_data_key_err: Option<u16>,
+}
+
+// Manual Debug, mirroring [`AacsAuth`]: the Volume ID feeds VUK derivation and
+// the read_data_key IS the bus key, so neither may ever reach a log or a test
+// failure message in plaintext.
+impl std::fmt::Debug for CertHandshake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertHandshake")
+            .field("volume_id", &"[redacted]")
+            .field("read_data_key", &self.read_data_key.map(|_| "[redacted]"))
+            .field("read_data_key_err", &self.read_data_key_err)
+            .finish()
+    }
 }
 
 /// Run the host-certificate mutual-auth handshake over `scsi` against the given
@@ -1265,14 +1371,27 @@ pub fn run_cert_handshake(
                 let volume_id = match read_volume_id(scsi, &mut auth) {
                     Ok(vid) => vid,
                     Err(e) => {
+                        let transport = e.is_scsi_transport_failure();
                         tracing::warn!(
                             target: "freemkv::disc",
                             phase = "handshake_vid_read_failed",
                             cert_index = idx,
                             error_code = e.code(),
+                            transport_failure = transport,
                             "auth ok but volume ID read failed"
                         );
-                        return Err(UnlockError::VidUnavailable);
+                        // We authenticated, so we hold an AGID; release it
+                        // before giving up rather than leaving the drive one
+                        // short until the next attempt invalidates all four.
+                        release_agid(scsi, auth.agid);
+                        // A dead bus is NOT "the drive has no Volume ID" — that
+                        // told the consumer to fall through and keep working a
+                        // transport that is gone.
+                        return Err(if transport {
+                            UnlockError::Transport
+                        } else {
+                            UnlockError::VidUnavailable
+                        });
                     }
                 };
                 let (read_data_key, read_data_key_err) = match read_data_keys(scsi, &mut auth) {
@@ -1305,6 +1424,24 @@ pub fn run_cert_handshake(
             }
             Err(e) => {
                 last_err_code = Some(e.code());
+                // A transport fault must ABORT, not roll on to the next cert.
+                // `handshake_err` deliberately preserves transport errors so
+                // the true root cause is surfaced — and then this arm threw
+                // that away: a transport fault has no sense, so the
+                // `unwrap_or(false)` below fell through to `continue`, and the
+                // handshake ran all three certs with a 1 s backoff against a
+                // dead bus before reporting HandshakeRejected (a cert problem)
+                // for what is a replug.
+                if e.is_scsi_transport_failure() {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "handshake_transport_fault",
+                        cert_index = idx,
+                        error_code = e.code(),
+                        "transport fault during AACS auth; aborting"
+                    );
+                    return Err(UnlockError::Transport);
+                }
                 // Read the wedge sense off the structured ScsiSense, NOT
                 // `e.code()` (a flat constant for every ScsiError). On
                 // ILLEGAL_REQUEST the drive is signalling it won't talk to us
@@ -1342,6 +1479,230 @@ pub fn run_cert_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scsi::mock::{MockTransport, Reply};
+
+    // ── Transport-contract tests ────────────────────────────────────────────
+    //
+    // Before these, every one of this module's 41 tests was pure math: nothing
+    // drove `aacs_authenticate` / `run_cert_handshake` / `read_volume_id`
+    // through a transport at all, and no mock in the crate could return `Err`
+    // or a CHECK CONDITION. That gap is what let the handshake read its own
+    // zero-filled buffers as drive data and treat a dead bus as a cert problem.
+
+    /// A host cert good enough to reach the SCSI steps (the crypto is exercised
+    /// by the math tests; these tests are about the transport contract).
+    fn dummy_cert() -> crate::HostCert {
+        crate::HostCert {
+            private_key: [0x11u8; 20],
+            certificate: vec![0u8; 92],
+            private_key_v2: None,
+            certificate_v2: None,
+        }
+    }
+
+    /// Catches deleting the `status` check in `scsi_read`: per the transport
+    /// contract a CHECK CONDITION is `Ok`, so without it the step returns the
+    /// caller's ZERO-FILLED buffer as if the drive had sent it.
+    #[test]
+    fn scsi_read_rejects_a_check_condition_instead_of_returning_zeros() {
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let cdb = cdb_report_key(0, 0x01, 116);
+        let e = scsi_read(&mut t, &cdb, 116).expect_err("a drive sense is not data");
+        assert!(!e.is_scsi_transport_failure(), "a sense is not a bus fault");
+        assert!(
+            e.scsi_sense()
+                .map(|s| s.is_illegal_request())
+                .unwrap_or(false),
+            "the parsed sense must survive so the wedge guard can read it"
+        );
+    }
+
+    /// Catches deleting the length check in `scsi_read`: a GOOD status with zero
+    /// bytes transferred is a command that moved no data, and parsing the
+    /// untouched buffer yields a certificate / key point / VID made of zeros.
+    #[test]
+    fn scsi_read_rejects_a_zero_length_transfer() {
+        let mut t = MockTransport::always(Reply::zero_transfer(116));
+        let cdb = cdb_report_key(0, 0x01, 116);
+        let e = scsi_read(&mut t, &cdb, 116).expect_err("no bytes is not a response");
+        assert!(matches!(
+            e,
+            Error::ShortTransfer {
+                expected: 116,
+                got: 0,
+                ..
+            }
+        ));
+    }
+
+    /// Catches deleting the `status` check in `scsi_write`: a drive REFUSING the
+    /// host certificate answers `Ok` + CHECK CONDITION, and treating that as a
+    /// successful send carried the handshake on against a drive that never
+    /// accepted it.
+    #[test]
+    fn scsi_write_rejects_a_check_condition() {
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let cdb = cdb_send_key(0, 0x01, 116);
+        let e = scsi_write(&mut t, &cdb, &[0u8; 116]).expect_err("a refused send is not a send");
+        assert!(!e.is_scsi_transport_failure());
+    }
+
+    /// A transport fault propagates out of `scsi_read` unchanged so
+    /// `handshake_err` can preserve it.
+    #[test]
+    fn scsi_read_propagates_a_transport_fault() {
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let cdb = cdb_report_key(0, 0x00, 8);
+        let e = scsi_read(&mut t, &cdb, 8).expect_err("dead bus");
+        assert!(e.is_scsi_transport_failure());
+    }
+
+    /// THE defect-3 test. A dead bus must ABORT the handshake. It used to fall
+    /// into `continue` — a transport fault carries no sense, so the wedge check
+    /// `sense.map(..).unwrap_or(false)` was false — and the handshake then ran
+    /// every remaining cert with a 1 s backoff against a bus that was gone,
+    /// finally reporting HandshakeRejected (a credentials problem) for what is a
+    /// replug. Catches restoring that `continue`.
+    #[test]
+    fn transport_fault_aborts_the_cert_loop_immediately() {
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let certs = vec![dummy_cert(), dummy_cert(), dummy_cert()];
+        let started = std::time::Instant::now();
+        let err = run_cert_handshake(&mut t, &certs).expect_err("dead bus");
+        assert_eq!(err, crate::UnlockError::Transport);
+        // 4 AGID invalidations + the AGID allocation that faulted. A second cert
+        // attempt would show up as more calls AND a 1 s backoff.
+        assert_eq!(t.calls(), 5, "must not try the remaining certs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "must not have slept through a per-cert backoff"
+        );
+    }
+
+    /// A drive that rejects every cert with ILLEGAL REQUEST is a credentials /
+    /// wedge situation, NOT a dead bus: it must still report HandshakeRejected
+    /// so the consumer falls through. Guards against over-correcting defect 3
+    /// into "every failure aborts the rip".
+    #[test]
+    fn drive_rejection_is_still_handshake_rejected_not_transport() {
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let certs = vec![dummy_cert()];
+        let err = run_cert_handshake(&mut t, &certs).expect_err("rejected");
+        assert_eq!(err, crate::UnlockError::HandshakeRejected);
+    }
+
+    /// Script a full, successful AACS 1.0 mutual auth against the mock.
+    ///
+    /// The drive presents a type-0x11 (AACS 2.0) certificate, which the
+    /// handshake accepts without verifying either the cert or the key signature
+    /// (documented backward-compat behaviour), and a drive key point of the
+    /// curve generator so the ECDH bus-key derivation succeeds. `tail` is
+    /// appended for whatever the test wants to happen after authentication.
+    fn authenticated_script(tail: Vec<Reply>) -> Vec<Reply> {
+        let mut cert_resp = vec![0u8; 116];
+        cert_resp[24] = 0x11; // drive cert type 0x11 → verification skipped
+        let mut key_resp = vec![0u8; 84];
+        key_resp[4..24].copy_from_slice(&EC_GX);
+        key_resp[24..44].copy_from_slice(&EC_GY);
+
+        let mut s = vec![
+            Reply::good(vec![0u8; 2]), // AGID invalidate ×4
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 8]), // AGID alloc → agid 0
+            Reply::good(vec![]),       // SEND KEY: host cert + nonce
+            Reply::good(cert_resp),    // REPORT KEY: drive cert + nonce
+            Reply::good(key_resp),     // REPORT KEY: drive key point + sig
+            Reply::good(vec![]),       // SEND KEY: host key point + sig
+        ];
+        s.extend(tail);
+        s
+    }
+
+    /// THE defect-9 test. Authentication SUCCEEDED, then the bus died during the
+    /// Volume ID read. That is not "this disc has no Volume ID" — it used to
+    /// return VidUnavailable unconditionally, telling the consumer to carry on
+    /// with a transport that is gone. Catches dropping the
+    /// `is_scsi_transport_failure` branch on the VID path.
+    #[test]
+    fn transport_fault_reading_the_volume_id_is_transport_not_vid_unavailable() {
+        let mut t = MockTransport::scripted(
+            authenticated_script(vec![Reply::TransportFault]),
+            Reply::TransportFault,
+        );
+        let err = run_cert_handshake(&mut t, &[dummy_cert()]).expect_err("dead bus on VID read");
+        assert_eq!(err, crate::UnlockError::Transport);
+    }
+
+    /// The counterpart: a drive that answers the Volume ID read with a MAC that
+    /// doesn't verify really is VidUnavailable — the defect-9 fix must not turn
+    /// every VID failure into a rip-aborting transport error.
+    #[test]
+    fn bad_volume_id_mac_is_still_vid_unavailable() {
+        let mut t = MockTransport::scripted(
+            authenticated_script(vec![Reply::good(vec![0xAAu8; 36])]),
+            Reply::good(vec![0u8; 36]),
+        );
+        let err = run_cert_handshake(&mut t, &[dummy_cert()]).expect_err("bad MAC");
+        assert_eq!(err, crate::UnlockError::VidUnavailable);
+
+        // Defect 18: the AGID we authenticated with must be released on the way
+        // out, not abandoned. REPORT KEY (0xA4) with format 0x3F in CDB byte 10.
+        let last = t.cdbs.last().expect("commands were issued");
+        assert_eq!(last[0], crate::scsi::SCSI_REPORT_KEY);
+        assert_eq!(last[10] & 0x3F, 0x3F, "AGID released on the failure path");
+    }
+
+    /// THE defect-6 test. Format 0x84 carries no MAC, so an all-zero response
+    /// AES-decrypts to two plausible 16-byte values that used to be returned as
+    /// `Ok((key, key))` — a garbage bus key reported as success, which is how a
+    /// bus-encrypted disc gets "decrypted" at rc=0. Catches removing the
+    /// all-zero guard.
+    #[test]
+    fn read_data_keys_refuses_an_all_zero_response() {
+        let mut t = MockTransport::always(Reply::good(vec![0u8; 36]));
+        let mut auth = AacsAuth {
+            bus_key: [0x42u8; 16],
+            agid: 0,
+            volume_id: None,
+            read_data_key: None,
+            drive_cert: [0u8; 92],
+        };
+        let e = read_data_keys(&mut t, &mut auth).expect_err("zeros are not keys");
+        assert_eq!(e.code(), Error::AacsDataKey.code());
+        assert!(auth.read_data_key.is_none(), "no key may be recorded");
+    }
+
+    /// A non-zero key block still decrypts and is returned — the defect-6 guard
+    /// must reject only the response the drive plainly never filled.
+    #[test]
+    fn read_data_keys_accepts_a_non_zero_response() {
+        let mut resp = vec![0u8; 36];
+        resp[4..20].copy_from_slice(&[0x5Au8; 16]);
+        let mut t = MockTransport::always(Reply::good(resp));
+        let mut auth = AacsAuth {
+            bus_key: [0x42u8; 16],
+            agid: 0,
+            volume_id: None,
+            read_data_key: None,
+            drive_cert: [0u8; 92],
+        };
+        let (rdk, _wdk) = read_data_keys(&mut t, &mut auth).expect("decrypts");
+        assert_eq!(auth.read_data_key, Some(rdk));
+    }
+
+    /// Constant-time compare must still be a CORRECT compare.
+    #[test]
+    fn ct_eq_16_matches_ordinary_equality() {
+        let a = [0x11u8; 16];
+        assert!(ct_eq_16(&a, &a));
+        for i in 0..16 {
+            let mut b = a;
+            b[i] ^= 0x80;
+            assert!(!ct_eq_16(&a, &b), "differs at byte {i}");
+        }
+    }
 
     #[test]
     fn handshake_err_preserves_transport_failure() {
