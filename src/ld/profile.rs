@@ -57,7 +57,7 @@ pub struct Identity {
 /// them as unread. Deleting them would silently drop fields from the format the
 /// profile-extraction pipeline emits.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DriveProfile {
     pub identity: Identity,
     /// Expected first 4 bytes of the drive's unlock response — the
@@ -111,6 +111,28 @@ pub struct DriveProfile {
     pub(crate) speed_zone_table: Option<Vec<u8>>,
     #[serde(default, deserialize_with = "deserialize_opt_hex_bytes")]
     pub(crate) speed_calc_table: Option<Vec<u8>>,
+}
+
+// Hand-written, REDACTING Debug. `DriveProfile` is `pub` and reachable through
+// the public `Profiles` catalog (`ld::bundled` / `ld::profiles`), whose own
+// derived `Debug` would recurse into this one. `Cargo.toml` says this crate is
+// NEVER published because it carries drive firmware; a derived `Debug` would
+// render that firmware image AND every captured per-drive vendor CDB (the unlock
+// MECHANISM) straight into any log. Show only the PUBLIC identity + signature
+// (what the catalog is public FOR); collapse the firmware to a byte length and
+// omit the vendor CDB templates entirely so no mechanism bytes reach a log.
+impl std::fmt::Debug for DriveProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriveProfile")
+            .field("identity", &self.identity)
+            .field("signature", &self.signature)
+            .field(
+                "firmware",
+                &format_args!("[{} bytes redacted]", self.firmware.len()),
+            )
+            .field("cdb_templates", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Chipset + variant — determined by which section the profile was found in.
@@ -691,6 +713,40 @@ mod tests {
             p.speed_calc_table.is_none(),
             "speed_calc_table must default to None"
         );
+    }
+
+    /// `DriveProfile`'s `Debug` must NOT render the firmware image or the
+    /// per-drive vendor CDB templates — this crate is unpublished precisely
+    /// because it carries drive firmware, and the profile is reachable through
+    /// the public `Profiles` catalog.
+    /// MUTATION: restoring `#[derive(Debug)]` prints the raw firmware bytes
+    /// (e.g. the 0xEE marker below) and the CDB bytes, so this goes red.
+    #[test]
+    fn drive_profile_debug_redacts_firmware_and_cdbs() {
+        use serde_json::json;
+        let profiles: Profiles = serde_json::from_str(
+            &json!({
+                "mt1959_a": [{
+                    "identity": {"vendor_id":"VIS","product_revision":"1.00",
+                        "vendor_specific":"AA00000","firmware_date":"200001010000"},
+                    "signature":"aabbccdd",
+                    "firmware":"7u7u7u7u", // base64 → six 0xEE bytes
+                    "read_vid_cdb":"3c014410e29100002400"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let s = format!("{:?}", profiles.mt1959_a[0]);
+        // Firmware byte 0xEE renders as `238` under a derived Debug.
+        assert!(!s.contains("238"), "firmware bytes must not appear: {s}");
+        assert!(
+            !s.contains("read_vid_cdb"),
+            "CDB templates must not appear: {s}"
+        );
+        assert!(s.contains("redacted"), "must mark redaction: {s}");
+        // The PUBLIC fields stay visible.
+        assert!(s.contains("VIS"), "identity must remain visible: {s}");
     }
 
     /// deserialize_hex4 of an empty string must produce [0;4] without error.

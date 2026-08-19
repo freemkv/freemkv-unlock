@@ -83,11 +83,28 @@ impl<'a> UnlockCtx<'a> {
 /// What removing bus encryption yielded. `drive_unlocked` means the drive now
 /// serves clear content (firmware route) — equivalent, for the gate, to a cert
 /// `bus_key`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Unlocked {
     pub vid: Option<[u8; 16]>,
     pub bus_key: Option<[u8; 16]>,
     pub drive_unlocked: bool,
+}
+
+// Hand-written, REDACTING Debug — `Unlocked` is the public carrier that leaves
+// this crate, and both `bus_key` (the AACS bus key) and `vid` (the Volume ID
+// that feeds VUK derivation) are key material that must never reach a log or a
+// test-failure message in plaintext. The `AacsAuth` / `CertHandshake` siblings
+// already redact; a derived `Debug` here would print the very bytes they hide.
+// Presence is still observable (Some/None) so a log can say WHETHER a key was
+// obtained without revealing WHAT it is.
+impl std::fmt::Debug for Unlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Unlocked")
+            .field("vid", &self.vid.map(|_| "[redacted]"))
+            .field("bus_key", &self.bus_key.map(|_| "[redacted]"))
+            .field("drive_unlocked", &self.drive_unlocked)
+            .finish()
+    }
 }
 
 /// Why an unlock produced no usable result. Only `Transport` is a hard error
@@ -234,5 +251,26 @@ mod tests {
     #[test]
     fn unlocker_name_is_a_pure_identity_lookup() {
         assert_eq!(unlocker_name(&DriveId::default()), None);
+    }
+
+    /// `Unlocked` is the public carrier that leaves the crate, and its `bus_key`
+    /// and `vid` are key material. Its `Debug` must NOT print those bytes.
+    /// MUTATION: restoring `#[derive(Debug)]` prints the raw byte arrays, so the
+    /// distinctive marker bytes appear in the output and this goes red.
+    #[test]
+    fn unlocked_debug_redacts_key_material() {
+        let u = Unlocked {
+            vid: Some([0xAB; 16]),
+            bus_key: Some([0xCD; 16]),
+            drive_unlocked: true,
+        };
+        let s = format!("{u:?}");
+        // A derived Debug renders `[171, 171, ...]` (0xAB) / `[205, ...]` (0xCD).
+        assert!(!s.contains("171"), "vid bytes must not appear: {s}");
+        assert!(!s.contains("205"), "bus_key bytes must not appear: {s}");
+        assert!(s.contains("[redacted]"), "must mark redaction: {s}");
+        // Presence (Some/None) stays observable.
+        assert!(s.contains("Some"), "must still show a key WAS present: {s}");
+        assert!(s.contains("drive_unlocked: true"));
     }
 }
