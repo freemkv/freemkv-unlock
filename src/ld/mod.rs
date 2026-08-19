@@ -188,10 +188,26 @@ impl LibreDrive {
         // unlogged `let _ =` made a fully-failed calibration indistinguishable
         // from a successful one in the rip log.
         if let Err(e) = mt.probe_disc(scsi) {
+            // A transport fault here is a DEAD BUS, not a speed-calibration miss.
+            // The rest of this path (`read_oem_vid`) is a no-op for the 140/206
+            // profiles that carry no `read_vid_cdb`, so it never touches the bus
+            // again — meaning this swallowed fault was the ONLY dead-bus signal,
+            // and warn-and-continue turned it into `Ok(Unlocked{drive_unlocked:
+            // true})`: a dead bus rendered as a fully-unlocked drive (the flagship
+            // failure-that-looks-like-success). A genuine calibration miss (drive
+            // sense / short reply) still continues on the default speed table.
+            if e.is_transport_failure() {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "probe_disc_transport_fault",
+                    "transport fault during disc speed calibration; aborting"
+                );
+                return Err(UnlockError::Transport);
+            }
             tracing::warn!(
                 target: "freemkv::disc",
                 phase = "probe_disc_failed",
-                transport_failure = e.is_transport_failure(),
+                transport_failure = false,
                 "disc speed calibration failed; continuing with the drive's default speed table"
             );
         }
@@ -448,6 +464,65 @@ mod tests {
             .unlock_features(&mut t, &ctx(&id))
             .expect("both markers → unlocked");
         assert!(u.drive_unlocked);
+    }
+
+    /// THE probe-disc dead-bus test. The drive unlocks fully (both firmware
+    /// markers), then the bus DIES during disc-speed calibration. `probe_disc`
+    /// used to be warn-and-continued regardless of the fault, and — because the
+    /// 140/206 profiles without a `read_vid_cdb` never touch the bus again — a
+    /// dead bus was reported as `Ok(Unlocked{drive_unlocked:true})`: a dead bus
+    /// rendered as a successful unlock (the flagship failure-that-looks-like-
+    /// success). `firmware_unlock` must now abort with `Transport`.
+    /// MUTATION: reverting the `if e.is_transport_failure()` return in
+    /// `firmware_unlock` (warn-and-continue), OR flattening the probe loops'
+    /// transport classification, makes this go red.
+    #[test]
+    fn transport_fault_during_probe_disc_is_transport_not_a_successful_unlock() {
+        let id = known_vid_drive_id();
+        let sig = profile::find_bundled(&id)
+            .expect("profile")
+            .profile
+            .signature;
+
+        // A drive that unlocks fully but whose bus dies on the speed probe.
+        struct ProbeFaultsDrive {
+            resp: Vec<u8>,
+        }
+        impl ScsiTransport for ProbeFaultsDrive {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                // READ_BUFFER (0x3C) / SUB_CMD_PROBE (0x14) is the speed probe.
+                if cdb.first() == Some(&0x3C) && cdb.get(3) == Some(&0x14) {
+                    return Err(crate::scsi::ScsiError {
+                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                        sense: None,
+                    });
+                }
+                let n = self.resp.len().min(data.len());
+                data[..n].copy_from_slice(&self.resp[..n]);
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+
+        let mut resp = vec![0u8; 64];
+        resp[0..4].copy_from_slice(&sig);
+        resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]); // primary marker
+        resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]); // secondary marker
+        let mut t = ProbeFaultsDrive { resp };
+
+        let err = LibreDrive::new()
+            .unlock_features(&mut t, &ctx(&id))
+            .expect_err("a dead bus during probe must abort, not report success");
+        assert_eq!(err, UnlockError::Transport);
     }
 
     /// Catches classifying a dead bus as "not this unlocker's drive": the very

@@ -416,7 +416,7 @@ impl Mt1959 {
         let mut addr: u16 = 0;
         while addr < PROBE_COARSE_END {
             let mut resp = [0u8; PROBE_RESPONSE_SIZE as usize];
-            if self
+            if let Err(e) = self
                 .read_buffer_probe(
                     scsi,
                     SUB_CMD_PROBE,
@@ -433,11 +433,18 @@ impl Mt1959 {
                         "coarse speed probe failed"
                     );
                 })
-                .is_err()
             {
-                // Surface the drive's OWN failure. Re-labelling it as a
-                // transport failure turned a short/rejected probe response into
-                // a hard abort of the whole rip.
+                // A dead bus MUST keep its transport classification: this loop is
+                // reached from `probe_disc`, whose caller aborts the rip only when
+                // it sees `Transport`. Flattening every failure to `UnlockFailed`
+                // (which classifies as "not applicable") let a bus that died mid
+                // speed-probe fall through to `Ok(Unlocked{drive_unlocked:true})`.
+                // A short / rejected probe reply is still the drive's OWN failure —
+                // keep it as `UnlockFailed` so it doesn't hard-abort a rip that
+                // could continue on the default speed table.
+                if e.is_transport_failure() {
+                    return Err(e);
+                }
                 return Err(Error::UnlockFailed);
             }
             addr = addr.wrapping_add(PROBE_STEP);
@@ -450,16 +457,35 @@ impl Mt1959 {
         let mut addr: u32 = PROBE_COARSE_END as u32;
         while addr < PROBE_FINE_END {
             let mut resp = [0u8; PROBE_RESPONSE_SIZE as usize];
-            if self
-                .read_buffer_probe(
-                    scsi,
-                    SUB_CMD_PROBE,
-                    addr as u16,
-                    &mut resp,
-                    PROBE_RESPONSE_SIZE as usize,
-                )
-                .is_err()
-            {
+            if let Err(e) = self.read_buffer_probe(
+                scsi,
+                SUB_CMD_PROBE,
+                addr as u16,
+                &mut resp,
+                PROBE_RESPONSE_SIZE as usize,
+            ) {
+                // Fine probing is best-effort — a short / rejected reply just ends
+                // the sweep early. But a bus that DIED here must not be swallowed:
+                // a bare `break` returned `Ok(())` from `run_probe`, so a dead bus
+                // mid-pass-2 vanished into `Ok(Unlocked{drive_unlocked:true})` with
+                // no log at all (the flagship failure-that-looks-like-success). A
+                // transport fault keeps its classification and aborts.
+                if e.is_transport_failure() {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_probe_transport_fault",
+                        addr,
+                        "transport fault during fine speed probe; aborting"
+                    );
+                    return Err(e);
+                }
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "mt1959_probe_failed",
+                    addr,
+                    error = %e,
+                    "fine speed probe ended early"
+                );
                 break;
             }
             addr += PROBE_STEP as u32;
@@ -760,6 +786,160 @@ mod tests {
             probes.len(),
             "no probe address may be issued twice ({} duplicates)",
             issued - probes.len()
+        );
+    }
+
+    /// Answers every command GOOD except the speed probe (READ_BUFFER /
+    /// SUB_CMD_PROBE) at address >= `fault_at`, which returns a transport fault —
+    /// a bus that dies partway through disc-speed calibration.
+    struct ProbeFaultsTransport {
+        fault_at: u16,
+    }
+    impl ScsiTransport for ProbeFaultsTransport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::scsi::Result<ScsiResult> {
+            if cdb.first() == Some(&SCSI_READ_BUFFER) && cdb.get(3) == Some(&SUB_CMD_PROBE) {
+                let addr = ((cdb[4] as u16) << 8) | cdb[5] as u16;
+                if addr >= self.fault_at {
+                    return Err(crate::scsi::ScsiError {
+                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                        sense: None,
+                    });
+                }
+            }
+            for b in data.iter_mut() {
+                *b = 0;
+            }
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: data.len(),
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    /// THE probe pass-1 dead-bus test. A bus that dies during the coarse speed
+    /// probe must keep its transport classification out of `run_probe` so the
+    /// caller (`firmware_unlock`) aborts with `Transport` rather than reporting a
+    /// fully-unlocked drive.
+    /// MUTATION: flattening the pass-1 error to `Error::UnlockFailed` makes the
+    /// `is_transport_failure` assert go red (UnlockFailed maps to NotApplicable).
+    #[test]
+    fn transport_fault_during_pass1_probe_stays_a_transport_failure() {
+        let mut t = ProbeFaultsTransport { fault_at: 0 };
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let e = mt
+            .run_probe(&mut t)
+            .expect_err("dead bus during pass-1 probe");
+        assert!(e.is_transport_failure(), "pass-1 fault must stay transport");
+        assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
+    }
+
+    /// THE probe pass-2 dead-bus test. Pass 1 completes; the bus dies in the fine
+    /// probe. The loop used to `break` on ANY error and return `Ok(())`, so a
+    /// dead bus mid-pass-2 vanished into `Ok`. It must now propagate a transport
+    /// fault (a short/rejected fine probe still ends the sweep benignly).
+    /// MUTATION: restoring the bare `break` makes `expect_err` panic (run_probe
+    /// returns Ok).
+    #[test]
+    fn transport_fault_during_pass2_probe_stays_a_transport_failure() {
+        let mut t = ProbeFaultsTransport {
+            fault_at: PROBE_COARSE_END,
+        };
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let e = mt
+            .run_probe(&mut t)
+            .expect_err("dead bus during pass-2 probe");
+        assert!(e.is_transport_failure(), "pass-2 fault must stay transport");
+        assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
+    }
+
+    /// `validate`'s transport-abort branch had no test. A dead bus must propagate
+    /// as a transport fault on the FIRST attempt, not be retried five times.
+    /// MUTATION: turning the `Err(e) => return Err(Error::from(e))` arm into a
+    /// `continue` makes this exhaust to `UnlockFailed` and the assert go red.
+    #[test]
+    fn validate_propagates_a_transport_fault_without_retrying() {
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
+        let mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let e = mt.validate(&mut t).expect_err("dead bus");
+        assert!(e.is_transport_failure());
+        assert_eq!(t.calls(), 1, "abort on the first fault, no 5× retry");
+    }
+
+    /// `validate`'s drive-sense path: a CHECK CONDITION is `Ok` per the contract,
+    /// so validate retries and finally returns `UnlockFailed` — NOT a transport
+    /// abort (which would wrongly kill a rip the drive merely stalled on).
+    #[test]
+    fn validate_drive_sense_exhausts_to_unlock_failed() {
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::illegal_request());
+        let mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let e = mt.validate(&mut t).expect_err("five senses, no pass");
+        assert!(!e.is_transport_failure(), "a sense is not a dead bus");
+        assert!(matches!(e, Error::UnlockFailed));
+        assert_eq!(t.calls(), 5, "retries the full five attempts");
+    }
+
+    /// variant_a's firmware-verify-read transport-abort branch (~variant_a.rs:97)
+    /// had no test. WRITE_BUFFER succeeds, the 0x45 verify read faults: a dead bus
+    /// must abort THERE, not be swallowed into the unlock retries.
+    /// MUTATION: dropping the `if err.is_transport_failure() { return Err }` lets
+    /// execution fall through to `do_unlock` (scripted to answer, so it fails on
+    /// the signature as `UnlockFailed`), and the `is_transport_failure` assert
+    /// goes red — a genuine red-before-green, not green-both-ways.
+    #[test]
+    fn variant_a_verify_read_transport_fault_aborts() {
+        let mut profile = fixture_profile([0; 4]);
+        profile.firmware = vec![0u8; 64];
+        let mut mt = Mt1959::new(profile, false);
+        // call 1 WRITE_BUFFER → good; call 2 verify read → dead bus; later
+        // do_unlock calls (only reached if the fix is absent) → good.
+        let mut t = crate::scsi::mock::MockTransport::scripted(
+            vec![
+                crate::scsi::mock::Reply::good(vec![0u8; 4]),
+                crate::scsi::mock::Reply::TransportFault,
+            ],
+            crate::scsi::mock::Reply::good(vec![0u8; 64]),
+        );
+        let e = variant_a::load_firmware(&mut mt, &mut t).expect_err("dead bus at verify");
+        assert!(
+            e.is_transport_failure(),
+            "verify-read dead bus must surface"
+        );
+    }
+
+    /// variant_b had no transport-abort test. A firmware-upload STEP that hits a
+    /// dead bus (here the metadata read) must abort via `trace_step`, not be
+    /// swallowed and carried into the unlock retries.
+    /// MUTATION: dropping `trace_step`'s `if err.is_transport_failure()` return
+    /// lets execution reach `do_unlock` (scripted good → signature fails as
+    /// `UnlockFailed`), so the `is_transport_failure` assert goes red.
+    #[test]
+    fn variant_b_upload_step_transport_fault_aborts() {
+        let mut profile = fixture_profile([0; 4]);
+        profile.firmware = vec![0u8; 64];
+        let mut mt = Mt1959::new(profile, true);
+        // call 1 MODE SELECT → good; call 2 metadata read → dead bus; rest good.
+        let mut t = crate::scsi::mock::MockTransport::scripted(
+            vec![
+                crate::scsi::mock::Reply::good(vec![0u8; 16]),
+                crate::scsi::mock::Reply::TransportFault,
+            ],
+            crate::scsi::mock::Reply::good(vec![0u8; 64]),
+        );
+        let e = variant_b::load_firmware(&mut mt, &mut t).expect_err("dead bus mid-upload");
+        assert!(
+            e.is_transport_failure(),
+            "an upload-step dead bus must surface"
         );
     }
 
