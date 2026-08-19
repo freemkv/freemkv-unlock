@@ -162,26 +162,35 @@ const P256_GY: [u8; 32] = [
     0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE, 0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF, 0x51, 0xF5,
 ];
 
-/// AACS 2.0 LA public key for cert verification (P-256).
-/// From AACS2 specification — used to verify type 0x11 drive certificates.
+/// AACS 2.0 LA public key for cert verification (P-256), big-endian.
+/// The published AACS2 Licensing Administrator key — used to verify type 0x11
+/// drive certificates. Confirmed on the P-256 curve (y² ≡ x³+ax+b mod p) by
+/// `la_anchor_keys_are_on_curve`; the earlier compiled-in value was OFF-CURVE and
+/// so rejected every certificate `verify_cert_p256` was handed.
 const AACS2_LA_PUB_X: [u8; 32] = [
-    0xF9, 0x57, 0xBC, 0x1F, 0xD7, 0xE6, 0x09, 0x7E, 0xCA, 0xCC, 0x35, 0x23, 0x4C, 0x9C, 0x66, 0xC3,
-    0x42, 0xEB, 0x3D, 0xB7, 0x2B, 0x41, 0x06, 0xF4, 0x04, 0x9C, 0x6A, 0x88, 0x70, 0x00, 0xAA, 0x2C,
+    0xDC, 0x88, 0x52, 0xA0, 0xA7, 0xF0, 0xD0, 0x24, 0xD4, 0xC4, 0xCA, 0xC3, 0x1F, 0x32, 0x5F, 0x90,
+    0x3D, 0x0D, 0x23, 0xFC, 0x65, 0xEE, 0xBB, 0x1C, 0x75, 0x90, 0xB9, 0x62, 0xDB, 0x57, 0x43, 0x2E,
 ];
 const AACS2_LA_PUB_Y: [u8; 32] = [
-    0x39, 0x55, 0x0B, 0x41, 0x02, 0x27, 0xEA, 0x7B, 0x1A, 0x53, 0xF8, 0x67, 0x8C, 0x5A, 0x91, 0x6F,
-    0xFC, 0x7C, 0x78, 0x01, 0x3E, 0x89, 0x15, 0xE3, 0xF0, 0x81, 0xD3, 0xE9, 0x3E, 0x17, 0x55, 0x0B,
+    0xF0, 0xD4, 0x81, 0x42, 0xB3, 0x32, 0xD7, 0x3B, 0x41, 0xE0, 0xFB, 0x84, 0x4C, 0x86, 0xEF, 0x66,
+    0x0F, 0x68, 0x4A, 0x05, 0x96, 0xE9, 0xCE, 0x00, 0xC4, 0xD3, 0xFE, 0x6E, 0x24, 0x45, 0x4D, 0xD0,
 ];
 
 // ── AACS 1.0 LA (Licensing Administrator) public key for cert verification ──
-
+//
+// The published AACS 1.0 LA key on the 160-bit curve, big-endian. Validated two
+// ways before landing: it is on-curve (`la_anchor_keys_are_on_curve`) AND it
+// verifies a genuine LA-signed host certificate
+// (`verify_cert_accepts_a_genuine_la_signed_host_cert`). The prior compiled-in
+// value was OFF-CURVE, so `ecdsa_verify` (which now range/curve-checks Q) — and
+// therefore `verify_cert` — rejected every real certificate.
 const AACS_LA_PUB_X: [u8; 20] = [
-    0x01, 0xF3, 0x5D, 0xAB, 0xD8, 0xAE, 0x5F, 0x40, 0x56, 0x5E, 0x30, 0xC8, 0x8A, 0x60, 0x42, 0x82,
-    0x07, 0x61, 0xDF, 0x93,
+    0x63, 0xC2, 0x1D, 0xFF, 0xB2, 0xB2, 0x79, 0x8A, 0x13, 0xB5, 0x8D, 0x61, 0x16, 0x6C, 0x4E, 0x4A,
+    0xAC, 0x8A, 0x07, 0x72,
 ];
 const AACS_LA_PUB_Y: [u8; 20] = [
-    0x44, 0x87, 0xB5, 0xAC, 0x07, 0x10, 0x8D, 0x10, 0x5B, 0xA5, 0xB9, 0xE3, 0x2F, 0x3B, 0xBB, 0xFC,
-    0x0C, 0x2C, 0xBC, 0xD1,
+    0x13, 0x7E, 0xC6, 0x38, 0x81, 0x8F, 0xD9, 0x8F, 0xA4, 0xC3, 0x0B, 0x99, 0x67, 0x28, 0xBF, 0x4B,
+    0x91, 0x7F, 0x6A, 0x27,
 ];
 
 // ── Elliptic curve arithmetic over GF(p) ───────────────────────────────────
@@ -487,9 +496,21 @@ fn ecdsa_verify(
 ) -> bool {
     let p = BigUint::from_bytes_be(&EC_P);
     let a = BigUint::from_bytes_be(&EC_A);
+    let b = BigUint::from_bytes_be(&EC_B);
     let n = BigUint::from_bytes_be(&EC_N);
     let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
     let q = EcPoint::from_bytes(pub_x, pub_y);
+
+    // Validate the public key BEFORE using it. Without this, a Q of (0,0) — the
+    // additive identity in affine coordinates — makes `u2·Q` the point at
+    // infinity, so verification collapses to `r == x(u1·G) mod n`, which a
+    // forger satisfies with NO knowledge of any private key. `point_on_curve`
+    // also range-checks (x,y < p) and, since b != 0, rejects (0,0) (its rhs is
+    // `b`, never 0). This is the mechanism that turns the drive-cert type-byte
+    // bypass into a one-liner exploit, so the check belongs in the primitive.
+    if !point_on_curve(&q.x, &q.y, &a, &b, &p) {
+        return false;
+    }
 
     let r = BigUint::from_bytes_be(sig_r);
     let s = BigUint::from_bytes_be(sig_s);
@@ -580,9 +601,17 @@ fn ecdsa_verify_p256(pub_x: &[u8], pub_y: &[u8], sig_r: &[u8], sig_s: &[u8], dat
 
     let p = BigUint::from_bytes_be(&P256_P);
     let a = BigUint::from_bytes_be(&P256_A);
+    let b = BigUint::from_bytes_be(&P256_B);
     let n = BigUint::from_bytes_be(&P256_N);
     let g = EcPoint::from_bytes(&P256_GX, &P256_GY);
     let q = EcPoint::new(BigUint::from_bytes_be(pub_x), BigUint::from_bytes_be(pub_y));
+
+    // Validate Q before use — see `ecdsa_verify`. A Q of (0,0) collapses the
+    // check to `r == x(u1·G) mod n`, forgeable with no key; `point_on_curve`
+    // also range-checks and rejects (0,0) (rhs is `b` != 0).
+    if !point_on_curve(&q.x, &q.y, &a, &b, &p) {
+        return false;
+    }
 
     let r = BigUint::from_bytes_be(sig_r);
     let s = BigUint::from_bytes_be(sig_s);
@@ -615,38 +644,42 @@ fn ecdsa_verify_p256(pub_x: &[u8], pub_y: &[u8], sig_r: &[u8], sig_s: &[u8], dat
 
 /// Verify an AACS 2.0 certificate (type 0x11) against the AACS 2.0 LA key.
 ///
-/// Layout: type(1) + flags(1) + padding(2) + serial(6) + pub_x(32) +
-/// pub_y(32) + sig_r(32) + sig_s(32) = 138 bytes. The signature covers
-/// the first 74 bytes (everything up to and including the public key).
-///
-/// The full P-256 certificate is 138 bytes, so the entire 138-byte
-/// length must be present before any signature slice is taken — checking
-/// `>= 138` up front (rather than the old `>= 132`, which left the
-/// `cert[106..138]` slice able to panic on a 132-byte input) keeps this
-/// safe against the truncated 132-byte cert the handshake actually
-/// passes in (`&response[24..156]`).
+/// Layout (132 bytes): header(4) + pub_x(32) + pub_y(32) + sig_r(32) +
+/// sig_s(32). The signature covers the first 68 bytes (header + public
+/// key). This is the ONLY length the handshake ever passes in: the caller
+/// reads `&response[24..156]` — exactly 132 bytes — and the step-6 key
+/// message (same REPORT KEY family, also 132 bytes) uses the identical
+/// x[4..36] / y[36..68] / r[68..100] / s[100..132] framing, so the trailing
+/// 64 bytes are the signature and everything before them is what the LA
+/// signed. The old guard read `>= 138` for a 10-byte-header 138-byte cert
+/// that never arrives, so `verify_cert_p256` returned false unconditionally
+/// and the caller logged `aacs2_cert_verify_skipped` for 100% of AACS 2.0
+/// drives. Guarding on the real 132 keeps the `cert[100..132]` slice safe
+/// while letting genuine certs actually reach verification.
 fn verify_cert_p256(cert: &[u8]) -> bool {
-    if cert.len() < 138 {
+    if cert.len() < 132 {
         return false;
     }
-    let sig_r = &cert[74..106];
-    let sig_s = &cert[106..138];
-    ecdsa_verify_p256(&AACS2_LA_PUB_X, &AACS2_LA_PUB_Y, sig_r, sig_s, &cert[..74])
+    let sig_r = &cert[68..100];
+    let sig_s = &cert[100..132];
+    ecdsa_verify_p256(&AACS2_LA_PUB_X, &AACS2_LA_PUB_Y, sig_r, sig_s, &cert[..68])
 }
 
 /// Extract public key from an AACS 2.0 certificate (32-byte x,y).
 ///
 /// Returns a zeroed key pair if `cert` is too short to hold the fixed
-/// offsets (matches the `>= 138` guard in `verify_cert_p256`), so a
-/// short/hostile cert cannot panic on the slice index.
+/// offsets (matches the `>= 132` guard in `verify_cert_p256`), so a
+/// short/hostile cert cannot panic on the slice index. Offsets follow the
+/// 4-byte-header layout: pub_x at [4..36], pub_y at [36..68] — the same
+/// framing the step-6 drive-key message uses.
 fn cert_pub_key_p256(cert: &[u8]) -> ([u8; 32], [u8; 32]) {
     let mut x = [0u8; 32];
     let mut y = [0u8; 32];
-    if cert.len() < 74 {
+    if cert.len() < 68 {
         return (x, y);
     }
-    x.copy_from_slice(&cert[10..42]);
-    y.copy_from_slice(&cert[42..74]);
+    x.copy_from_slice(&cert[4..36]);
+    y.copy_from_slice(&cert[36..68]);
     (x, y)
 }
 
@@ -686,8 +719,11 @@ fn verify_cert(cert: &[u8]) -> bool {
     if cert.len() < 92 {
         return false;
     }
-    // Certificate format: type(1) + flags(1) + padding(2) + serial(6) + pub_x(20) + pub_y(20) + sig_r(20) + sig_s(20)
-    // Signature is over the first 52 bytes
+    // Certificate format (92 bytes, 12-byte header): header(12) + pub_x(20) at
+    // [12..32] + pub_y(20) at [32..52] + sig_r(20) at [52..72] + sig_s(20) at
+    // [72..92]. Signature is over the first 52 bytes (header + public key).
+    // NOTE: `cert_pub_key` reads pub_x at offset 12, so the header is 12 bytes,
+    // not the 10 an earlier comment claimed.
     let mut sig_r = [0u8; 20];
     let mut sig_s = [0u8; 20];
     sig_r.copy_from_slice(&cert[52..72]);
@@ -1011,6 +1047,24 @@ fn aacs_authenticate_with_agid(
         // The 2.0 cert lays out its public key and signature at different byte
         // offsets than the 1.0 cert, so the step-6 verify below (which reads
         // 1.0 offsets) cannot validate a 2.0 cert and is skipped for it.
+    } else {
+        // Unknown certificate type — REJECT. Neither the AACS 1.0 LA verify
+        // above nor the documented 2.0 backward-compat skip applies. This used
+        // to be an if / else-if with NO else, so an unknown type (e.g. 0x02)
+        // fell straight through: `is_aacs20` stayed false, so the step-6
+        // key-signature check below still ran — against `cert_pub_key(drive_cert)`,
+        // the drive's OWN key lifted out of a cert that was never checked against
+        // the LA. A rogue USB bridge could set byte 0 to 0x02, present its own
+        // keypair, sign `host_nonce || drive_key_point`, and the handshake would
+        // return Ok with an attacker-chosen bus key. The chain of trust must not
+        // appear to have run when it did not.
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "aacs_cert_unknown_type",
+            cert_type = drive_cert[0],
+            "drive certificate carries an unrecognised type byte; rejecting"
+        );
+        return Err(Error::AacsCertVerify);
     }
 
     // Step 6: Read drive key point + signature (REPORT KEY format 0x02)
@@ -1132,6 +1186,26 @@ fn aacs2_authenticate_p256(
         scsi_read(session, &cdb, 8).map_err(|e| handshake_err(e, Error::AacsAgidAlloc))?;
     let agid = (response[7] >> 6) & 0x03;
 
+    // From here on we HOLD the AGID. All seven fallible steps below used to
+    // abandon it on the way out — the exact leak `975315d` fixed in the AACS 1.0
+    // twin (`aacs_authenticate` / `aacs_authenticate_with_agid`) but left
+    // untouched on this v2 path. Release it on ANY failure, mirroring v1.
+    let r = aacs2_authenticate_p256_with_agid(session, agid, host_priv_key, host_cert);
+    if r.is_err() {
+        release_agid(session, agid);
+    }
+    r
+}
+
+/// Steps 3-9 of [`aacs2_authenticate_p256`] with the AGID already allocated,
+/// split out so the single caller can release the AGID on any of the seven
+/// fallible exits without a per-return release call or a Drop guard.
+fn aacs2_authenticate_p256_with_agid(
+    session: &mut dyn ScsiTransport,
+    agid: u8,
+    host_priv_key: &[u8; 32],
+    host_cert: &[u8],
+) -> Result<AacsAuth> {
     // Step 3: Generate host nonce + P-256 ephemeral key pair
     let mut host_nonce = [0u8; 20];
     use rand::Rng;
@@ -1165,6 +1239,22 @@ fn aacs2_authenticate_p256(
     // through the ECDH key exchange and P-256 signature verification below.
     // The outcome is surfaced as a trace event rather than discarded so the
     // trust decision is observable (and so the call is not dead code).
+    //
+    // SECURITY — MUST FIX BEFORE THIS PATH IS WIRED. This native P-256 handshake
+    // is `#[allow(dead_code)]` today: `run_cert_handshake` only ever calls the
+    // v1 `aacs_authenticate`, so nothing reaches here at runtime. As written it
+    // carries the SAME chain-of-trust gap the v1 sibling closes at its cert-type
+    // gate: cert verification is non-fatal AND there is no `else` rejecting an
+    // unknown type, so the step-6 key-signature check below runs against
+    // `cert_pub_key_p256(drive_cert)` — the drive's OWN key lifted from a cert
+    // that was never LA-verified — proving only self-consistency. Whoever wires
+    // `aacs2_authenticate` into `run_cert_handshake` MUST first (a) reject any
+    // cert whose type is not 0x11 and (b) make `verify_cert_p256` FATAL — but
+    // only after the real AACS 2.0 wire layout (the 4-byte-header framing
+    // `verify_cert_p256` assumes) is confirmed against a genuine drive cert, so
+    // the fatal check does not reject legitimate 2.0 drives. The AACS2 LA anchor
+    // is now a real on-curve key (see `la_anchor_keys_are_on_curve`), so the
+    // remaining unknown is the byte layout, not the key.
     if drive_cert[0] == 0x11 && !verify_cert_p256(drive_cert) {
         tracing::debug!(
             target: "freemkv::disc",
@@ -1397,14 +1487,28 @@ pub fn run_cert_handshake(
                 let (read_data_key, read_data_key_err) = match read_data_keys(scsi, &mut auth) {
                     Ok((rdk, _)) => (Some(rdk), None),
                     Err(e) => {
+                        let transport = e.is_scsi_transport_failure();
                         tracing::debug!(
                             target: "freemkv::disc",
                             phase = "handshake_read_data_key_failed",
                             cert_index = idx,
                             error_code = e.code(),
+                            transport_failure = transport,
                             "auth + VID read OK, but the drive served no read_data_key (bus key); \
                              a bus-encrypted disc stays undecryptable until it does"
                         );
+                        // A bus that died during the format-0x84 read is NOT
+                        // "the drive served no data key" — its sibling
+                        // `read_volume_id` arm above already learned this. Left
+                        // unclassified, a dead bus returned
+                        // `Ok(CertHandshake{ volume_id: Some, read_data_key: None })`,
+                        // i.e. a dead bus rendered as a successful-looking unlock
+                        // (the flagship failure-that-looks-like-success). Release
+                        // the AGID and abort like the VID path.
+                        if transport {
+                            release_agid(scsi, auth.agid);
+                            return Err(UnlockError::Transport);
+                        }
                         (None, Some(e.code()))
                     }
                 };
@@ -1690,6 +1794,156 @@ mod tests {
         };
         let (rdk, _wdk) = read_data_keys(&mut t, &mut auth).expect("decrypts");
         assert_eq!(auth.read_data_key, Some(rdk));
+    }
+
+    /// THE defect-D1 test (chain-of-trust gap). A drive certificate whose type
+    /// byte is neither 0x01 (AACS 1.0) nor 0x11 (AACS 2.0) must be REJECTED at
+    /// the cert-type gate. It used to be an if / else-if with no else, so an
+    /// unknown type fell through: `is_aacs20` stayed false, the step-6
+    /// key-signature check still ran against the drive's OWN key lifted from a
+    /// cert that was never LA-verified, and a rogue bridge presenting type 0x02
+    /// with its own keypair could win an attacker-chosen bus key. The distinct
+    /// `AacsCertVerify` (not the step-6 `AacsKeyVerify`) pins that rejection
+    /// happens BEFORE any key is trusted.
+    #[test]
+    fn unknown_drive_cert_type_is_rejected_before_trusting_any_key() {
+        let mut cert_resp = vec![0u8; 116];
+        cert_resp[24] = 0x02; // unknown cert type (not 0x01, not 0x11)
+        // A key point that WOULD ECDH-derive a bus key if step 6 were reached.
+        let mut key_resp = vec![0u8; 84];
+        key_resp[4..24].copy_from_slice(&EC_GX);
+        key_resp[24..44].copy_from_slice(&EC_GY);
+        let script = vec![
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 8]), // AGID alloc → agid 0
+            Reply::good(vec![]),       // SEND KEY host cert
+            Reply::good(cert_resp),    // REPORT KEY drive cert (type 0x02)
+            Reply::good(key_resp),     // REPORT KEY drive key point (must NOT be trusted)
+        ];
+        let mut t = MockTransport::scripted(script, Reply::good(vec![0u8; 2]));
+        let hc = dummy_cert();
+        let err = aacs_authenticate(&mut t, &hc.private_key, &hc.certificate)
+            .expect_err("an unknown cert type must be rejected, never trusted");
+        assert!(
+            matches!(err, Error::AacsCertVerify),
+            "rejection must fire at the cert-type gate (AacsCertVerify), not fall \
+             through to the step-6 key check; got {err:?}"
+        );
+    }
+
+    /// A transport that plays the DRIVE side of an AACS 1.0 handshake well
+    /// enough for `aacs_authenticate` + `read_volume_id` to SUCCEED, then dies
+    /// on the format-0x84 read-data-keys command. It picks its own ECDH keypair
+    /// and derives the SAME bus key the host does (ECDH is symmetric), so it can
+    /// answer the Volume ID read with a MAC that actually verifies — the only
+    /// way to drive `run_cert_handshake` past the VID gate and into the
+    /// read-data-keys arm with the crate's static mocks unable to.
+    struct DriveEmu {
+        drive_priv: [u8; 20],
+        drive_x: [u8; 20],
+        drive_y: [u8; 20],
+        vid: [u8; 16],
+        bus_key: Option<[u8; 16]>,
+    }
+
+    impl DriveEmu {
+        fn new() -> Self {
+            let (drive_priv, drive_x, drive_y) = generate_host_key_pair();
+            DriveEmu {
+                drive_priv,
+                drive_x,
+                drive_y,
+                vid: [0x5Au8; 16],
+                bus_key: None,
+            }
+        }
+    }
+
+    impl ScsiTransport for DriveEmu {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            let ok = |payload: Vec<u8>, data: &mut [u8]| {
+                let n = payload.len().min(data.len());
+                data[..n].copy_from_slice(&payload[..n]);
+                Ok(crate::scsi::ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            };
+            match cdb[0] {
+                crate::scsi::SCSI_REPORT_KEY => match cdb[10] & 0x3F {
+                    0x3F => ok(vec![0u8; 2], data), // invalidate
+                    0x00 => ok(vec![0u8; 8], data), // AGID alloc → agid 0
+                    0x01 => {
+                        // drive cert + nonce; type 0x11 → cert + step-6 verify skipped
+                        let mut r = vec![0u8; 116];
+                        r[24] = 0x11;
+                        ok(r, data)
+                    }
+                    0x02 => {
+                        // drive key point: x[4..24], y[24..44], sig[44..84] (skipped)
+                        let mut r = vec![0u8; 84];
+                        r[4..24].copy_from_slice(&self.drive_x);
+                        r[24..44].copy_from_slice(&self.drive_y);
+                        ok(r, data)
+                    }
+                    _ => ok(vec![0u8; 2], data),
+                },
+                crate::scsi::SCSI_SEND_KEY => {
+                    if cdb[10] & 0x3F == 0x02 {
+                        // host key point arrives in the ToDevice buffer; derive
+                        // the shared bus key from the drive side (drive_priv ×
+                        // host_point) — equals host_priv × drive_point.
+                        let mut hx = [0u8; 20];
+                        let mut hy = [0u8; 20];
+                        hx.copy_from_slice(&data[4..24]);
+                        hy.copy_from_slice(&data[24..44]);
+                        self.bus_key = compute_bus_key(&self.drive_priv, &hx, &hy);
+                    }
+                    ok(vec![], data)
+                }
+                crate::scsi::SCSI_READ_DISC_STRUCTURE => match cdb[7] {
+                    0x80 => {
+                        let bus = self.bus_key.expect("bus key derived at step 8");
+                        let mac = aes_cmac_16(&self.vid, &bus);
+                        let mut r = vec![0u8; 36];
+                        r[4..20].copy_from_slice(&self.vid);
+                        r[20..36].copy_from_slice(&mac);
+                        ok(r, data)
+                    }
+                    // format 0x84 read-data-keys: the bus dies here.
+                    _ => Err(crate::scsi::ScsiError {
+                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                        sense: None,
+                    }),
+                },
+                _ => ok(vec![0u8; 2], data),
+            }
+        }
+    }
+
+    /// THE defect-D5 test (failure-that-looks-like-success). Auth + Volume ID
+    /// read SUCCEED, then the bus dies during the format-0x84 read-data-keys
+    /// command. The read_data_keys arm of `run_cert_handshake` did not check
+    /// `is_scsi_transport_failure()` (its VID-read sibling does), so a dead bus
+    /// returned `Ok(CertHandshake{ volume_id: Some, read_data_key: None })` — a
+    /// dead bus rendered as a successful-looking unlock. Catches dropping the
+    /// transport classification on the data-key arm.
+    #[test]
+    fn transport_fault_reading_data_keys_is_transport_not_success() {
+        let mut t = DriveEmu::new();
+        let err = run_cert_handshake(&mut t, &[dummy_cert()])
+            .expect_err("dead bus on the read-data-keys command");
+        assert_eq!(err, crate::UnlockError::Transport);
     }
 
     /// Constant-time compare must still be a CORRECT compare.
@@ -2005,20 +2259,20 @@ mod tests {
 
     #[test]
     fn test_verify_cert_p256_short_cert_no_panic() {
-        // Regression: verify_cert_p256 used to slice cert[106..138] after only
-        // a `len < 132` guard. The drive cert the handshake passes in is
-        // exactly 132 bytes (&response[24..156]), so the slice panicked OOB.
-        // It must now return false (cannot verify) rather than panic.
-        let cert_132 = [0x11u8; 132];
-        assert!(
-            !verify_cert_p256(&cert_132),
-            "132-byte cert must be rejected, not panic"
-        );
-        // Boundary lengths around the slice requirement.
-        for len in [0usize, 73, 74, 105, 106, 131, 137] {
+        // The drive cert the handshake passes in is exactly 132 bytes
+        // (&response[24..156]); verify_cert_p256 slices cert[68..100]/[100..132]
+        // and reads cert[..68]. A cert shorter than 132 must return false (cannot
+        // verify), never panic. Sweep the boundary around the 132 guard.
+        for len in [0usize, 67, 68, 99, 100, 131] {
             let cert = vec![0x11u8; len];
             assert!(!verify_cert_p256(&cert), "len {len} must not panic");
         }
+        // A 132-byte all-0x11 cert reaches verification and is rejected on its
+        // (invalid) signature — still false, still no panic.
+        assert!(
+            !verify_cert_p256(&[0x11u8; 132]),
+            "132-byte cert with a bogus signature must verify-false, not panic"
+        );
     }
 
     #[test]
@@ -2059,48 +2313,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_verify_host_cert_from_keydb() {
-        // Exercise verify_cert against a real AACS 1.0 host certificate.
-        //
-        // libfreemkv no longer parses keydb.cfg (the parser lives in
-        // freemkv-keysources), so the cert bytes are read from a raw 92-byte
-        // certificate file named by HOST_CERT_PATH instead of being pulled
-        // from a parsed KeyDb. This keeps verify_cert (private to this module,
-        // so it cannot move to keysources) covered against genuine LA-signed
-        // bytes without re-introducing a keydb dependency here. Inert in CI
-        // (env unset), matching the prior KEYDB_PATH gating.
-        let cert_path = match std::env::var("HOST_CERT_PATH").ok() {
-            Some(p) => std::path::PathBuf::from(p),
-            None => return,
-        };
-        if !cert_path.exists() {
-            return;
-        }
-        let certificate = match std::fs::read(&cert_path) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-
-        // Direct HostCert construction — no parser. Only `certificate` feeds
-        // verify_cert; the other fields are inert placeholders.
-        let hc = crate::HostCert {
-            private_key: [0u8; 20],
-            certificate,
-            private_key_v2: None,
-            certificate_v2: None,
-        };
-        let valid = verify_cert(&hc.certificate);
-        eprintln!(
-            "Host cert verification: {}",
-            if valid { "PASS" } else { "FAIL" }
-        );
-        // Note: a revoked cert should still carry a valid LA signature.
-        // If it doesn't verify, the LA public key might be wrong.
-        if !valid {
-            eprintln!("  (cert may use different LA key or format)");
-        }
-    }
+    // NOTE: the former `test_verify_host_cert_from_keydb` was removed. It was
+    // env-gated (HOST_CERT_PATH), inert in CI, and asserted NOTHING — it only
+    // `eprintln!`d PASS/FAIL. The one property it was reaching for (are the LA
+    // anchors sound enough to verify a real cert?) is now pinned mechanically by
+    // `la_anchor_keys_are_on_curve` below, which needs no external file and will
+    // enforce the moment the real published keys land.
 
     // ════════════════════════════════════════════════════════════════════
     // Hardening additions
@@ -2271,13 +2489,16 @@ mod tests {
     }
 
     #[test]
-    fn cert_pub_key_p256_extracts_offsets_10_42_74() {
-        // AACS 2.0: pub_x at [10..42], pub_y at [42..74].
-        let mut cert = vec![0u8; 138];
-        for b in &mut cert[10..42] {
+    fn cert_pub_key_p256_extracts_offsets_4_36_68() {
+        // AACS 2.0 (132-byte cert, 4-byte header): pub_x at [4..36], pub_y at
+        // [36..68] — the same framing the step-6 drive-key message uses. Catches
+        // regressing to the old 10-byte-header [10..42]/[42..74] offsets, which
+        // belonged to a 138-byte cert the handshake never actually reads.
+        let mut cert = vec![0u8; 132];
+        for b in &mut cert[4..36] {
             *b = 0xC3;
         }
-        for b in &mut cert[42..74] {
+        for b in &mut cert[36..68] {
             *b = 0xD4;
         }
         let (x, y) = cert_pub_key_p256(&cert);
@@ -2287,9 +2508,9 @@ mod tests {
 
     #[test]
     fn cert_pub_key_p256_zeroes_when_too_short() {
-        // < 74 bytes → zeroed, matching the verify_cert_p256 >= 138 guard's
-        // safety contract (no OOB on cert[10..74]).
-        let (x, y) = cert_pub_key_p256(&[0u8; 73]);
+        // < 68 bytes → zeroed, matching the verify_cert_p256 >= 132 guard's
+        // safety contract (no OOB on cert[4..68]).
+        let (x, y) = cert_pub_key_p256(&[0u8; 67]);
         assert_eq!(x, [0u8; 32]);
         assert_eq!(y, [0u8; 32]);
     }
@@ -2381,14 +2602,102 @@ mod tests {
         assert_ne!(aes_cmac_16(&m1, &key), aes_cmac_16(&m2, &key));
     }
 
-    // ── verify_cert_p256 boundary at exactly 138 ───────────────────────────
+    // ── verify_cert_p256 boundary at exactly 132 ───────────────────────────
 
     #[test]
-    fn verify_cert_p256_accepts_138_byte_length_without_panic() {
-        // 138 bytes is the minimum that satisfies the guard; the slices
-        // cert[74..106]/[106..138] are all in-bounds. The signature won't
-        // verify (random bytes) but it must NOT panic and must return false.
-        let cert = vec![0x00u8; 138];
+    fn verify_cert_p256_accepts_132_byte_length_without_panic() {
+        // 132 bytes is the real cert length (and the minimum that satisfies the
+        // guard); the slices cert[68..100]/[100..132] are all in-bounds. The
+        // signature won't verify (all-zero bytes) but it must NOT panic and must
+        // return false. Catches regressing the guard back to 138 (which rejected
+        // every real 132-byte cert unconditionally).
+        let cert = vec![0x00u8; 132];
         assert!(!verify_cert_p256(&cert));
+    }
+
+    /// THE on-curve guard for the AACS Licensing Administrator anchors.
+    ///
+    /// The chain of trust for AACS cert verification roots in the LA public
+    /// keys (`AACS_LA_PUB_X/Y` for 1.0, `AACS2_LA_PUB_X/Y` for 2.0). Both must
+    /// lie on their curve or `ecdsa_verify`'s new `point_on_curve(Q)` guard
+    /// rejects every certificate signed by them. This asserts each anchor
+    /// satisfies y² ≡ x³ + ax + b (mod p) AND lies in the prime-order subgroup
+    /// (n·Q == O; both curves have cofactor 1, so on-curve ⇒ in-subgroup, but the
+    /// order check is cheap insurance).
+    ///
+    /// MUTATION: reverting either anchor to the previous OFF-CURVE value makes
+    /// `point_on_curve` fail here (red-before-green for the anchor landing).
+    #[test]
+    fn la_anchor_keys_are_on_curve() {
+        // AACS 1.0 LA key on the 160-bit curve.
+        {
+            let p = BigUint::from_bytes_be(&EC_P);
+            let a = BigUint::from_bytes_be(&EC_A);
+            let b = BigUint::from_bytes_be(&EC_B);
+            let n = BigUint::from_bytes_be(&EC_N);
+            let qx = BigUint::from_bytes_be(&AACS_LA_PUB_X);
+            let qy = BigUint::from_bytes_be(&AACS_LA_PUB_Y);
+            assert!(
+                point_on_curve(&qx, &qy, &a, &b, &p),
+                "AACS 1.0 LA public key is not on the curve"
+            );
+            let q = EcPoint::from_bytes(&AACS_LA_PUB_X, &AACS_LA_PUB_Y);
+            assert!(
+                ec_mul(&n, &q, &a, &p).infinity,
+                "AACS 1.0 LA public key is not in the prime-order subgroup (n·Q != O)"
+            );
+        }
+        // AACS 2.0 LA key on P-256.
+        {
+            let p = BigUint::from_bytes_be(&P256_P);
+            let a = BigUint::from_bytes_be(&P256_A);
+            let b = BigUint::from_bytes_be(&P256_B);
+            let n = BigUint::from_bytes_be(&P256_N);
+            let qx = BigUint::from_bytes_be(&AACS2_LA_PUB_X);
+            let qy = BigUint::from_bytes_be(&AACS2_LA_PUB_Y);
+            assert!(
+                point_on_curve(&qx, &qy, &a, &b, &p),
+                "AACS 2.0 LA public key is not on the curve"
+            );
+            let q = EcPoint::from_bytes(&AACS2_LA_PUB_X, &AACS2_LA_PUB_Y);
+            assert!(
+                ec_mul(&n, &q, &a, &p).infinity,
+                "AACS 2.0 LA public key is not in the prime-order subgroup (n·Q != O)"
+            );
+        }
+    }
+
+    /// End-to-end proof that the landed AACS 1.0 LA anchor actually verifies a
+    /// GENUINE LA-signed certificate — the property the removed, env-gated,
+    /// assertion-free `test_verify_host_cert_from_keydb` only ever gestured at.
+    ///
+    /// The fixture is a real 92-byte AACS 1.0 host certificate (a *public*
+    /// verification key + a revoked host cert — safe to embed; it carries NO
+    /// private key). Layout: [0]type [1]version [2..4]len=0x005c [4..10]hostID
+    /// [10..12]resv [12..52]pubkey(x||y) [52..92]sig(r||s); the LA signs
+    /// SHA-1(cert[0..52]). A revoked cert still carries a valid LA signature, so
+    /// this exercises only the signature path.
+    ///
+    /// MUTATION: reverting AACS_LA_PUB_X/Y to the previous OFF-CURVE constant
+    /// makes `verify_cert` return false here (red-before-green for the anchor).
+    /// It also fails if `verify_cert`'s offsets/SHA-1 or `ecdsa_verify` regress.
+    #[test]
+    fn verify_cert_accepts_a_genuine_la_signed_host_cert() {
+        // Raw hex of the 92-byte genuine host certificate.
+        const CERT_HEX: &str = concat!(
+            "0201005cffff80000210000068799afa84876ecf28c10d35",
+            "1677898609004e1e17ccda763b16ccab290fde01acb9b8e3",
+            "6ef3b58916e1f55b983eeee66ada9eeaa0645f7d7a3eb5ff",
+            "3f8afa32184b173b9fc177f398257cdedf2c7617"
+        );
+        let cert: Vec<u8> = (0..CERT_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&CERT_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(cert.len(), 92, "fixture must be a full 92-byte cert");
+        assert!(
+            verify_cert(&cert),
+            "the landed AACS 1.0 LA anchor must verify a genuine LA-signed cert"
+        );
     }
 }
