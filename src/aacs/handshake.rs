@@ -442,7 +442,6 @@ fn ecdsa_sign(priv_key: &[u8; 20], data: &[u8]) -> ([u8; 20], [u8; 20]) {
     let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
     let d = BigUint::from_bytes_be(priv_key);
 
-    // Hash the data
     let hash = Sha1::digest(data);
     let z = BigUint::from_bytes_be(&hash);
 
@@ -803,8 +802,7 @@ fn compute_bus_key(
     Some(bus_key)
 }
 
-/// Generate ephemeral host key pair: (private_key, public_point_x, public_point_y).
-/// Generate P-256 ephemeral key pair for AACS 2.0.
+/// Generate P-256 ephemeral key pair for AACS 2.0: (private_key, public_point_x, public_point_y).
 fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
     let p_mod = BigUint::from_bytes_be(&P256_P);
     let a = BigUint::from_bytes_be(&P256_A);
