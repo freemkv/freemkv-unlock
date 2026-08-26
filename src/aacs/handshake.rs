@@ -1901,6 +1901,10 @@ mod tests {
         drive_y: [u8; 20],
         vid: [u8; 16],
         bus_key: Option<[u8; 16]>,
+        /// When set, format-0x84 (read-data-keys) is served a genuine non-zero
+        /// response instead of the default dead-bus behaviour, letting
+        /// `run_cert_handshake` run all the way to its `Ok` return.
+        serve_data_keys: bool,
     }
 
     impl DriveEmu {
@@ -1912,6 +1916,7 @@ mod tests {
                 drive_y,
                 vid: [0x5Au8; 16],
                 bus_key: None,
+                serve_data_keys: false,
             }
         }
     }
@@ -1974,11 +1979,21 @@ mod tests {
                         r[20..36].copy_from_slice(&mac);
                         ok(r, data)
                     }
-                    // format 0x84 read-data-keys: the bus dies here.
-                    _ => Err(crate::scsi::ScsiError {
-                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
-                        sense: None,
-                    }),
+                    // format 0x84 read-data-keys: the bus dies here, unless
+                    // the test opted into a full success path.
+                    _ => {
+                        if self.serve_data_keys {
+                            let mut r = vec![0u8; 36];
+                            r[4..20].copy_from_slice(&[0x7Bu8; 16]); // enc read data key
+                            r[20..36].copy_from_slice(&[0x7Cu8; 16]); // enc write data key
+                            ok(r, data)
+                        } else {
+                            Err(crate::scsi::ScsiError {
+                                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                                sense: None,
+                            })
+                        }
+                    }
                 },
                 _ => ok(vec![0u8; 2], data),
             }
@@ -2849,6 +2864,10 @@ mod tests {
         /// When set, step 6 serves an OFF-CURVE key point (identity-ish) so the
         /// host's `compute_bus_key_p256` invalid-curve guard must reject it.
         off_curve_point: bool,
+        /// When set, step 6's key-point signature is corrupted AFTER signing
+        /// (so the signed message is genuine but the wire bytes are not) — the
+        /// host's `ecdsa_verify_p256` at step 6 must reject it.
+        bad_step6_sig: bool,
         host_nonce: [u8; 20],
         bus_key: Option<[u8; 16]>,
     }
@@ -2866,6 +2885,7 @@ mod tests {
                 eph_y,
                 cert,
                 off_curve_point: false,
+                bad_step6_sig: false,
                 host_nonce: [0u8; 20],
                 bus_key: None,
             }
@@ -2911,7 +2931,10 @@ mod tests {
                         signed.extend_from_slice(&self.host_nonce);
                         signed.extend_from_slice(&px);
                         signed.extend_from_slice(&py);
-                        let (sr, ss) = ecdsa_sign_p256(&self.lt_priv, &signed);
+                        let (sr, mut ss) = ecdsa_sign_p256(&self.lt_priv, &signed);
+                        if self.bad_step6_sig {
+                            ss[31] ^= 0xFF; // corrupt the wire signature, not the signed message
+                        }
                         let mut r = vec![0u8; 132];
                         r[4..36].copy_from_slice(&px);
                         r[36..68].copy_from_slice(&py);
@@ -3150,6 +3173,249 @@ mod tests {
             !ecdsa_verify_p256(&cc_x, &cc_y, &sig_r, &sig_s, &tampered),
             "a tampered signed region must not verify"
         );
+    }
+
+    // ── Round-2 coverage: EC math edge cases ────────────────────────────────
+
+    /// `mod_inv` returns `None` when `gcd(a, m) != 1` — the caller-facing
+    /// contract every call site (`ec_add`, `ec_double`, `ecdsa_verify*`)
+    /// pattern-matches on. Called directly with a non-coprime pair (both
+    /// even), since every production caller passes a genuinely prime curve
+    /// modulus for which this never fires.
+    #[test]
+    fn mod_inv_returns_none_for_non_coprime_inputs() {
+        let a = BigUint::from(4u32);
+        let m = BigUint::from(8u32); // gcd(4, 8) = 4, no inverse exists
+        assert!(mod_inv(&a, &m).is_none());
+    }
+
+    /// `ec_add`'s `dx_inv` guard: when the x-difference is not invertible mod
+    /// the modulus, addition must return the point at infinity rather than
+    /// panic or produce a bogus point. Only reachable with a non-prime
+    /// modulus (every real curve here uses a prime `p`, under which two
+    /// distinct field elements always have an invertible difference) — a
+    /// direct, pure-function exercise of the defensive branch.
+    #[test]
+    fn ec_add_returns_infinity_when_dx_not_invertible() {
+        let a = BigUint::from(1u32);
+        let p = BigUint::from(8u32); // composite modulus
+        let p1 = EcPoint::new(BigUint::from(0u32), BigUint::from(1u32));
+        let p2 = EcPoint::new(BigUint::from(4u32), BigUint::from(3u32)); // dx = 4, gcd(4,8)=4
+        let r = ec_add(&p1, &p2, &a, &p);
+        assert!(
+            r.infinity,
+            "a non-invertible dx must yield infinity, not a bogus point"
+        );
+    }
+
+    /// `ec_double`'s `denom_inv` guard: same shape as above, for the
+    /// doubling denominator `2y`.
+    #[test]
+    fn ec_double_returns_infinity_when_denominator_not_invertible() {
+        let a = BigUint::from(1u32);
+        let p = BigUint::from(8u32); // composite modulus
+        let pt = EcPoint::new(BigUint::from(1u32), BigUint::from(4u32)); // 2y = 8, gcd(8,8)=8
+        let r = ec_double(&pt, &a, &p);
+        assert!(
+            r.infinity,
+            "a non-invertible denominator must yield infinity"
+        );
+    }
+
+    /// `ec_mul` with a zero scalar is the point at infinity by definition —
+    /// the double-and-add loop must short-circuit rather than run.
+    #[test]
+    fn ec_mul_zero_scalar_returns_infinity() {
+        let a = BigUint::from_bytes_be(&EC_A);
+        let p = BigUint::from_bytes_be(&EC_P);
+        let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+        let r = ec_mul(&BigUint::zero(), &g, &a, &p);
+        assert!(r.infinity);
+    }
+
+    /// `ecdsa_verify` (AACS 1.0) rejects an off-curve public key up front —
+    /// the same invalid-curve defence `ecdsa_verify_p256` has its own direct
+    /// test for (`ecdsa_verify_p256_rejects_identity_key_forgery`), but the
+    /// 1.0 primitive had none.
+    #[test]
+    fn ecdsa_verify_rejects_off_curve_public_key() {
+        let (priv_key, px, py) = generate_host_key_pair();
+        let (r, s) = ecdsa_sign(&priv_key, b"payload");
+        // A genuinely off-curve point: flip a low byte of py.
+        let mut bad_py = py;
+        bad_py[19] ^= 0x01;
+        assert!(
+            !ecdsa_verify(&px, &bad_py, &r, &s, b"payload"),
+            "an off-curve public key must be rejected before any range/pairing check"
+        );
+    }
+
+    // ── Round-2 coverage: Debug redaction ───────────────────────────────────
+
+    /// `AacsAuth`'s hand-written `Debug` must redact `bus_key` / `volume_id` /
+    /// `read_data_key` (key material) while still showing whether each is
+    /// present, and must NOT panic on a populated instance.
+    #[test]
+    fn aacs_auth_debug_redacts_key_material() {
+        let auth = AacsAuth {
+            bus_key: [0x11u8; 16],
+            agid: 2,
+            volume_id: Some([0x22u8; 16]),
+            read_data_key: Some([0x33u8; 16]),
+            drive_cert: [0u8; 92],
+        };
+        let s = format!("{auth:?}");
+        assert!(
+            s.contains("[redacted]"),
+            "key material must be redacted: {s}"
+        );
+        assert!(!s.contains("17"), "no raw key byte (0x11=17) may leak: {s}");
+        assert!(
+            s.contains("agid"),
+            "non-secret fields must still print: {s}"
+        );
+    }
+
+    /// `CertHandshake`'s hand-written `Debug` likewise redacts `read_data_key`
+    /// and `volume_id`, and does not panic on `None`.
+    #[test]
+    fn cert_handshake_debug_redacts_key_material() {
+        let ch = CertHandshake {
+            volume_id: [0x44u8; 16],
+            read_data_key: Some([0x55u8; 16]),
+            read_data_key_err: None,
+        };
+        let s = format!("{ch:?}");
+        assert!(
+            s.contains("[redacted]"),
+            "key material must be redacted: {s}"
+        );
+
+        let ch_none = CertHandshake {
+            volume_id: [0u8; 16],
+            read_data_key: None,
+            read_data_key_err: Some(7006),
+        };
+        let s2 = format!("{ch_none:?}");
+        assert!(s2.contains("[redacted]"));
+    }
+
+    // ── Round-2 coverage: AACS 1.0 cert-verify gate ─────────────────────────
+
+    /// `aacs_authenticate` rejects a host cert shorter than 92 bytes before
+    /// issuing a single SCSI command.
+    #[test]
+    fn aacs_authenticate_v1_rejects_short_host_cert() {
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let priv_key = [0u8; 20];
+        let err = aacs_authenticate(&mut t, &priv_key, &[0u8; 91])
+            .expect_err("a 91-byte cert is too short");
+        assert!(matches!(err, Error::AacsCertShort));
+        assert_eq!(t.calls(), 0, "must reject before touching the transport");
+    }
+
+    /// A type-0x01 (AACS 1.0) drive certificate whose LA signature does not
+    /// verify must be rejected at the cert-verify gate (`Error::AacsCertVerify`,
+    /// via `verify_cert`) — the type-0x01 sibling of the type-0x11
+    /// (`unknown_drive_cert_type_is_rejected_before_trusting_any_key`) and
+    /// type-0x02 gates, neither of which exercises this specific `if
+    /// drive_cert[0] == 0x01 { if !verify_cert(..) }` branch.
+    #[test]
+    fn aacs_authenticate_v1_type01_bad_signature_is_rejected() {
+        let mut cert_resp = vec![0u8; 116];
+        cert_resp[24] = 0x01; // type 0x01, but the rest is all zeros: sig r=s=0
+        let script = vec![
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 8]), // AGID alloc
+            Reply::good(vec![]),       // SEND KEY host cert
+            Reply::good(cert_resp),    // REPORT KEY drive cert (type 0x01, unsigned)
+        ];
+        let mut t = MockTransport::scripted(script, Reply::good(vec![0u8; 2]));
+        let hc = dummy_cert();
+        let err = aacs_authenticate(&mut t, &hc.private_key, &hc.certificate)
+            .expect_err("an unsigned type-0x01 cert must fail LA verification");
+        assert!(matches!(err, Error::AacsCertVerify));
+    }
+
+    // ── Round-2 coverage: AACS 2.0 (P-256) wiring ───────────────────────────
+
+    /// `aacs2_authenticate_p256` — the thin wrapper threading the REAL
+    /// production LA anchor (`AACS2_LA_PUB_X/Y`), as opposed to the
+    /// test-injectable `_with_anchor` every other P-256 AKE test calls — had
+    /// no direct test. A dead bus on the very first step proves the wrapper
+    /// forwards correctly and its `if r.is_err() { release_agid }` cleanup
+    /// runs (the AGID-allocation call itself fails, so no AGID to release —
+    /// asserting the call count instead pins that no extra CDB is issued).
+    #[test]
+    fn aacs2_authenticate_p256_wrapper_propagates_transport_fault() {
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let (host_priv, _hx, _hy) = generate_host_key_pair_p256();
+        let err =
+            aacs2_authenticate_p256(&mut t, &host_priv, &[0x11u8; 132]).expect_err("dead bus");
+        assert!(err.is_scsi_transport_failure());
+    }
+
+    /// `aacs2_authenticate_p256_with_anchor` rejects a host cert shorter than
+    /// 132 bytes before issuing a single SCSI command.
+    #[test]
+    fn aacs2_authenticate_p256_with_anchor_rejects_short_host_cert() {
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let (host_priv, _hx, _hy) = generate_host_key_pair_p256();
+        let (_la_priv, la_x, la_y) = generate_host_key_pair_p256();
+        let err =
+            aacs2_authenticate_p256_with_anchor(&mut t, &host_priv, &[0u8; 131], &la_x, &la_y)
+                .expect_err("a 131-byte cert is too short");
+        assert!(matches!(err, Error::AacsCertShort));
+        assert_eq!(t.calls(), 0, "must reject before touching the transport");
+    }
+
+    /// THE step-6 signature proof, P-256 AKE: a validly LA-signed type-0x11
+    /// cert passes the cert-verify gate, but the drive's key-point signature
+    /// at step 6 is corrupted. Must abort at `ecdsa_verify_p256` (returning
+    /// `Error::AacsKeyVerify`) — distinct from the cert-verify gate
+    /// (`p256_ake_bad_cert_signature_is_fatal`) and the bus-key invalid-curve
+    /// guard (`p256_ake_off_curve_drive_point_is_rejected`), neither of which
+    /// exercises this specific check.
+    #[test]
+    fn p256_ake_bad_step6_signature_is_rejected() {
+        let (la_priv, la_x, la_y) = generate_host_key_pair_p256();
+        let (drive_lt_priv, drive_lt_x, drive_lt_y) = generate_host_key_pair_p256();
+        let cert = p256_synth_cert(0x11, &drive_lt_x, &drive_lt_y, &la_priv);
+        let (host_priv, _hx, _hy) = generate_host_key_pair_p256();
+
+        let mut emu = DriveEmuP256::new(drive_lt_priv, cert);
+        emu.bad_step6_sig = true;
+        let err =
+            aacs2_authenticate_p256_with_anchor(&mut emu, &host_priv, &[0x11u8; 132], &la_x, &la_y)
+                .expect_err("a corrupted step-6 signature must abort the AKE");
+        assert!(
+            matches!(err, Error::AacsKeyVerify),
+            "rejection must fire at the step-6 signature check; got {err:?}"
+        );
+    }
+
+    // ── Round-2 coverage: run_cert_handshake full success ───────────────────
+
+    /// THE full happy path: auth, Volume ID read, AND the read-data-keys
+    /// (bus key) read all succeed against a self-consistent drive emulator.
+    /// Every other `run_cert_handshake` test above deliberately stops short
+    /// (dead bus / bad MAC / all-zero keys) — this is the only one that
+    /// reaches the function's final `Ok(CertHandshake { .. })` return.
+    #[test]
+    fn run_cert_handshake_succeeds_end_to_end() {
+        let mut t = DriveEmu::new();
+        t.serve_data_keys = true;
+        let ch = run_cert_handshake(&mut t, &[dummy_cert()])
+            .expect("auth + VID + data-key reads all succeed");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+        assert!(
+            ch.read_data_key.is_some(),
+            "a served data-key block must decrypt"
+        );
+        assert!(ch.read_data_key_err.is_none());
     }
 
     /// SLOT for a REAL AACS 2.0 host certificate (a side agent is sourcing one).

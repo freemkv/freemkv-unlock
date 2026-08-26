@@ -1290,4 +1290,152 @@ mod tests {
         let e = read_disc_key(&mut t, 0).expect_err("dead bus");
         assert!(e.is_transport_failure());
     }
+
+    // ── Full happy-path bus-auth ────────────────────────────────────────────
+
+    /// A fake drive that plays its half of the CSS bus-auth handshake for
+    /// real: it captures the host's genuinely-random per-session challenge
+    /// and answers Key1 with the actual `crypt_key(0, variant, ..)` for a
+    /// fixed `variant`, so the host's brute-force loop matches it honestly
+    /// (not via a canned constant the loop happens to hit). Also answers
+    /// GET CONFIGURATION as a DVD and READ DVD STRUCTURE (disc key) as a
+    /// success, so the full `unlock_bus` path can be driven end to end.
+    struct FakeDvdDrive {
+        variant: u8,
+        host_challenge: [u8; 10],
+    }
+
+    impl ScsiTransport for FakeDvdDrive {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            use crate::scsi::ScsiResult;
+            let ok = |bytes_transferred: usize| ScsiResult {
+                status: 0,
+                bytes_transferred,
+                sense: [0u8; 32],
+            };
+            match cdb[0] {
+                crate::scsi::SCSI_GET_CONFIGURATION => {
+                    data[6] = 0x00;
+                    data[7] = 0x10; // DVD-ROM current profile
+                    Ok(ok(8))
+                }
+                crate::scsi::SCSI_SEND_KEY => {
+                    let format = cdb[10] & 0x3F;
+                    if format == 0x01 {
+                        // Host challenge: capture it for the Key1 answer.
+                        for i in 0..10 {
+                            self.host_challenge[i] = data[4 + (9 - i)];
+                        }
+                    }
+                    // format 0x03 (Key2) is accepted unconditionally: the
+                    // real handshake never verifies it drive-side in this
+                    // primitive (ASF=1 is set on the drive's own say-so).
+                    Ok(ok(0))
+                }
+                crate::scsi::SCSI_REPORT_KEY => {
+                    match cdb[10] & 0x3F {
+                        0x00 => {
+                            // Allocate AGID 0.
+                            data[7] = 0x00;
+                            Ok(ok(8))
+                        }
+                        0x02 => {
+                            // Key1, honestly derived from the captured challenge.
+                            let key1 = crypt_key(0, self.variant, &self.host_challenge);
+                            for i in 0..5 {
+                                data[4 + (4 - i)] = key1[i];
+                            }
+                            Ok(ok(12))
+                        }
+                        0x01 => {
+                            // Drive challenge (arbitrary, fixed).
+                            let drive_challenge: [u8; 10] = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+                            for i in 0..10 {
+                                data[4 + (9 - i)] = drive_challenge[i];
+                            }
+                            Ok(ok(16))
+                        }
+                        _ => Ok(ok(0)), // 0x3F release, best-effort
+                    }
+                }
+                crate::scsi::SCSI_READ_DISC_STRUCTURE => Ok(ok(2048 + 4)),
+                _ => Ok(ok(0)),
+            }
+        }
+    }
+
+    /// End-to-end happy path for the bus-auth handshake: AGID allocation,
+    /// host challenge, a Key1 that genuinely matches the brute-forced
+    /// variant, the drive-challenge/Key2 exchange, and the disc-key REPORT
+    /// KEY all succeed. Exercises `establish_authenticated_session`'s `Ok`
+    /// return and `read_disc_key`'s success path, neither of which the
+    /// failure-path tests above reach.
+    #[test]
+    fn full_bus_auth_and_disc_key_succeed() {
+        let mut t = FakeDvdDrive {
+            variant: 7,
+            host_challenge: [0u8; 10],
+        };
+        let agid =
+            establish_authenticated_session(&mut t).expect("full bus-auth handshake succeeds");
+        assert_eq!(agid, 0);
+        read_disc_key(&mut t, agid).expect("disc-key REPORT KEY succeeds");
+    }
+
+    /// The same happy path driven through the public `unlock_bus` entry
+    /// point (DVD self-guard, full bus-auth, best-effort disc key), proving
+    /// `DvdUnlocker::unlock_bus` returns `Ok(Unlocked::default())` on success
+    /// — the path every failure-injection test above deliberately avoids.
+    #[test]
+    fn dvd_unlocker_succeeds_end_to_end() {
+        let id = DriveId::default();
+        let mut t = FakeDvdDrive {
+            variant: 3,
+            host_challenge: [0u8; 10],
+        };
+        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        let unlocked = r.expect("full unlock succeeds");
+        assert!(unlocked.vid.is_none(), "CSS yields no Volume ID");
+        assert!(unlocked.bus_key.is_none(), "CSS yields no AACS bus key");
+        assert!(
+            !unlocked.drive_unlocked,
+            "CSS is a bus-auth unlock, not a firmware drive-unlock"
+        );
+    }
+
+    /// `unlock_css_reads` (the crate-level public entry point, distinct from
+    /// the `DvdUnlocker` wrapper) also succeeds end to end.
+    #[test]
+    fn unlock_css_reads_succeeds() {
+        let mut t = FakeDvdDrive {
+            variant: 11,
+            host_challenge: [0u8; 10],
+        };
+        // unlock_css_reads doesn't probe GET CONFIGURATION itself (that's
+        // DvdUnlocker's job); it goes straight to bus-auth.
+        unlock_css_reads(&mut t, 0).expect("css bus-auth + best-effort disc key succeed");
+    }
+
+    /// `crypt_key`'s `key_type == 2` arm (`PERM_VARIANT[1]`) has no
+    /// production caller (only key_type 0, the variant brute-force, and 1,
+    /// the drive-challenge Key2, are ever invoked from `authenticate_with_agid`)
+    /// but is a pure, directly-testable function of its documented contract.
+    #[test]
+    fn crypt_key_type2_is_deterministic_and_distinct_from_type1() {
+        let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let a = crypt_key(2, 9, &challenge);
+        let b = crypt_key(2, 9, &challenge);
+        assert_eq!(a, b, "crypt_key(2, ..) must be deterministic");
+        assert_ne!(
+            crypt_key(1, 9, &challenge),
+            crypt_key(2, 9, &challenge),
+            "key_type 1 and 2 must diverge (distinct PERM_VARIANT rows)"
+        );
+    }
 }

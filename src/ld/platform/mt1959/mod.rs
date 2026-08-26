@@ -1039,6 +1039,283 @@ mod tests {
         assert!(!mt.is_unlocked());
     }
 
+    // ── run_init (the retry loop itself, not the leaf steps) ───────────────
+
+    /// A signature mismatch on the unlock response is another drive's token —
+    /// retrying accomplishes nothing, so `run_init` must abort on the FIRST
+    /// attempt with `UnlockFailed`, not retry three times.
+    #[test]
+    fn run_init_signature_mismatch_aborts_without_retry() {
+        let response = build_response(
+            [0xAA, 0xBB, 0xCC, 0xDD],
+            FIRMWARE_ACTIVE_SIG,
+            FIRMWARE_MODE_SIG,
+        );
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::good(response));
+        let mut mt = Mt1959::new(fixture_profile([0x99, 0x9E, 0xC3, 0x75]), false);
+        let e = mt.init(&mut t).expect_err("signature mismatch");
+        assert!(matches!(e, Error::UnlockFailed));
+        assert_eq!(t.calls(), 1, "must not retry a signature mismatch");
+    }
+
+    /// `run_init`'s retry loop: `do_unlock` fails generically (too short to
+    /// validate — not a signature mismatch, not a transport fault), the
+    /// firmware reload it falls back to also fails generically (an empty
+    /// firmware blob) rather than fatally, so the loop must `continue` and
+    /// try again — three times — before exhausting to the last error.
+    #[test]
+    fn run_init_exhausts_after_three_generic_failures() {
+        let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(
+            vec![0u8; 64],
+            10,
+        ));
+        // Empty firmware -> variant_a::load_firmware fails immediately with
+        // no CDB, so each attempt costs exactly one do_unlock call.
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let e = mt.init(&mut t).expect_err("never validates, never uploads");
+        assert!(matches!(e, Error::UnlockFailed));
+        assert!(!e.is_transport_failure());
+        assert_eq!(
+            t.calls(),
+            3,
+            "one do_unlock call per attempt, three attempts, no firmware CDBs"
+        );
+    }
+
+    /// Same generic `do_unlock` failure, but this time the firmware-reload
+    /// fallback itself hits a dead bus. That must abort `run_init`
+    /// immediately (transport classification preserved), not be folded into
+    /// `last_err` and retried.
+    #[test]
+    fn run_init_firmware_reload_transport_fault_aborts() {
+        let mut profile = fixture_profile([0; 4]);
+        profile.firmware = vec![0u8; 64]; // non-empty: load_firmware issues a CDB
+        let mut t = crate::scsi::mock::MockTransport::scripted(
+            vec![crate::scsi::mock::Reply::short(vec![0u8; 64], 10)], // do_unlock: generic fail
+            crate::scsi::mock::Reply::TransportFault,                 // WRITE_BUFFER: dead bus
+        );
+        let mut mt = Mt1959::new(profile, false);
+        let e = mt
+            .init(&mut t)
+            .expect_err("dead bus during firmware reload");
+        assert!(e.is_transport_failure());
+        assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
+        assert_eq!(
+            t.calls(),
+            2,
+            "one do_unlock call, then the WRITE_BUFFER that dies"
+        );
+    }
+
+    // ── run_probe entry / disc-type detection ───────────────────────────────
+
+    /// `run_probe` called before `init_complete` runs `do_unlock` itself
+    /// first (rather than assuming the caller already did).
+    #[test]
+    fn run_probe_runs_do_unlock_when_not_yet_initialized() {
+        let sig = [0x99, 0x9E, 0xC3, 0x75];
+        let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::good(response));
+        let mut mt = Mt1959::new(fixture_profile(sig), false);
+        assert!(!mt.init_complete);
+        let r = mt.run_probe(&mut t);
+        assert!(r.is_ok(), "probe completes: {r:?}");
+        assert!(mt.init_complete, "run_probe must do_unlock itself first");
+    }
+
+    /// A READ CAPACITY drive sense (status != 0) means "capacity unknown" ->
+    /// `disc_sectors` falls back to 0, which is still below the UHD
+    /// threshold, so probing continues with the BD init address rather than
+    /// aborting.
+    #[test]
+    fn run_probe_capacity_check_condition_falls_back_to_zero_sectors() {
+        struct CapacitySenseTransport;
+        impl ScsiTransport for CapacitySenseTransport {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                if cdb.first() == Some(&SCSI_READ_CAPACITY) {
+                    return Ok(ScsiResult {
+                        status: 0x02,
+                        bytes_transferred: 0,
+                        sense: [0u8; 32],
+                    });
+                }
+                for b in data.iter_mut() {
+                    *b = 0;
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = CapacitySenseTransport;
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let r = mt.run_probe(&mut t);
+        assert!(
+            r.is_ok(),
+            "a capacity sense must not abort the probe: {r:?}"
+        );
+    }
+
+    /// A disc reporting more than `UHD_SECTOR_THRESHOLD` sectors selects the
+    /// UHD init address (0x0200) rather than the BD one (0x0100).
+    #[test]
+    fn run_probe_selects_uhd_init_addr_for_a_large_disc() {
+        struct BigDiscTransport {
+            init_addr_seen: std::cell::RefCell<Option<u16>>,
+        }
+        impl ScsiTransport for BigDiscTransport {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                if cdb.first() == Some(&SCSI_READ_CAPACITY) {
+                    // last_lba = UHD_SECTOR_THRESHOLD (well above threshold
+                    // once +1'd), well past the 25M-sector cutoff.
+                    let last_lba: u32 = UHD_SECTOR_THRESHOLD + 1_000_000;
+                    data[..4].copy_from_slice(&last_lba.to_be_bytes());
+                    return Ok(ScsiResult {
+                        status: 0,
+                        bytes_transferred: 4,
+                        sense: [0u8; 32],
+                    });
+                }
+                if cdb.first() == Some(&SCSI_READ_BUFFER) && cdb.get(3) == Some(&SUB_CMD_INIT) {
+                    let addr = ((cdb[4] as u16) << 8) | cdb[5] as u16;
+                    *self.init_addr_seen.borrow_mut() = Some(addr);
+                }
+                for b in data.iter_mut() {
+                    *b = 0;
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = BigDiscTransport {
+            init_addr_seen: std::cell::RefCell::new(None),
+        };
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let _ = mt.run_probe(&mut t);
+        assert_eq!(
+            *t.init_addr_seen.borrow(),
+            Some(INIT_ADDR_UHD),
+            "a >25M-sector disc must probe-init at the UHD address"
+        );
+    }
+
+    /// The fine (pass-2) probe sweep ends early on a merely-rejected probe
+    /// reply (not a transport fault) — it must `break` out of the sweep and
+    /// let `run_probe` still return `Ok`, rather than propagating the drive's
+    /// refusal as a hard failure.
+    #[test]
+    fn run_probe_pass2_ends_early_on_a_rejected_probe_without_failing() {
+        struct Pass2RejectsTransport {
+            fault_at: u32,
+        }
+        impl ScsiTransport for Pass2RejectsTransport {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                if cdb.first() == Some(&SCSI_READ_BUFFER) && cdb.get(3) == Some(&SUB_CMD_PROBE) {
+                    let addr = ((cdb[4] as u32) << 8) | cdb[5] as u32;
+                    if addr >= self.fault_at {
+                        return Ok(ScsiResult {
+                            status: 0x02,
+                            bytes_transferred: 0,
+                            sense: [0u8; 32],
+                        });
+                    }
+                }
+                for b in data.iter_mut() {
+                    *b = 0;
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = Pass2RejectsTransport {
+            fault_at: PROBE_COARSE_END as u32,
+        };
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let r = mt.run_probe(&mut t);
+        assert!(
+            r.is_ok(),
+            "a rejected fine probe must end the sweep, not fail run_probe: {r:?}"
+        );
+        assert!(mt.probed);
+    }
+
+    // ── PlatformDriver trait guard clauses ──────────────────────────────────
+
+    /// `init()` is a no-op once `init_complete` is already set — it must not
+    /// re-run the handshake.
+    #[test]
+    fn init_is_a_noop_once_already_complete() {
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
+        assert!(mt.init(&mut t).is_ok());
+        assert_eq!(t.calls(), 0, "already-complete init must issue no CDBs");
+    }
+
+    /// `probe_disc()` before `init()` succeeded is a deliberate no-op (not a
+    /// retry of init): it must return `Ok(())` without touching the bus.
+    #[test]
+    fn probe_disc_is_a_noop_before_init_completes() {
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
+        assert!(mt.probe_disc(&mut t).is_ok());
+        assert_eq!(t.calls(), 0);
+    }
+
+    /// `probe_disc()` is a no-op once already probed.
+    #[test]
+    fn probe_disc_is_a_noop_once_already_probed() {
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        mt.probed = true;
+        let mut t =
+            crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
+        assert!(mt.probe_disc(&mut t).is_ok());
+        assert_eq!(t.calls(), 0);
+    }
+
+    /// `is_ready()` mirrors `init_complete`.
+    #[test]
+    fn is_ready_mirrors_init_complete() {
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        assert!(!mt.is_ready());
+        mt.init_complete = true;
+        assert!(mt.is_ready());
+    }
+
     #[test]
     fn do_unlock_rejects_inactive_mode_marker() {
         // Signature matches but the primary marker at [12..16] is
