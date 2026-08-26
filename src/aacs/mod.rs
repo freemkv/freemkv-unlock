@@ -140,6 +140,42 @@ mod tests {
         }
     }
 
+    /// `Default` must delegate to `new()` (there is only one way to build an
+    /// `AacsCert`, so this pins the two constructors never drift apart).
+    #[test]
+    #[allow(clippy::default_constructed_unit_structs)]
+    fn default_matches_new() {
+        let _ = AacsCert::default();
+        let _ = AacsCert::new();
+    }
+
+    /// THE full success path through `Unlocker::unlock_bus` itself: a
+    /// self-consistent AACS 1.0 drive emulator carries auth + VID + data-key
+    /// reads all the way to `Ok(Unlocked { .. })`, so the crate's public entry
+    /// point — not just `run_cert_handshake` underneath it — is proven to wire
+    /// `volume_id` and `read_data_key` into `Unlocked` correctly.
+    #[test]
+    fn unlock_bus_succeeds_end_to_end() {
+        let mut t = handshake::tests::DriveEmu::new();
+        t.serve_data_keys = true;
+        let id = id();
+        let certs = [host_cert()];
+        let ctx = UnlockCtx::new(&id, DiscKind::Aacs, &certs);
+        let unlocked = AacsCert::new()
+            .unlock_bus(&mut t, &ctx)
+            .expect("auth + VID + data-key reads all succeed");
+        assert_eq!(unlocked.vid, Some([0x5Au8; 16]));
+        assert!(unlocked.bus_key.is_some());
+        assert!(
+            !unlocked.drive_unlocked,
+            "cert path never sets drive_unlocked"
+        );
+    }
+
+    fn host_cert() -> crate::HostCert {
+        handshake::tests::dummy_cert()
+    }
+
     /// With no host certs there is nothing to authenticate with → NoUsableHostCert,
     /// and the transport is never touched.
     #[test]

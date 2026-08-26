@@ -1021,6 +1021,15 @@ mod tests {
         assert_eq!(DvdUnlocker::new().name(), "DVD");
     }
 
+    /// `Default` must delegate to `new()` — there is only one way to build a
+    /// `DvdUnlocker` (it is a unit struct), so this pins the two never drift.
+    #[test]
+    #[allow(clippy::default_constructed_unit_structs)]
+    fn default_matches_new() {
+        let _ = DvdUnlocker::default();
+        let _ = DvdUnlocker::new();
+    }
+
     /// DvdUnlocker provides bus removal only — it never provides drive features.
     #[test]
     fn dvd_unlocker_provides_no_features() {
@@ -1270,6 +1279,70 @@ mod tests {
         );
     }
 
+    /// Host challenge + Key1 both succeed, but the drive challenge REPORT KEY
+    /// (step 3) is refused. Distinct from `key1_report_failure_fails_the_auth`
+    /// (step 2) and `key2_send_failure_fails_the_auth` (step 4) below — each
+    /// pins a different `css_scsi` call site's `?`.
+    #[test]
+    fn drive_challenge_report_failure_fails_the_auth() {
+        struct FailAtDriveChallenge(FakeDvdDrive);
+        impl ScsiTransport for FailAtDriveChallenge {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                dir: DataDirection,
+                data: &mut [u8],
+                timeout_ms: u32,
+            ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+                if cdb[0] == crate::scsi::SCSI_REPORT_KEY && cdb[10] & 0x3F == 0x01 {
+                    return Ok(crate::scsi::ScsiResult {
+                        status: 0x02,
+                        bytes_transferred: 0,
+                        sense: [0u8; 32],
+                    });
+                }
+                self.0.execute(cdb, dir, data, timeout_ms)
+            }
+        }
+        let mut t = FailAtDriveChallenge(FakeDvdDrive {
+            variant: 4,
+            host_challenge: [0u8; 10],
+        });
+        let e = authenticate_with_agid(&mut t, 0).expect_err("refused drive challenge");
+        assert!(matches!(e, Error::CssAuthFailed));
+    }
+
+    /// Host challenge, Key1, and the drive challenge all succeed, but the
+    /// Key2 SEND KEY (step 4, the last command in the handshake) is refused.
+    #[test]
+    fn key2_send_failure_fails_the_auth() {
+        struct FailAtKey2Send(FakeDvdDrive);
+        impl ScsiTransport for FailAtKey2Send {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                dir: DataDirection,
+                data: &mut [u8],
+                timeout_ms: u32,
+            ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+                if cdb[0] == crate::scsi::SCSI_SEND_KEY && cdb[10] & 0x3F == 0x03 {
+                    return Ok(crate::scsi::ScsiResult {
+                        status: 0x02,
+                        bytes_transferred: 0,
+                        sense: [0u8; 32],
+                    });
+                }
+                self.0.execute(cdb, dir, data, timeout_ms)
+            }
+        }
+        let mut t = FailAtKey2Send(FakeDvdDrive {
+            variant: 4,
+            host_challenge: [0u8; 10],
+        });
+        let e = authenticate_with_agid(&mut t, 0).expect_err("refused Key2 send");
+        assert!(matches!(e, Error::CssAuthFailed));
+    }
+
     // ── read_disc_key ────────────────────────────────────────────────────────
 
     /// The best-effort disc-key REPORT KEY is refused — `read_disc_key` must
@@ -1420,6 +1493,41 @@ mod tests {
         // unlock_css_reads doesn't probe GET CONFIGURATION itself (that's
         // DvdUnlocker's job); it goes straight to bus-auth.
         unlock_css_reads(&mut t, 0).expect("css bus-auth + best-effort disc key succeed");
+    }
+
+    /// A drive whose bus-auth succeeds but refuses the best-effort disc-key
+    /// REPORT KEY (CHECK CONDITION). `unlock_css_reads_inner` must swallow
+    /// that failure — the read barrier is already open from bus-auth, so the
+    /// whole unlock must still report `Ok`, not propagate the disc-key error.
+    struct DiscKeyRefusingDrive(FakeDvdDrive);
+
+    impl ScsiTransport for DiscKeyRefusingDrive {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            dir: DataDirection,
+            data: &mut [u8],
+            timeout_ms: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            if cdb[0] == crate::scsi::SCSI_READ_DISC_STRUCTURE {
+                return Ok(crate::scsi::ScsiResult {
+                    status: 0x02,
+                    bytes_transferred: 0,
+                    sense: [0u8; 32],
+                });
+            }
+            self.0.execute(cdb, dir, data, timeout_ms)
+        }
+    }
+
+    #[test]
+    fn disc_key_refusal_is_non_fatal_to_the_overall_unlock() {
+        let mut t = DiscKeyRefusingDrive(FakeDvdDrive {
+            variant: 5,
+            host_challenge: [0u8; 10],
+        });
+        unlock_css_reads(&mut t, 0)
+            .expect("bus-auth succeeded; a refused best-effort disc-key read must not fail it");
     }
 
     /// `crypt_key`'s `key_type == 2` arm (`PERM_VARIANT[1]`) has no

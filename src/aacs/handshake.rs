@@ -1635,7 +1635,7 @@ pub fn run_cert_handshake(
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::scsi::mock::{MockTransport, Reply};
 
@@ -1649,7 +1649,7 @@ mod tests {
 
     /// A host cert good enough to reach the SCSI steps (the crypto is exercised
     /// by the math tests; these tests are about the transport contract).
-    fn dummy_cert() -> crate::HostCert {
+    pub(crate) fn dummy_cert() -> crate::HostCert {
         crate::HostCert {
             private_key: [0x11u8; 20],
             certificate: vec![0u8; 92],
@@ -1747,6 +1747,29 @@ mod tests {
         let certs = vec![dummy_cert()];
         let err = run_cert_handshake(&mut t, &certs).expect_err("rejected");
         assert_eq!(err, crate::UnlockError::HandshakeRejected);
+    }
+
+    /// A drive that rejects the FIRST cert (a plain cert-level rejection, not a
+    /// wedge or a dead bus) must roll on to the second cert — and the roll-on
+    /// is gated by the per-cert backoff sleep (`idx > 0`), which fires only on
+    /// the second and later attempts. Pins both: the loop actually retries
+    /// with a second host cert (not just re-reporting the first failure), and
+    /// the backoff genuinely elapses real time (catches deleting the sleep or
+    /// gating it on the wrong condition).
+    #[test]
+    fn a_rejected_first_cert_backs_off_and_tries_the_second() {
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let certs = vec![dummy_cert(), dummy_cert()];
+        let started = std::time::Instant::now();
+        let err = run_cert_handshake(&mut t, &certs).expect_err("both certs rejected");
+        assert_eq!(err, crate::UnlockError::HandshakeRejected);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "must have slept the per-cert backoff before the second attempt"
+        );
+        // Each attempt issues 4 invalidations + 1 AGID alloc (which is where
+        // the rejection fires) = 5 CDBs; two attempts = 10.
+        assert_eq!(t.calls(), 10, "must have actually issued a second attempt");
     }
 
     /// Script a full, successful AACS 1.0 mutual auth against the mock.
@@ -1895,7 +1918,7 @@ mod tests {
     /// answer the Volume ID read with a MAC that actually verifies — the only
     /// way to drive `run_cert_handshake` past the VID gate and into the
     /// read-data-keys arm with the crate's static mocks unable to.
-    struct DriveEmu {
+    pub(crate) struct DriveEmu {
         drive_priv: [u8; 20],
         drive_x: [u8; 20],
         drive_y: [u8; 20],
@@ -1904,11 +1927,11 @@ mod tests {
         /// When set, format-0x84 (read-data-keys) is served a genuine non-zero
         /// response instead of the default dead-bus behaviour, letting
         /// `run_cert_handshake` run all the way to its `Ok` return.
-        serve_data_keys: bool,
+        pub(crate) serve_data_keys: bool,
     }
 
     impl DriveEmu {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let (drive_priv, drive_x, drive_y) = generate_host_key_pair();
             DriveEmu {
                 drive_priv,

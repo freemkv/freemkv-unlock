@@ -136,6 +136,31 @@ mod tests {
         }
     }
 
+    /// `Display` is what shows up in logs — every variant must render without
+    /// panicking and the SCSI variant must carry the opcode/status through.
+    #[test]
+    fn display_renders_every_variant() {
+        assert_eq!(Error::ProfileParse.to_string(), "drive profile parse error");
+        assert_eq!(Error::UnlockFailed.to_string(), "firmware unlock failed");
+        assert_eq!(
+            Error::SignatureMismatch {
+                expected: [0; 4],
+                got: [1; 4],
+            }
+            .to_string(),
+            "signature mismatch"
+        );
+        assert_eq!(
+            Error::Scsi {
+                opcode: 0x3C,
+                status: 0x02,
+                sense: None,
+            }
+            .to_string(),
+            "SCSI error (opcode 0x3c, status 0x02)"
+        );
+    }
+
     /// `From<ScsiError>` must carry the status AND sense across the seam —
     /// collapsing either one destroys the transport-vs-rejection distinction the
     /// whole abort/fall-through split rests on.
