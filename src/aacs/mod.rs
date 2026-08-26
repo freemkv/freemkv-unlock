@@ -79,6 +79,38 @@ impl Unlocker for AacsCert {
 mod tests {
     use super::*;
 
+    /// AES-128-ECB decrypt against the FIPS-197 Appendix B / NIST known-answer
+    /// test vector: decrypting the published ciphertext with the published key
+    /// must recover the published plaintext.
+    #[test]
+    fn aes_ecb_decrypt_matches_fips197_test_vector() {
+        let key: [u8; 16] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0x0F,
+        ];
+        let ciphertext: [u8; 16] = [
+            0x69, 0xC4, 0xE0, 0xD8, 0x6A, 0x7B, 0x04, 0x30, 0xD8, 0xCD, 0xB7, 0x80, 0x70, 0xB4,
+            0xC5, 0x5A,
+        ];
+        let expected_plaintext: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let out = aes_ecb_decrypt(&key, &ciphertext);
+        assert_eq!(out, expected_plaintext);
+    }
+
+    /// Decrypting a different ciphertext under the same key must not produce
+    /// the same plaintext — pins that the function actually decrypts the
+    /// given block rather than returning a constant.
+    #[test]
+    fn aes_ecb_decrypt_varies_with_input() {
+        let key = [0u8; 16];
+        let a = aes_ecb_decrypt(&key, &[0u8; 16]);
+        let b = aes_ecb_decrypt(&key, &[1u8; 16]);
+        assert_ne!(a, b);
+    }
+
     fn id() -> crate::DriveId {
         crate::DriveId::default()
     }

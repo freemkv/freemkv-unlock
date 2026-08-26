@@ -1225,4 +1225,69 @@ mod tests {
         let e = establish_authenticated_session(&mut t).expect_err("short alloc");
         assert!(matches!(e, Error::CssAuthFailed));
     }
+
+    // ── authenticate_with_agid step failures ────────────────────────────────
+
+    /// The drive refuses the host-challenge SEND KEY (step 1) — the very first
+    /// command `authenticate_with_agid` issues.
+    #[test]
+    fn host_challenge_send_failure_fails_the_auth() {
+        let mut t =
+            MockTransport::scripted(vec![Reply::illegal_request()], Reply::illegal_request());
+        let e = authenticate_with_agid(&mut t, 0).expect_err("refused host challenge");
+        assert!(matches!(e, Error::CssAuthFailed));
+        assert_eq!(t.calls(), 1, "must not proceed past the first refused step");
+    }
+
+    /// The host challenge SEND KEY succeeds but the Key1 REPORT KEY (step 2) is
+    /// refused.
+    #[test]
+    fn key1_report_failure_fails_the_auth() {
+        let mut t = MockTransport::scripted(
+            vec![Reply::good(vec![]), Reply::illegal_request()],
+            Reply::illegal_request(),
+        );
+        let e = authenticate_with_agid(&mut t, 0).expect_err("refused Key1 report");
+        assert!(matches!(e, Error::CssAuthFailed));
+        assert_eq!(t.calls(), 2);
+    }
+
+    /// Both SCSI steps succeed but the drive's Key1 does not match any of the
+    /// 32 CryptKey variants for the (randomly generated) host challenge — the
+    /// brute-force loop exhausts and `variant.ok_or(CssAuthFailed)` fires.
+    #[test]
+    fn key1_matching_no_variant_fails_the_auth() {
+        let mut t = MockTransport::scripted(
+            vec![Reply::good(vec![]), Reply::good(vec![0xABu8; 12])],
+            Reply::illegal_request(),
+        );
+        let e = authenticate_with_agid(&mut t, 0).expect_err("no variant matches");
+        assert!(matches!(e, Error::CssAuthFailed));
+        assert_eq!(
+            t.calls(),
+            2,
+            "the brute-force loop issues no further SCSI commands"
+        );
+    }
+
+    // ── read_disc_key ────────────────────────────────────────────────────────
+
+    /// The best-effort disc-key REPORT KEY is refused — `read_disc_key` must
+    /// surface the failure to its caller (who treats it as non-fatal), not
+    /// silently return `Ok`.
+    #[test]
+    fn read_disc_key_refused_is_an_error() {
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let e = read_disc_key(&mut t, 0).expect_err("drive refused disc-key read");
+        assert!(matches!(e, Error::CssAuthFailed));
+    }
+
+    /// A transport fault reading the disc key must classify as a transport
+    /// failure, not a generic auth failure.
+    #[test]
+    fn read_disc_key_transport_fault_is_transport_failure() {
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let e = read_disc_key(&mut t, 0).expect_err("dead bus");
+        assert!(e.is_transport_failure());
+    }
 }
