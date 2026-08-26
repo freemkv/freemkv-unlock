@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.6.11] — 2026-08-26
+
+### Changed
+
+- Version aligned to 1.6.11 for the unified release. No functional changes to
+  this crate; the release was driven by the libfreemkv main-feature selection
+  improvements and the autorip mux-quarantine fix (see the libfreemkv and
+  autorip 1.6.11 notes).
+
+### Added
+
+- Codecov coverage reporting and badge.
+- Substantially expanded unit-test coverage.
+
 ## [1.6.10] — 2026-08-23
 
 ### Changed
