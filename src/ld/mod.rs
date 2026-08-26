@@ -397,6 +397,15 @@ mod tests {
         assert_eq!(got, None);
     }
 
+    /// Public catalog accessors: `profiles()` returns the bundled catalog and
+    /// `profile()` is `profiles().and_then(get)` for a known drive.
+    #[test]
+    fn public_catalog_accessors_find_the_bundled_fixture_drive() {
+        assert!(super::profiles().is_some(), "bundled catalog must parse");
+        let m = super::profile(&known_vid_drive_id()).expect("known fixture drive matches");
+        assert!(m.profile.read_vid_cdb.is_some());
+    }
+
     /// `unlock_features` on a drive with no matching profile → `NotApplicable`
     /// (fall through), short-circuiting before any firmware handshake.
     #[test]
@@ -523,6 +532,83 @@ mod tests {
             .unlock_features(&mut t, &ctx(&id))
             .expect_err("a dead bus during probe must abort, not report success");
         assert_eq!(err, UnlockError::Transport);
+    }
+
+    /// A drive-sense (not a dead bus) rejecting the speed probe is a genuine
+    /// calibration miss, not a transport fault — `firmware_unlock` must
+    /// warn-and-continue on the drive's default speed table, still reporting a
+    /// full unlock. The non-transport sibling of
+    /// `transport_fault_during_probe_disc_is_transport_not_a_successful_unlock`.
+    #[test]
+    fn drive_sense_during_probe_disc_still_reports_a_successful_unlock() {
+        let id = known_vid_drive_id();
+        let sig = profile::find_bundled(&id)
+            .expect("profile")
+            .profile
+            .signature;
+
+        let mut resp = vec![0u8; 64];
+        resp[0..4].copy_from_slice(&sig);
+        resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]); // primary marker
+        resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]); // secondary marker
+
+        struct ProbeSenseDrive {
+            resp: Vec<u8>,
+        }
+        impl ScsiTransport for ProbeSenseDrive {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                // READ_BUFFER (0x3C) / SUB_CMD_PROBE (0x14) is the speed probe.
+                if cdb.first() == Some(&0x3C) && cdb.get(3) == Some(&0x14) {
+                    return Ok(ScsiResult {
+                        status: 0x02,
+                        bytes_transferred: 0,
+                        sense: [0u8; 32],
+                    });
+                }
+                let n = self.resp.len().min(data.len());
+                data[..n].copy_from_slice(&self.resp[..n]);
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = ProbeSenseDrive { resp };
+        let u = LibreDrive::new()
+            .unlock_features(&mut t, &ctx(&id))
+            .expect("a calibration miss must not fail the whole unlock");
+        assert!(u.drive_unlocked);
+    }
+
+    /// `unlock_bus` is the same firmware code as `unlock_features` (bus removal
+    /// comes free with the drive unlock) — pins that the trait method actually
+    /// delegates rather than being an accidental no-op stub.
+    #[test]
+    fn unlock_bus_delegates_to_the_same_firmware_unlock() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let id = known_vid_drive_id();
+        let sig = profile::find_bundled(&id)
+            .expect("profile")
+            .profile
+            .signature;
+
+        let mut resp = vec![0u8; 64];
+        resp[0..4].copy_from_slice(&sig);
+        resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
+        resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
+
+        let mut t = MockTransport::always(Reply::good(resp));
+        let u = LibreDrive::new()
+            .unlock_bus(&mut t, &ctx(&id))
+            .expect("unlock_bus runs the same firmware handshake");
+        assert!(u.drive_unlocked);
     }
 
     /// Catches classifying a dead bus as "not this unlocker's drive": the very

@@ -823,6 +823,49 @@ mod tests {
         }
     }
 
+    /// A drive SENSE (not a dead bus) during the coarse speed probe is the
+    /// drive's OWN failure, not a transport fault — `run_probe` must report
+    /// `UnlockFailed`, not `Transport`. The sibling of
+    /// `transport_fault_during_pass1_probe_stays_a_transport_failure`, which
+    /// only exercises the `is_transport_failure()` arm.
+    #[test]
+    fn drive_sense_during_pass1_probe_is_unlock_failed_not_transport() {
+        struct SenseAtFirstProbe;
+        impl ScsiTransport for SenseAtFirstProbe {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                if cdb.first() == Some(&SCSI_READ_BUFFER) && cdb.get(3) == Some(&SUB_CMD_PROBE) {
+                    return Ok(ScsiResult {
+                        status: 0x02,
+                        bytes_transferred: 0,
+                        sense: [0u8; 32],
+                    });
+                }
+                for b in data.iter_mut() {
+                    *b = 0;
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = SenseAtFirstProbe;
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        mt.init_complete = true;
+        let e = mt
+            .run_probe(&mut t)
+            .expect_err("drive-refused pass-1 probe");
+        assert!(!e.is_transport_failure(), "a sense is not a dead bus");
+        assert!(matches!(e, Error::UnlockFailed));
+    }
+
     /// THE probe pass-1 dead-bus test. A bus that dies during the coarse speed
     /// probe must keep its transport classification out of `run_probe` so the
     /// caller (`firmware_unlock`) aborts with `Transport` rather than reporting a
@@ -915,6 +958,48 @@ mod tests {
             e.is_transport_failure(),
             "verify-read dead bus must surface"
         );
+    }
+
+    /// A firmware blob larger than WRITE_BUFFER's 24-bit CDB length field
+    /// cannot be uploaded — encoding it would silently disagree with the
+    /// bytes actually sent. Must reject before issuing any CDB.
+    #[test]
+    fn variant_a_refuses_firmware_over_the_24bit_write_buffer_length() {
+        let mut profile = fixture_profile([0; 4]);
+        profile.firmware = vec![0u8; 0x0100_0000]; // one past WRITE_BUFFER_MAX_LEN
+        let mut mt = Mt1959::new(profile, false);
+        let mut t = RecordingTransport { cdbs: Vec::new() };
+        let e = variant_a::load_firmware(&mut mt, &mut t).expect_err("blob too large to encode");
+        assert!(matches!(e, Error::UnlockFailed));
+        assert!(t.cdbs.is_empty(), "no CDB may reach the drive");
+    }
+
+    /// THE full success path: WRITE_BUFFER upload, a fully-good verify read
+    /// (exercising the `Ok(r) if status==0 && bytes_transferred==len` arm no
+    /// other variant_a test reaches), then BOTH `do_unlock` calls succeed —
+    /// the first fatally-gated, the second best-effort. Every other
+    /// variant_a test above deliberately stops short (empty firmware, a
+    /// dead bus, or `do_unlock` failing against `RecordingTransport`'s empty
+    /// response) — this is the only one that reaches `load_firmware`'s final
+    /// `Ok(())`.
+    #[test]
+    fn variant_a_load_firmware_succeeds_end_to_end() {
+        let sig = [0x11, 0x22, 0x33, 0x44];
+        let mut profile = fixture_profile(sig);
+        profile.firmware = vec![0u8; 64];
+        let mut mt = Mt1959::new(profile, false);
+        let unlock_response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+        let mut t = crate::scsi::mock::MockTransport::scripted(
+            vec![
+                crate::scsi::mock::Reply::good(vec![]), // WRITE_BUFFER upload
+                crate::scsi::mock::Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]), // verify read, full
+                crate::scsi::mock::Reply::good(unlock_response.clone()), // do_unlock #1
+                crate::scsi::mock::Reply::good(unlock_response), // do_unlock #2 (best-effort)
+            ],
+            crate::scsi::mock::Reply::TransportFault,
+        );
+        variant_a::load_firmware(&mut mt, &mut t).expect("upload + verify + double unlock all ok");
+        assert!(mt.init_complete, "do_unlock #1 must have set init_complete");
     }
 
     /// variant_b had no transport-abort test. A firmware-upload STEP that hits a
@@ -1073,6 +1158,28 @@ mod tests {
         // Empty firmware -> variant_a::load_firmware fails immediately with
         // no CDB, so each attempt costs exactly one do_unlock call.
         let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+        let e = mt.init(&mut t).expect_err("never validates, never uploads");
+        assert!(matches!(e, Error::UnlockFailed));
+        assert!(!e.is_transport_failure());
+        assert_eq!(
+            t.calls(),
+            3,
+            "one do_unlock call per attempt, three attempts, no firmware CDBs"
+        );
+    }
+
+    /// Same shape as `run_init_exhausts_after_three_generic_failures`, but for
+    /// a MODE_B (`is_variant_b = true`) drive — pins that `run_init`'s mode
+    /// dispatch (`self.mode == MODE_A`) actually reaches `variant_b::load_firmware`
+    /// and not just its `variant_a` sibling, which every other `run_init` test
+    /// above exercises exclusively.
+    #[test]
+    fn run_init_exhausts_after_three_generic_failures_mode_b() {
+        let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(
+            vec![0u8; 64],
+            10,
+        ));
+        let mut mt = Mt1959::new(fixture_profile([0; 4]), true);
         let e = mt.init(&mut t).expect_err("never validates, never uploads");
         assert!(matches!(e, Error::UnlockFailed));
         assert!(!e.is_transport_failure());
