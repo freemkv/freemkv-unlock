@@ -4,9 +4,9 @@
 //! CSS bus-auth handshake has set its Authentication Success Flag (ASF=1).
 //! [`unlock_css_reads`] runs that bus-auth challenge-response (which is what
 //! actually opens scrambled-sector reads), then a best-effort, non-fatal
-//! disc-key REPORT KEY. The bytes are NOT used as keys: the descramble title
-//! key is recovered keylessly by the Stevenson known-plaintext attack (see
-//! libfreemkv's `crack_key`).
+//! disc-key REPORT KEY. The bytes are NOT used as keys: descrambling here is
+//! keyless — the descramble title key is recovered directly from the stream,
+//! so no device or player key is derived or needed.
 
 mod error;
 use crate::css::error::{Error, Result, step_err};
@@ -166,9 +166,10 @@ const PERM_VARIANT: [[u8; 32]; 2] = [
 /// Runs the bus-auth challenge-response (which sets the drive's ASF=1 and is
 /// what actually unlocks scrambled-sector reads), then a best-effort,
 /// non-fatal disc-key REPORT KEY. The title-key REPORT KEY is NOT issued: it
-/// is unnecessary (the descramble key is recovered keylessly by the Stevenson
-/// attack in libfreemkv's `crack_key`) and its hard failure on some USB bridges
-/// used to abort the whole unlock (the 7014 bug). The bytes are discarded.
+/// is unnecessary (descrambling is keyless — the key is recovered directly
+/// from the data, so no device key is derived) and its hard failure on some
+/// USB bridges used to abort the whole unlock (the 7014 bug). The bytes are
+/// discarded.
 pub fn unlock_css_reads(scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
     let t0 = std::time::Instant::now();
     tracing::info!(target: "freemkv::css", phase = "unlock_css_reads", lba, "begin");
@@ -187,8 +188,8 @@ pub fn unlock_css_reads(scsi: &mut dyn ScsiTransport, lba: u32) -> Result<()> {
 /// The DVD unlocker (registry name `"DVD"`) — the DVD peer of the firmware and
 /// AACS-cert unlockers in the uniform [`crate::Unlocker`] registry. It removes
 /// the DVD scrambled-read barrier (drive ASF=1) via bus-auth and learns no VID
-/// or bus key — the descramble key is recovered keylessly downstream (the
-/// Stevenson attack). Named for the medium it unlocks (DVD), not the CSS
+/// or bus key — descrambling is keyless: the key is recovered directly from
+/// the data downstream. Named for the medium it unlocks (DVD), not the CSS
 /// scheme: the bus-auth is required to read a CSS-protected DVD at all, whether
 /// or not any given sector turns out to be scrambled. Lives in the `css` module
 /// beside the CSS-scheme primitives it drives.
@@ -332,8 +333,8 @@ fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()>
 /// Success Flag (ASF=1) — which is the ENTIRE purpose: it unlocks
 /// scrambled-sector reads. Returns the negotiated AGID (the caller needs it for
 /// the best-effort disc-key REPORT KEY). The CSS bus key is intentionally NOT
-/// derived: descrambling is keyless (the Stevenson known-plaintext attack), so
-/// the bus key has no consumer.
+/// derived: descrambling is keyless — the key is recovered directly from the
+/// data — so the bus key has no consumer.
 fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     // Invalidate all AGIDs via REPORT KEY format 0x3F. This is also what makes
     // an abandoned AGID self-heal — which is not a reason to abandon one.
@@ -454,7 +455,8 @@ fn authenticate_with_agid(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> 
     // The authenticated session (ASF=1) is now established — scrambled-sector
     // reads are unlocked, which is the only thing we needed. The CSS bus key
     // would be CryptKey(2, variant, key1 || key2), but it has no consumer
-    // (descrambling is keyless via the Stevenson attack), so it is not derived.
+    // (descrambling is keyless — the key is recovered directly from the
+    // data), so it is not derived.
     Ok(())
 }
 

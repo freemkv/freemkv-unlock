@@ -1,7 +1,7 @@
 //! Public unlock-CDB seam.
 //!
 //! These items expose the *minimum* an external consumer (e.g. the bdemu
-//! drive emulator) needs to recognise and answer the LibreDrive unlock
+//! drive emulator) needs to recognise and answer the Mt1959Unlocker unlock
 //! READ_BUFFER handshake, without that consumer open-coding the
 //! handshake internals. The concrete CDB shapes and the verification
 //! marker are unlock-handshake details and must live ONLY in this crate.
@@ -15,7 +15,7 @@ pub const UNLOCK_MARKER: &[u8] = b"MMkv";
 
 /// Returns `true` when a READ_BUFFER (`0x3C`) CDB with the given mode
 /// (`cdb[1] & 0x1F`) and buffer id (`cdb[2]`) is an unlock-handshake
-/// read — i.e. one of the LibreDrive unlock variants.
+/// read — i.e. one of the Mt1959Unlocker unlock variants.
 ///
 /// This is the single source of truth for the unlock READ_BUFFER CDB
 /// shapes; consumers must call it rather than hardcoding the mode /

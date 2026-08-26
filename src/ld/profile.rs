@@ -3,7 +3,7 @@
 use crate::ld::error::{Error, Result};
 use serde::Deserialize;
 
-/// The LibreDrive profile catalog — the set of optical drives the firmware
+/// The Mt1959Unlocker profile catalog — the set of optical drives the firmware
 /// unlocker recognizes, keyed by chipset + variant. Loaded from the bundled
 /// JSON; the public entry point is [`crate::ld::profiles`].
 #[derive(Debug, Deserialize)]
@@ -308,7 +308,7 @@ pub fn bundled() -> Option<&'static Profiles> {
             Ok(p) => Some(p),
             // The `None` is cached PERMANENTLY (correctly — the blob is fixed at
             // compile time), which means a bad shipped profiles.json makes
-            // LibreDrive report "drive not supported" for every drive for the
+            // Mt1959Unlocker report "drive not supported" for every drive for the
             // life of the process. Unlogged, that is indistinguishable from a
             // genuinely uncataloged drive; log it once, loudly, at the one place
             // the parse happens.
@@ -317,7 +317,7 @@ pub fn bundled() -> Option<&'static Profiles> {
                     target: "freemkv::disc",
                     phase = "bundled_profiles_parse_failed",
                     error_code = e.code(),
-                    "bundled LibreDrive profile catalog failed to parse; no drive can match"
+                    "bundled Mt1959Unlocker profile catalog failed to parse; no drive can match"
                 );
                 None
             }

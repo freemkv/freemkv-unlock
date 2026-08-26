@@ -1,4 +1,4 @@
-//! ld — the LibreDrive firmware unlocker (MediaTek MT1959).
+//! ld — the MediaTek MT1959 firmware unlocker.
 //!
 //! Self-contained module: it owns the bundled drive profiles, firmware blobs,
 //! the WRITE_BUFFER / MODE SELECT upload, the unlock CDBs, and the variant-A /
@@ -25,7 +25,7 @@ use crate::{DriveId, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
 // ── Public profile catalog ──────────────────────────────────────────────────
 //
-// The catalog of drives the LibreDrive unlocker recognizes is the one piece of
+// The catalog of drives the MT1959 unlocker recognizes is the one piece of
 // ld worth exposing publicly: it answers "is this drive supported?" without
 // unlocking, and the bdemu test-emulator reads it to impersonate a supported
 // drive. The unlock *mechanism* (firmware blobs, upload sequence, CDB wire
@@ -33,7 +33,7 @@ use crate::{DriveId, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
 pub use profile::{DriveProfile as Profile, Identity, Platform, ProfileMatch, Profiles};
 
-/// The bundled LibreDrive profile catalog (parsed once, process-cached), or
+/// The bundled MT1959 profile catalog (parsed once, process-cached), or
 /// `None` if the embedded JSON fails to parse (a build-time bug). Pair with
 /// [`Profiles::get`] to look up a specific drive:
 /// `freemkv_unlock::ld::profiles().and_then(|p| p.get(&drive_id))`.
@@ -54,17 +54,17 @@ pub fn profile(drive_id: &DriveId) -> Option<ProfileMatch> {
 #[cfg(feature = "emulation")]
 pub use cdb::{UNLOCK_MARKER, is_unlock_read_buffer};
 
-/// The LibreDrive unlocker. `pub(crate)` — clients reach it only through
+/// The MT1959 unlocker. `pub(crate)` — clients reach it only through
 /// [`crate::all_unlockers`], never by name (the locked-design contract).
 ///
 /// Matches a drive against the bundled profile database and, on a hit,
 /// runs the MediaTek MT1959 firmware-unlock (and disc-speed calibration)
 /// handshake over the raw SCSI transport.
-pub(crate) struct LibreDrive;
+pub(crate) struct Mt1959Unlocker;
 
-impl LibreDrive {
+impl Mt1959Unlocker {
     pub(crate) fn new() -> Self {
-        LibreDrive
+        Mt1959Unlocker
     }
 }
 
@@ -72,10 +72,10 @@ impl LibreDrive {
 /// drive-info "is this drive supported?" display), or `None`. A pure profile
 /// lookup — does NOT touch the drive or unlock anything.
 pub(crate) fn firmware_name(id: &DriveId) -> Option<&'static str> {
-    profile::find_bundled(id).map(|_| "LibreDrive")
+    profile::find_bundled(id).map(|_| "MT1959")
 }
 
-impl LibreDrive {
+impl Mt1959Unlocker {
     /// Read the OEM Volume ID via the matched profile's vendor CDB.
     ///
     /// Takes the profile the caller ALREADY matched rather than re-running
@@ -138,8 +138,8 @@ impl LibreDrive {
     }
 }
 
-impl LibreDrive {
-    /// The MediaTek firmware unlock. Because LibreDrive removes AACS bus
+impl Mt1959Unlocker {
+    /// The MediaTek firmware unlock. Because the MT1959 unlocker removes AACS bus
     /// encryption AT THE DRIVE (the unlocked drive serves CLEAR content), this ONE
     /// operation satisfies BOTH the drive-features and the bus-removal capability
     /// — so `unlock_features` and `unlock_bus` both delegate here. The result
@@ -220,12 +220,12 @@ impl LibreDrive {
     }
 }
 
-impl Unlocker for LibreDrive {
+impl Unlocker for Mt1959Unlocker {
     fn name(&self) -> &'static str {
-        "LibreDrive"
+        "MT1959"
     }
 
-    /// LibreDrive provides drive features (riplock/speed, OEM VID) — and, because
+    /// Mt1959Unlocker provides drive features (riplock/speed, OEM VID) — and, because
     /// its firmware unlock serves clear content, bus removal comes free with it.
     fn unlock_features(
         &self,
@@ -235,7 +235,7 @@ impl Unlocker for LibreDrive {
         self.firmware_unlock(scsi, ctx)
     }
 
-    /// Same firmware code as [`unlock_features`]: LibreDrive removes the bus at
+    /// Same firmware code as [`unlock_features`]: Mt1959Unlocker removes the bus at
     /// the drive. In practice the consumer skips this because drive-prep already
     /// set `drive_unlocked`; it's here for completeness / a bus-first call order.
     fn unlock_bus(
@@ -322,7 +322,7 @@ mod tests {
             payload,
             bytes_transferred: 36,
         };
-        let got = LibreDrive::new()
+        let got = Mt1959Unlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("parse ok");
         assert_eq!(got, Some(vid), "VID parsed from [4..20]");
@@ -335,7 +335,7 @@ mod tests {
             payload: vec![0u8; 36],
             bytes_transferred: 20,
         };
-        let got = LibreDrive::new()
+        let got = Mt1959Unlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("short response is Ok(None)");
         assert_eq!(got, None);
@@ -350,7 +350,7 @@ mod tests {
             payload,
             bytes_transferred: 36,
         };
-        let got = LibreDrive::new()
+        let got = Mt1959Unlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("bad header is Ok(None)");
         assert_eq!(got, None);
@@ -363,7 +363,7 @@ mod tests {
     fn read_oem_vid_check_condition_is_none_not_a_vid() {
         use crate::scsi::mock::{MockTransport, Reply};
         let mut t = MockTransport::always(Reply::illegal_request());
-        let got = LibreDrive::new()
+        let got = Mt1959Unlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("a drive sense is not a transport fault");
         assert_eq!(got, None, "a CHECK CONDITION must never yield a VID");
@@ -375,7 +375,7 @@ mod tests {
     fn read_oem_vid_transport_fault_propagates() {
         use crate::scsi::mock::{MockTransport, Reply};
         let mut t = MockTransport::always(Reply::TransportFault);
-        let err = LibreDrive::new()
+        let err = Mt1959Unlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect_err("a dead bus must not be Ok(None)");
         assert!(err.is_transport_failure());
@@ -391,7 +391,7 @@ mod tests {
             payload: vec![0u8; 36],
             bytes_transferred: 36,
         };
-        let got = LibreDrive::new()
+        let got = Mt1959Unlocker::new()
             .read_oem_vid(&mut t, &p)
             .expect("no CDB is Ok(None)");
         assert_eq!(got, None);
@@ -414,7 +414,7 @@ mod tests {
             payload: vec![0u8; 36],
             bytes_transferred: 36,
         };
-        let err = LibreDrive::new()
+        let err = Mt1959Unlocker::new()
             .unlock_features(
                 &mut t,
                 &ctx(&make_drive_id("FAKE-VND", "9.99", "XX12345", "")),
@@ -445,7 +445,7 @@ mod tests {
         resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
 
         let mut t = MockTransport::always(Reply::good(resp));
-        let err = LibreDrive::new()
+        let err = Mt1959Unlocker::new()
             .unlock_features(&mut t, &ctx(&id))
             .expect_err("a half-unlocked drive must fall through to cert-auth");
         assert_eq!(err, UnlockError::NotApplicable);
@@ -469,7 +469,7 @@ mod tests {
         resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
 
         let mut t = MockTransport::always(Reply::good(resp));
-        let u = LibreDrive::new()
+        let u = Mt1959Unlocker::new()
             .unlock_features(&mut t, &ctx(&id))
             .expect("both markers → unlocked");
         assert!(u.drive_unlocked);
@@ -528,7 +528,7 @@ mod tests {
         resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]); // secondary marker
         let mut t = ProbeFaultsDrive { resp };
 
-        let err = LibreDrive::new()
+        let err = Mt1959Unlocker::new()
             .unlock_features(&mut t, &ctx(&id))
             .expect_err("a dead bus during probe must abort, not report success");
         assert_eq!(err, UnlockError::Transport);
@@ -581,7 +581,7 @@ mod tests {
             }
         }
         let mut t = ProbeSenseDrive { resp };
-        let u = LibreDrive::new()
+        let u = Mt1959Unlocker::new()
             .unlock_features(&mut t, &ctx(&id))
             .expect("a calibration miss must not fail the whole unlock");
         assert!(u.drive_unlocked);
@@ -605,7 +605,7 @@ mod tests {
         resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
 
         let mut t = MockTransport::always(Reply::good(resp));
-        let u = LibreDrive::new()
+        let u = Mt1959Unlocker::new()
             .unlock_bus(&mut t, &ctx(&id))
             .expect("unlock_bus runs the same firmware handshake");
         assert!(u.drive_unlocked);
@@ -618,7 +618,7 @@ mod tests {
     fn transport_fault_during_unlock_is_transport_not_not_applicable() {
         use crate::scsi::mock::{MockTransport, Reply};
         let mut t = MockTransport::always(Reply::TransportFault);
-        let err = LibreDrive::new()
+        let err = Mt1959Unlocker::new()
             .unlock_features(&mut t, &ctx(&known_vid_drive_id()))
             .expect_err("dead bus");
         assert_eq!(err, UnlockError::Transport);

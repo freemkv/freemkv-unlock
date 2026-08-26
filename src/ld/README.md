@@ -1,6 +1,6 @@
-# ld — the LibreDrive unlocker
+# ld — the drive bus-unlock module
 
-The **LibreDrive** unlocker module for freemkv-unlock.
+A drive bus-unlock module for freemkv-unlock.
 
 freemkv-unlock defines the generic `Unlocker` contract; this module is one
 implementation of it. It recognizes a bundled catalog of supported drives
@@ -19,9 +19,3 @@ This module performs only the **non-persistent** unlock — the access state it
 sets up lives in drive RAM and is gone on power cycle. The one-time, permanent
 drive preparation is the drive owner's own manual step and is **never**
 automated here.
-
-## Credits
-
-LibreDrive was created by **Mike Chen** and the **MakeMKV team**. This module
-builds on their work — our thanks and full credit to them for the LibreDrive
-capabilities.
