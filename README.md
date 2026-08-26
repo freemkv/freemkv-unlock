@@ -1,5 +1,7 @@
 # freemkv-unlock
 
+[![codecov](https://codecov.io/gh/freemkv/freemkv-unlock/branch/dev/graph/badge.svg)](https://codecov.io/gh/freemkv/freemkv-unlock)
+
 The unlock layer for the freemkv toolchain.
 
 An **unlocker removes a drive-level bus-encryption barrier** so the drive serves
