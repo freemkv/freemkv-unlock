@@ -74,6 +74,30 @@ jobs:
       # feature nothing compiles is a feature that breaks at release time.
       - run: cargo test --tests --features emulation
 
+  # Coverage is additive and NON-REQUIRED: it uploads to Codecov but never
+  # gates a merge (fail_ci_if_error is false, and it is not wired into any
+  # release gate). It mirrors the `test` job's environment — same pinned
+  # toolchain, ubuntu-latest, no `if:` so it runs on every branch and PR just
+  # as `test` does. `--locked` is intentionally omitted to match this crate's
+  # policy (Cargo.lock is gitignored; --locked would fail without it).
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-unlock-coverage
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          slug: freemkv/freemkv-unlock
+          fail_ci_if_error: false
+
   # The crate ships on macOS and Windows through its consumers, so it has to
   # compile there. Build the tests (not just `cargo check`) — that forces
   # codegen and catches errors in test-only code, which `check` skips.
