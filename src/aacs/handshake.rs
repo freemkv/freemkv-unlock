@@ -654,10 +654,11 @@ fn ecdsa_verify_p256(pub_x: &[u8], pub_y: &[u8], sig_r: &[u8], sig_s: &[u8], dat
 /// 2.0 content cert under the published CC key); second, the 132-byte
 /// 4-byte-header framing MATCHES the step-6 drive-key message (x[4..36] /
 /// y[36..68] / r[68..100] / s[100..132]), the natural 20→32-byte scaling of
-/// libaacs's proven AACS 1.0 84-byte key message.
-/// What is NOT confirmed: that a *certificate* shares that framing. libaacs
-/// deliberately does not verify 2.0 certs (it calls the config format
-/// "truncated"), and the AACS 2.0 draft architecture lists the 2.0 host cert
+/// the established AACS 1.0 84-byte key-message framing.
+/// What is NOT confirmed: that a *certificate* shares that framing. No known
+/// implementation verifies 2.0 certs against a confirmed layout (the published
+/// spec draft leaves that format ambiguous), and the AACS 2.0 draft architecture
+/// lists the 2.0 host cert
 /// (type 0x12) with a 6-byte Host ID + a NEW 4-byte paired-Device-Key-Set field
 /// before the 64-byte public key — implying a ~140–144-byte cert with the
 /// pubkey near offset 12–16 and a signed range of ~76–80 bytes, NOT 68. The
@@ -3158,7 +3159,8 @@ pub(crate) mod tests {
     /// a genuine 2.0 host/drive cert (and its correct signed range) lands, only
     /// the offsets — not the crypto — remain to be fixed.
     ///
-    /// The CC pubkey is libaacs's published `aacs2_cc_pubkey_x/y` (crypto.c).
+    /// The CC pubkey is the published AACS 2.0 Content Certificate public key
+    /// (P-256).
     ///
     /// MUTATION: corrupting any `P256_*` constant, or removing SHA-256, makes
     /// this real-vector verification go red.
@@ -3170,7 +3172,7 @@ pub(crate) mod tests {
                 .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
                 .collect()
         }
-        // AACS 2.0 Content Cert pubkey (P-256), from libaacs crypto.c.
+        // The published AACS 2.0 Content Certificate public key (P-256).
         let cc_x: [u8; 32] = hx("E70D49D26F45EAA736939D72882ED8FBA1607026963949970496C910EA5C9DC2")
             .try_into()
             .unwrap();

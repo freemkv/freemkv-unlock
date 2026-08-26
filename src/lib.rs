@@ -17,7 +17,7 @@ mod css;
 // `ld` is public ONLY for its drive-profile catalog (`ld::profiles` / the
 // `Profiles` object) and, under the `emulation` feature, the unlock-handshake
 // wire format the bdemu test-emulator needs. The unlocker impl itself
-// (`LibreDrive`) is `pub(crate)` — clients still reach unlockers only through
+// (`Mt1959Unlocker`) is `pub(crate)` — clients still reach unlockers only through
 // [`all_unlockers`]. `aacs` and `css` carry no such public catalog, so they
 // stay fully private.
 pub mod ld;
@@ -132,7 +132,7 @@ pub enum UnlockError {
 /// NOTE: drive tuning (e.g. SET CD SPEED to lift riplock) is deliberately NOT
 /// here — that is the consumer's concern, not bus removal.
 pub trait Unlocker: Send + Sync {
-    /// Short, stable identifier for this unlocker (e.g. "LibreDrive", "AACS",
+    /// Short, stable identifier for this unlocker (e.g. "MT1959", "AACS",
     /// "DVD", "Renesas"). The ONE place a name lives — apps render the unlocker
     /// report from [`all_unlockers`], never hardcoding names, so adding/removing
     /// an unlocker updates every report with no app change.
@@ -140,7 +140,7 @@ pub trait Unlocker: Send + Sync {
 
     /// Unlock DRIVE FEATURES — riplock/speed, OEM Volume ID, OEM extended-access
     /// reads. The consumer runs this at drive-prep, trying each unlocker until
-    /// one handles the drive. `Ok(_)` = this unlocker handled it (LibreDrive also
+    /// one handles the drive. `Ok(_)` = this unlocker handled it (Mt1959Unlocker also
     /// removes bus encryption at the drive, so its result carries
     /// `drive_unlocked: true`); `Err(NotApplicable)` = not this unlocker's drive;
     /// `Err(Transport)` = dead bus (the consumer aborts). Default: not provided.
@@ -183,7 +183,7 @@ pub fn unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
 /// dir; the consumer never changes.
 pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
     vec![
-        Box::new(ld::LibreDrive::new()),
+        Box::new(ld::Mt1959Unlocker::new()),
         Box::new(renesis::Renesis::new()),
         Box::new(aacs::AacsCert::new()),
         Box::new(css::DvdUnlocker::new()),
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn all_unlockers_dispatch_order_is_firmware_then_cert_then_css() {
         let names: Vec<&'static str> = all_unlockers().iter().map(|u| u.name()).collect();
-        assert_eq!(names, vec!["LibreDrive", "Renesas", "AACS", "DVD"]);
+        assert_eq!(names, vec!["MT1959", "Renesas", "AACS", "DVD"]);
     }
 
     /// Every unlocker declines by default rather than claiming a capability it
@@ -226,7 +226,7 @@ mod tests {
         let ctx = UnlockCtx::new(&id, DiscKind::Unencrypted, &[]);
         let mut t = DeadTransport;
         for u in all_unlockers() {
-            // AACS/DVD provide no drive features; LibreDrive/Renesas are the
+            // AACS/DVD provide no drive features; Mt1959Unlocker/Renesas are the
             // feature unlockers but decline an unknown drive identity.
             let name = u.name();
             if name == "AACS" || name == "DVD" {
