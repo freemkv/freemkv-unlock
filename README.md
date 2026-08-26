@@ -1,6 +1,8 @@
-# freemkv-unlock
-
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![CI](https://github.com/freemkv/freemkv-unlock/actions/workflows/ci.yml/badge.svg)](https://github.com/freemkv/freemkv-unlock/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/freemkv/freemkv-unlock/branch/dev/graph/badge.svg)](https://codecov.io/gh/freemkv/freemkv-unlock)
+
+# freemkv-unlock
 
 The unlock layer for the freemkv toolchain.
 
