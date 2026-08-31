@@ -1,4 +1,4 @@
-//! renesis — Renesas-platform detection (Pioneer + HL-DT-ST Renesas drives).
+//! renesas — Renesas-platform detection (Pioneer + HL-DT-ST Renesas drives).
 //!
 //! Optical drives split into two controller families: MediaTek (handled by
 //! [`crate::ld`]) and Renesas. This module identifies the Renesas side via a
@@ -63,11 +63,11 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
 
 /// The Renesas-platform unlocker. `pub(crate)` — reached only through
 /// [`crate::all_unlockers`].
-pub(crate) struct Renesis;
+pub(crate) struct Renesas;
 
-impl Renesis {
+impl Renesas {
     pub(crate) fn new() -> Self {
-        Renesis
+        Renesas
     }
 
     /// The Pioneer/Renesas vendor "open" — MakeMKV's live sequence, replicated in
@@ -137,7 +137,7 @@ fn read_is_good(
     }
 }
 
-impl Unlocker for Renesis {
+impl Unlocker for Renesas {
     fn name(&self) -> &'static str {
         "Renesas"
     }
@@ -281,12 +281,12 @@ mod tests {
         let id = crate::DriveId::default();
         let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
         // Recognized → Ok, but a feature-only unlock: bus NOT removed, no VID.
-        let u = Renesis::new()
+        let u = Renesas::new()
             .unlock_features(&mut t, &ctx)
             .expect("renesas → Ok");
         assert!(
             !u.drive_unlocked,
-            "renesis does not remove the bus (cert does)"
+            "renesas does not remove the bus (cert does)"
         );
         assert_eq!(u.vid, None);
         assert_eq!(u.bus_key, None);
@@ -299,7 +299,7 @@ mod tests {
         let mut t = RejectingTransport;
         let id = crate::DriveId::default();
         let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
-        let err = Renesis::new().unlock_features(&mut t, &ctx).unwrap_err();
+        let err = Renesas::new().unlock_features(&mut t, &ctx).unwrap_err();
         assert_eq!(err, UnlockError::NotApplicable);
     }
 
@@ -327,7 +327,7 @@ mod tests {
         let id = crate::DriveId::default();
         let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
         assert_eq!(
-            Renesis::new().unlock_features(&mut t, &ctx).unwrap_err(),
+            Renesas::new().unlock_features(&mut t, &ctx).unwrap_err(),
             UnlockError::Transport
         );
     }
@@ -375,7 +375,7 @@ mod tests {
         let id = crate::DriveId::default();
         let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
         assert_eq!(
-            Renesis::new().unlock_features(&mut t, &ctx).unwrap_err(),
+            Renesas::new().unlock_features(&mut t, &ctx).unwrap_err(),
             UnlockError::NotApplicable
         );
     }
@@ -388,7 +388,7 @@ mod tests {
         };
         let id = crate::DriveId::default();
         let ctx = UnlockCtx::new(&id, DiscKind::Aacs, &[]);
-        let err = Renesis::new().unlock_bus(&mut t, &ctx).unwrap_err();
+        let err = Renesas::new().unlock_bus(&mut t, &ctx).unwrap_err();
         assert_eq!(err, UnlockError::NotApplicable);
     }
 }

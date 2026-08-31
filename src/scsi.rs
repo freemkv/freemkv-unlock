@@ -107,7 +107,7 @@ pub(crate) fn build_set_cd_speed(read_speed: u16) -> [u8; 12] {
 // whole class of transport-fault misclassification bugs sat uncaught (a dead bus
 // read as "this unlocker doesn't apply", a zero-filled buffer read as valid
 // drive data). This fixture can express all of them, and is the red-before-green
-// vehicle for the transport-contract fixes across ld / aacs / css / renesis.
+// vehicle for the transport-contract fixes across ld / aacs / css / renesas.
 #[cfg(test)]
 #[allow(dead_code)] // a fixture: each helper is used by a subset of the modules
 pub(crate) mod mock {
