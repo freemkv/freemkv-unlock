@@ -2,7 +2,7 @@
 name = "freemkv-unlock"
 version = "1.6.13"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.88"
 license = "MIT"
 description = "Unlock layer for the freemkv toolchain: the Unlocker contract + self-contained firmware/AACS/CSS unlocker modules. libfreemkv depends on this and dispatches via all_unlockers()."
 repository = "https://github.com/freemkv/freemkv-unlock"
@@ -26,3 +26,6 @@ sha1 = "0.10"
 sha2 = "0.11"
 aes = "0.9"
 rand = "0.10"
+
+[lints.clippy]
+uninlined_format_args = "allow"
