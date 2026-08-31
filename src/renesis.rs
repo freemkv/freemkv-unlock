@@ -94,8 +94,10 @@ impl Renesis {
     /// CONDITION). `Err(Transport)` = dead bus.
     fn vendor_open(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
         const RB_B0_04_CDB: [u8; 10] = [0x3C, 0x02, 0xB0, 0x00, 0x00, 0x04, 0x00, 0x00, 0xA4, 0x00];
-        const KNOCK_A5AAAA_CDB: [u8; 10] = [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00];
-        const RB_B0_500000_CDB: [u8; 10] = [0x3C, 0x02, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0xA4, 0x00];
+        const KNOCK_A5AAAA_CDB: [u8; 10] =
+            [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00];
+        const RB_B0_500000_CDB: [u8; 10] =
+            [0x3C, 0x02, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0xA4, 0x00];
 
         // A: primary open read.
         if read_is_good(scsi, &RB_B0_04_CDB)? {
@@ -105,7 +107,9 @@ impl Renesis {
         // fire-and-forget (payload-less); its own status is not the signal.
         match scsi.execute(&KNOCK_A5AAAA_CDB, DataDirection::None, &mut [], 5_000) {
             Ok(_) => {}
-            Err(e) if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() => {
+            Err(e)
+                if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() =>
+            {
                 return Err(UnlockError::Transport);
             }
             Err(_) => {} // a drive that refuses the knock still gets the B read tried
