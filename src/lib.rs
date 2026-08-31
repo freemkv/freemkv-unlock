@@ -25,6 +25,11 @@ pub mod ld;
 // bus as `Err(UnlockError::Transport)` rather than "not a Renesas drive"); the unlocker impl
 // (`Renesis`) is `pub(crate)` — reached only through [`all_unlockers`].
 pub mod renesis;
+// `freemkv` carries no public catalog (the firmware self-identifies rather
+// than matching a bundled profile) and no emulation wire format yet, so it
+// stays fully private — the unlocker impl (`FreemkvUnlocker`) is reached only
+// through [`all_unlockers`].
+mod freemkv;
 
 use scsi::ScsiTransport;
 
@@ -178,11 +183,18 @@ pub fn unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
     ld::firmware_name(drive_id)
 }
 
-/// Every unlocker, in dispatch order (firmware → cert → css). This is the ONLY
-/// place an unlocker is named. Remove one = delete its line here + its module
-/// dir; the consumer never changes.
+/// Every unlocker, in dispatch order (freemkv → firmware → cert → css). This
+/// is the ONLY place an unlocker is named. Remove one = delete its line here +
+/// its module dir; the consumer never changes.
+///
+/// `FreemkvUnlocker` runs FIRST: its detection is a single, unambiguous
+/// self-identification probe (the drive's own firmware answers `"freemkv"`)
+/// rather than a profile-catalog match, so it is the cheapest and most
+/// certain check to run before falling back to the MT1959 profile lookup or
+/// the Renesas/cert/css routes.
 pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
     vec![
+        Box::new(freemkv::FreemkvUnlocker::new()),
         Box::new(ld::Mt1959Unlocker::new()),
         Box::new(renesis::Renesis::new()),
         Box::new(aacs::AacsCert::new()),
@@ -202,7 +214,7 @@ mod tests {
     #[test]
     fn all_unlockers_dispatch_order_is_firmware_then_cert_then_css() {
         let names: Vec<&'static str> = all_unlockers().iter().map(|u| u.name()).collect();
-        assert_eq!(names, vec!["MT1959", "Renesas", "AACS", "DVD"]);
+        assert_eq!(names, vec!["freemkv", "MT1959", "Renesas", "AACS", "DVD"]);
     }
 
     /// Every unlocker declines by default rather than claiming a capability it
