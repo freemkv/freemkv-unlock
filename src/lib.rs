@@ -21,10 +21,10 @@ mod css;
 // [`all_unlockers`]. `aacs` and `css` carry no such public catalog, so they
 // stay fully private.
 pub mod ld;
-// `renesis` is public for its `is_renesas` drive-probe (which reports a dead
+// `renesas` is public for its `is_renesas` drive-probe (which reports a dead
 // bus as `Err(UnlockError::Transport)` rather than "not a Renesas drive"); the unlocker impl
-// (`Renesis`) is `pub(crate)` — reached only through [`all_unlockers`].
-pub mod renesis;
+// (`Renesas`) is `pub(crate)` — reached only through [`all_unlockers`].
+pub mod renesas;
 // `freemkv` carries no public catalog (the firmware self-identifies rather
 // than matching a bundled profile) and no emulation wire format yet, so it
 // stays fully private — the unlocker impl (`FreemkvUnlocker`) is reached only
@@ -196,7 +196,7 @@ pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
     vec![
         Box::new(freemkv::FreemkvUnlocker::new()),
         Box::new(ld::Mt1959Unlocker::new()),
-        Box::new(renesis::Renesis::new()),
+        Box::new(renesas::Renesas::new()),
         Box::new(aacs::AacsCert::new()),
         Box::new(css::DvdUnlocker::new()),
     ]
