@@ -69,6 +69,68 @@ impl Renesis {
     pub(crate) fn new() -> Self {
         Renesis
     }
+
+    /// The Pioneer/Renesas vendor "open" — MakeMKV's live sequence, replicated in
+    /// full: a primary read, and on its failure a payload-less "knock" + a second
+    /// read at a different window.
+    ///
+    ///   A. `READ_BUFFER 0x02/0xB0 @0x000004` (164 B) — the primary open.
+    ///   B. (only if A refuses) `WRITE_BUFFER 0x02/0x41 @0xA5AAAA` (0-byte knock)
+    ///      then `READ_BUFFER 0x02/0xB0 @0x500000` (164 B).
+    ///
+    /// Success is by SCSI *status* alone (the 164-byte payload CONTENT is not
+    /// validated — verified empirically: a real drive's table and an all-zero
+    /// buffer are accepted identically as long as status is GOOD). We run the
+    /// whole A→knock→B path rather than bailing after A, because the knock is a
+    /// per-firmware fallback: some firmware revisions only answer the `0x500000`
+    /// window *after* the knock (MakeMKV issues the knock exactly when A returns
+    /// CHECK CONDITION). If NEITHER A nor B returns GOOD, the drive did not open →
+    /// defer to the next unlocker.
+    ///
+    /// (There may be more than one knock offset across firmware families; only
+    /// the observed `0xA5AAAA` is issued here — add variants as they are proven.)
+    ///
+    /// `Ok(true)` = opened (A or B GOOD). `Ok(false)` = neither opened (CHECK
+    /// CONDITION). `Err(Transport)` = dead bus.
+    fn vendor_open(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
+        const RB_B0_04_CDB: [u8; 10] = [0x3C, 0x02, 0xB0, 0x00, 0x00, 0x04, 0x00, 0x00, 0xA4, 0x00];
+        const KNOCK_A5AAAA_CDB: [u8; 10] = [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00];
+        const RB_B0_500000_CDB: [u8; 10] = [0x3C, 0x02, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0xA4, 0x00];
+
+        // A: primary open read.
+        if read_is_good(scsi, &RB_B0_04_CDB)? {
+            return Ok(true);
+        }
+        // B: MakeMKV's fallback — knock, then the second-window read. The knock is
+        // fire-and-forget (payload-less); its own status is not the signal.
+        match scsi.execute(&KNOCK_A5AAAA_CDB, DataDirection::None, &mut [], 5_000) {
+            Ok(_) => {}
+            Err(e) if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() => {
+                return Err(UnlockError::Transport);
+            }
+            Err(_) => {} // a drive that refuses the knock still gets the B read tried
+        }
+        read_is_good(scsi, &RB_B0_500000_CDB)
+    }
+}
+
+/// Issue a 164-byte vendor READ_BUFFER; `Ok(true)` on GOOD status, `Ok(false)`
+/// on CHECK CONDITION (drive refused), `Err(Transport)` on a senseless
+/// transport failure (dead bus).
+fn read_is_good(
+    scsi: &mut dyn ScsiTransport,
+    cdb: &[u8; 10],
+) -> std::result::Result<bool, UnlockError> {
+    let mut buf = [0u8; 164];
+    match scsi.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000) {
+        Ok(r) => Ok(r.status == 0),
+        Err(e) => {
+            if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() {
+                return Err(UnlockError::Transport);
+            }
+            Ok(false)
+        }
+    }
 }
 
 impl Unlocker for Renesis {
@@ -76,10 +138,17 @@ impl Unlocker for Renesis {
         "Renesas"
     }
 
-    /// Report whether the drive is a Renesas platform. On a match, returns `Ok`
-    /// with `drive_unlocked: false` — the drive is recognized but its state is
-    /// not modified here (AACS bus decryption is handled by the host cert). A
-    /// non-Renesas drive → `NotApplicable`.
+    /// Recognize and open a Renesas/Pioneer drive the way MakeMKV does:
+    ///   1. `READ_BUFFER 0xF1` identity gate (the `SAT` marker) — else this is
+    ///      not our drive → `NotApplicable`.
+    ///   2. the single vendor open read `READ_BUFFER 0xB0 @0x04` — GOOD status
+    ///      confirms the drive is rip-ready. A CHECK CONDITION here is exactly
+    ///      where MakeMKV gives up on the drive, so we defer to the next unlocker
+    ///      (`NotApplicable`) rather than claim a drive we could not open.
+    ///
+    /// On success returns `drive_unlocked: false`: the vendor open makes the
+    /// drive readable, but AACS bus decryption is still the host cert's job (the
+    /// cert unlocker runs next), so we do not assert the bus is handled here.
     fn unlock_features(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -88,10 +157,18 @@ impl Unlocker for Renesis {
         if !is_renesas(scsi)? {
             return Err(UnlockError::NotApplicable);
         }
+        if !Self::vendor_open(scsi)? {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "renesas_open_rejected",
+                "Renesas drive recognized but RB 0xB0@0x04 refused; deferring to next unlocker"
+            );
+            return Err(UnlockError::NotApplicable);
+        }
         tracing::debug!(
             target: "freemkv::disc",
-            phase = "renesas_recognized",
-            "Renesas drive recognized; bus handled by cert"
+            phase = "renesas_opened",
+            "Renesas drive opened (RB 0xB0@0x04 GOOD); bus handled by cert"
         );
         Ok(Unlocked {
             vid: None,
@@ -248,6 +325,54 @@ mod tests {
         assert_eq!(
             Renesis::new().unlock_features(&mut t, &ctx).unwrap_err(),
             UnlockError::Transport
+        );
+    }
+
+    /// A genuine Renesas drive (passes the `0xF1` SAT gate) that REFUSES the
+    /// vendor open read `RB 0xB0@0x04` with CHECK CONDITION — the exact point
+    /// where MakeMKV abandons the drive. `unlock_features` must defer to the
+    /// next unlocker (`NotApplicable`), not claim a drive it could not open.
+    /// MUTATION: dropping the `vendor_open` gate makes this return `Ok` and
+    /// wrongly claim the drive.
+    #[test]
+    fn open_rejection_defers_to_next_unlocker() {
+        struct GateOkOpenRefused;
+        impl ScsiTransport for GateOkOpenRefused {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                if cdb.get(2) == Some(&0xF1) {
+                    // Serve the SAT identity so is_renesas() matches.
+                    let p = renesas_payload();
+                    let n = p.len().min(data.len());
+                    data[..n].copy_from_slice(&p[..n]);
+                    Ok(ScsiResult {
+                        status: 0,
+                        bytes_transferred: n,
+                        sense: [0u8; 32],
+                    })
+                } else {
+                    // RB 0xB0@0x04 (the open read) → CHECK CONDITION.
+                    let mut sense = [0u8; 32];
+                    sense[2] = 0x05; // ILLEGAL REQUEST
+                    sense[12] = 0x20; // invalid command operation code
+                    Err(ScsiError {
+                        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                        sense: Some(sense),
+                    })
+                }
+            }
+        }
+        let mut t = GateOkOpenRefused;
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
+        assert_eq!(
+            Renesis::new().unlock_features(&mut t, &ctx).unwrap_err(),
+            UnlockError::NotApplicable
         );
     }
 
