@@ -104,10 +104,9 @@ mod tests {
         );
     }
 
-    /// `is_transport_failure` is false for `CssAuthFailed`, false for a
-    /// `Scsi` error carrying a sense (a drive rejection, not a dead bus) even
-    /// at the transport-failure status, and true only for the genuine
-    /// transport fault (status + no sense).
+    // False for `CssAuthFailed` and for a `Scsi` error with a sense (a
+    // drive rejection, not a dead bus) even at transport-failure status;
+    // true only for the genuine transport fault (status + no sense).
     #[test]
     fn is_transport_failure_false_paths() {
         assert!(!Error::CssAuthFailed.is_transport_failure());

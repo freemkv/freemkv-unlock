@@ -149,11 +149,9 @@ mod tests {
         let _ = AacsCert::new();
     }
 
-    /// THE full success path through `Unlocker::unlock_bus` itself: a
-    /// self-consistent AACS 1.0 drive emulator carries auth + VID + data-key
-    /// reads all the way to `Ok(Unlocked { .. })`, so the crate's public entry
-    /// point — not just `run_cert_handshake` underneath it — is proven to wire
-    /// `volume_id` and `read_data_key` into `Unlocked` correctly.
+    // Full success path through `Unlocker::unlock_bus`: a self-consistent
+    // AACS 1.0 emulator proves the public entry point (not just
+    // `run_cert_handshake`) wires `volume_id`/`read_data_key` into `Unlocked`.
     #[test]
     fn unlock_bus_succeeds_end_to_end() {
         let mut t = handshake::tests::DriveEmu::new();

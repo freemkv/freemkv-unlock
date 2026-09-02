@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.7.0] — 2026-09-02
+
+### Fixed
+
+- `ld/profile`: `find_by_drive_id` no longer mis-binds a drive whose reported `product_id` is real but not catalogued to a sibling model's profile. The product-id-blind loose match is now gated on an empty product id, so a wrong profile — and its wrong LibreDrive microcode — can't be selected for a drive that does report a product id.
+
+### Changed
+
+- Version aligned to 1.7.0 for the unified release.
+
+### Docs
+
+- Added a third-party NOTICE clarifying that the LibreDrive microcode bundled in `src/ld/profiles.json` is proprietary MakeMKV material, not covered by this repository's MIT license.
+
 ## [1.6.14] — 2026-08-31
 
 ### Changed
