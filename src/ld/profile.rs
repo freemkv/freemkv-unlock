@@ -183,7 +183,7 @@ fn decode_hex(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
         return Err("hex");
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0.iter() {
         let hi = (pair[0] as char).to_digit(16).ok_or("hex")?;
         let lo = (pair[1] as char).to_digit(16).ok_or("hex")?;
         out.push((hi * 16 + lo) as u8);
