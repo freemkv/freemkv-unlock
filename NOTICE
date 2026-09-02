@@ -1,0 +1,24 @@
+NOTICE — Third-Party Drive Microcode
+====================================
+
+freemkv-unlock's own source code is licensed under the MIT License (see LICENSE).
+The MIT License does NOT cover the drive-microcode payloads bundled in
+`src/ld/profiles.json`.
+
+Those payloads are volatile, RAM-only optical-drive microcode ("LibreDrive")
+authored and owned by the MakeMKV team (GuinpinSoft inc.). Each payload embeds
+its own copyright notice, e.g.:
+
+    "This is volatile RAM-only microcode for LibreDrive by MakeMKV -
+     http://www.makemkv.com/libredrive/
+     Copyright (c) MakeMKV team, all rights reserved."
+
+They are included solely to recognize supported drives and perform the
+non-persistent, RAM-only unlock in interoperation with MakeMKV's LibreDrive, on
+drives their owners already possess. They are third-party proprietary material —
+**Copyright (c) MakeMKV team, all rights reserved** — and are **NOT** licensed
+under MIT. No ownership is claimed or transferred.
+
+freemkv is an independent project, not affiliated with, endorsed by, or
+sponsored by MakeMKV / GuinpinSoft inc. With thanks to the MakeMKV team for
+LibreDrive. See https://www.makemkv.com/ and http://www.makemkv.com/libredrive/.

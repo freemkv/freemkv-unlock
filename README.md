@@ -36,4 +36,13 @@ for u in freemkv_unlock::all_unlockers() {
 To remove an unlocker, delete its module directory and its one line in
 `all_unlockers()` — nothing else changes.
 
-License: MIT.
+## License
+
+freemkv-unlock's own source is MIT — see [LICENSE](LICENSE).
+
+`src/ld/profiles.json` bundles volatile, RAM-only **LibreDrive** microcode
+authored and owned by the **MakeMKV team** (GuinpinSoft inc.) — *Copyright (c)
+MakeMKV team, all rights reserved.* That microcode is third-party proprietary
+material, **not** covered by the MIT license; no ownership is claimed. See
+[`NOTICE`](NOTICE). With thanks to the MakeMKV team for
+[LibreDrive](http://www.makemkv.com/libredrive/).
