@@ -6,13 +6,9 @@
 //! encryption AT THE DRIVE (the unlocked drive serves clear content) and
 //! reporting the OEM Volume ID.
 
-// `cdb` carries ONLY the unlock-handshake wire format that the bdemu emulator
-// needs (the real unlocker drives its CDBs from per-drive profile templates, not
-// these constants). Compile it only when the `emulation` feature exposes it, so
-// it never dead-codes in a normal build.
-// Compiled under `cfg(test)` as well as the feature: its tests pin the unlock
-// wire format, and gating the whole module on a non-default feature meant CI
-// (which builds with default features) never ran them.
+// `cdb` is only the bdemu emulator's wire format (real unlocking uses profile
+// templates), gated behind `emulation`; also compiled under `cfg(test)` so its
+// wire-format tests run in default-feature CI. See docs/ld-mod.md — cdb gating.
 #[cfg(any(feature = "emulation", test))]
 mod cdb;
 mod error;
@@ -24,12 +20,8 @@ use crate::scsi::{DataDirection, ScsiTransport};
 use crate::{DriveId, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
 // ── Public profile catalog ──────────────────────────────────────────────────
-//
-// The catalog of drives the MT1959 unlocker recognizes is the one piece of
-// ld worth exposing publicly: it answers "is this drive supported?" without
-// unlocking, and the bdemu test-emulator reads it to impersonate a supported
-// drive. The unlock *mechanism* (firmware blobs, upload sequence, CDB wire
-// format) stays private — only the catalog and its match result are public.
+// Only the catalog is public (supported-drive lookup, used by bdemu); the
+// unlock mechanism stays private. See docs/ld-mod.md — public catalog design.
 
 pub use profile::{DriveProfile as Profile, Identity, Platform, ProfileMatch, Profiles};
 
@@ -54,12 +46,9 @@ pub fn profile(drive_id: &DriveId) -> Option<ProfileMatch> {
 #[cfg(feature = "emulation")]
 pub use cdb::{UNLOCK_MARKER, is_unlock_read_buffer};
 
-/// The MT1959 unlocker. `pub(crate)` — clients reach it only through
-/// [`crate::all_unlockers`], never by name (the locked-design contract).
-///
-/// Matches a drive against the bundled profile database and, on a hit,
-/// runs the MediaTek MT1959 firmware-unlock (and disc-speed calibration)
-/// handshake over the raw SCSI transport.
+// The MT1959 unlocker, reached only through `crate::all_unlockers` (never by
+// name). Matches a drive against the bundled profile database and runs the
+// firmware-unlock + disc-speed-calibration handshake over raw SCSI.
 pub(crate) struct Mt1959Unlocker;
 
 impl Mt1959Unlocker {
@@ -76,17 +65,9 @@ pub(crate) fn firmware_name(id: &DriveId) -> Option<&'static str> {
 }
 
 impl Mt1959Unlocker {
-    /// Read the OEM Volume ID via the matched profile's vendor CDB.
-    ///
-    /// Takes the profile the caller ALREADY matched rather than re-running
-    /// `find_bundled`: the catalog is 206 entries and drive-prep used to scan it
-    /// twice per drive (once here, once in `firmware_unlock`) for the same
-    /// answer.
-    ///
-    /// `Ok(Some(vid))` on a well-formed 36-byte response (signature `00 22 00`,
-    /// VID at `[4..20]`); `Ok(None)` when there is no OEM-VID CDB or the response
-    /// is short / bad-signature / drive-rejected (the drive is still unlocked,
-    /// just no VID); `Err` only on a transport fault.
+    // Read the OEM Volume ID via the matched profile's vendor CDB (profile passed
+    // in to avoid a redundant 206-entry catalog scan). Ok(Some) on a well-formed
+    // response; Ok(None) if unreadable; Err only on a transport fault.
     fn read_oem_vid(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -101,10 +82,9 @@ impl Mt1959Unlocker {
 
         let mut buf = vec![0u8; RESPONSE_LEN];
         let result = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
-        // Per the transport contract a drive sense arrives as `Ok` with a
-        // non-zero `status`, NOT as `Err`. Without this check a CHECK CONDITION
-        // would be read as a successful 36-byte response and the caller's own
-        // zero fill parsed as a Volume ID.
+        // Per the transport contract a drive sense arrives as `Ok` with non-zero
+        // `status`, not `Err` — without this check a CHECK CONDITION reads as a
+        // successful response and the zero-filled buffer parses as a bogus VID.
         if result.status != 0 {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -139,15 +119,9 @@ impl Mt1959Unlocker {
 }
 
 impl Mt1959Unlocker {
-    /// The MediaTek firmware unlock. Because the MT1959 unlocker removes AACS bus
-    /// encryption AT THE DRIVE (the unlocked drive serves CLEAR content), this ONE
-    /// operation satisfies BOTH the drive-features and the bus-removal capability
-    /// — so `unlock_features` and `unlock_bus` both delegate here. The result
-    /// carries `drive_unlocked: true` (no bus key needed) and the OEM Volume ID.
-    ///
-    /// A no-firmware-route drive (Renesas / no profile) returns `NotApplicable`; a
-    /// transport fault propagates as `Transport`; any other firmware failure also
-    /// falls through as `NotApplicable`.
+    // The MediaTek firmware unlock. Since it removes AACS at the drive (clear
+    // content), this one op satisfies both features and bus-removal, so both
+    // trait methods delegate here. See docs/ld-mod.md — firmware_unlock contract.
     fn firmware_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -167,14 +141,9 @@ impl Mt1959Unlocker {
         // A transport fault → UnlockError::Transport; any other firmware failure
         // → NotApplicable (via From<error::Error>).
         mt.init(scsi)?;
-        // `init` only proves the handshake COMPLETED — `do_unlock` returns Ok on
-        // a response that carried the per-drive signature but not both firmware
-        // markers. Only `is_unlocked()` means the drive actually reached the
-        // extended-access state and serves clear content. Reporting
-        // `drive_unlocked: true` off `init` alone told the consumer the bus was
-        // clear on a half-unlocked drive, which suppressed the cert-auth
-        // fallback and shipped ciphertext at rc=0. A partial unlock must fall
-        // through to the next unlocker.
+        // `init` only proves the handshake completed, not that the drive reached
+        // extended-access state. Reporting unlocked off `init` alone shipped
+        // ciphertext at rc=0. See docs/ld-mod.md — half-unlock fallback.
         if !mt.is_unlocked() {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -183,19 +152,13 @@ impl Mt1959Unlocker {
             );
             return Err(UnlockError::NotApplicable);
         }
-        // Prime the per-region speed table. Best-effort — it must not fail the
-        // unlock — but NOT silent: speed calibration can fail completely, and an
-        // unlogged `let _ =` made a fully-failed calibration indistinguishable
-        // from a successful one in the rip log.
+        // Prime the per-region speed table. Best-effort (must not fail the unlock)
+        // but not silent — an unlogged `let _ =` made a failed calibration
+        // indistinguishable from success in the rip log.
         if let Err(e) = mt.probe_disc(scsi) {
-            // A transport fault here is a DEAD BUS, not a speed-calibration miss.
-            // The rest of this path (`read_oem_vid`) is a no-op for the 140/206
-            // profiles that carry no `read_vid_cdb`, so it never touches the bus
-            // again — meaning this swallowed fault was the ONLY dead-bus signal,
-            // and warn-and-continue turned it into `Ok(Unlocked{drive_unlocked:
-            // true})`: a dead bus rendered as a fully-unlocked drive (the flagship
-            // failure-that-looks-like-success). A genuine calibration miss (drive
-            // sense / short reply) still continues on the default speed table.
+            // A transport fault here is a dead bus, not a calibration miss — most
+            // profiles never touch the bus again, so this was the only dead-bus
+            // signal. See docs/ld-mod.md — probe_disc dead-bus classification.
             if e.is_transport_failure() {
                 tracing::warn!(
                     target: "freemkv::disc",
@@ -423,12 +386,9 @@ mod tests {
         assert_eq!(err, UnlockError::NotApplicable);
     }
 
-    /// THE defect-1 test. The drive answers every unlock READ_BUFFER with a
-    /// response carrying the per-drive signature and the primary firmware marker
-    /// but NOT the secondary one — `do_unlock` returns `Ok` and `init()`
-    /// succeeds, yet the drive is NOT in the extended-access state. Reporting
-    /// `drive_unlocked: true` here suppresses the cert-auth fallback. Catches
-    /// removing the `is_unlocked()` gate in `firmware_unlock`.
+    // THE defect-1 test: response carries the signature + primary marker but not
+    // the secondary one, so init() succeeds but the drive isn't in extended-access
+    // state. Catches removing the `is_unlocked()` gate in `firmware_unlock`.
     #[test]
     fn half_unlocked_drive_falls_through_instead_of_claiming_unlocked() {
         use crate::scsi::mock::{MockTransport, Reply};
@@ -475,16 +435,9 @@ mod tests {
         assert!(u.drive_unlocked);
     }
 
-    /// THE probe-disc dead-bus test. The drive unlocks fully (both firmware
-    /// markers), then the bus DIES during disc-speed calibration. `probe_disc`
-    /// used to be warn-and-continued regardless of the fault, and — because the
-    /// 140/206 profiles without a `read_vid_cdb` never touch the bus again — a
-    /// dead bus was reported as `Ok(Unlocked{drive_unlocked:true})`: a dead bus
-    /// rendered as a successful unlock (the flagship failure-that-looks-like-
-    /// success). `firmware_unlock` must now abort with `Transport`.
-    /// MUTATION: reverting the `if e.is_transport_failure()` return in
-    /// `firmware_unlock` (warn-and-continue), OR flattening the probe loops'
-    /// transport classification, makes this go red.
+    // THE probe-disc dead-bus test: bus dies during speed calibration after a
+    // full unlock; must abort with Transport, not report a successful unlock.
+    // See docs/ld-mod.md — probe_disc dead-bus test / mutation notes.
     #[test]
     fn transport_fault_during_probe_disc_is_transport_not_a_successful_unlock() {
         let id = known_vid_drive_id();
@@ -534,11 +487,9 @@ mod tests {
         assert_eq!(err, UnlockError::Transport);
     }
 
-    /// A drive-sense (not a dead bus) rejecting the speed probe is a genuine
-    /// calibration miss, not a transport fault — `firmware_unlock` must
-    /// warn-and-continue on the drive's default speed table, still reporting a
-    /// full unlock. The non-transport sibling of
-    /// `transport_fault_during_probe_disc_is_transport_not_a_successful_unlock`.
+    // A drive-sense (not a dead bus) rejecting the speed probe is a genuine
+    // calibration miss: warn-and-continue on the default speed table, still
+    // reporting a full unlock. Non-transport sibling of the probe-fault test.
     #[test]
     fn drive_sense_during_probe_disc_still_reports_a_successful_unlock() {
         let id = known_vid_drive_id();
