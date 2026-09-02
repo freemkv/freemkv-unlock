@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.15] — 2026-09-02
+
+### Changed
+
+- Version aligned to 1.6.15 for the unified release.
+
+### Docs
+
+- Added a third-party NOTICE clarifying that the LibreDrive microcode bundled in `src/ld/profiles.json` is proprietary MakeMKV material, not covered by this repository's MIT license.
+
 ## [1.6.14] — 2026-08-31
 
 ### Changed
