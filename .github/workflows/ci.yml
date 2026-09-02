@@ -17,8 +17,10 @@ on:
 # seven others down with it, which is why it gets the full OS matrix rather
 # than a token Linux run.
 #
-# Cargo.lock is gitignored (library convention), so `--locked` is deliberately
-# NOT used: with no committed lockfile it fails rather than resolves.
+# Cargo.lock is now committed (issue #15), so the resolved dependency graph is
+# recorded and the `deny` job audits it. `--locked` is still deliberately NOT
+# used, matching the binary crates' ci.yml: CI's sibling path-patch layout
+# resolves the freemkv crates as path packages, which `--locked` can't satisfy.
 
 jobs:
   # ── Single source of truth for the MSRV ─────────────────────────────────────
@@ -110,7 +112,7 @@ jobs:
   # release gate). It mirrors the `test` job's environment — same pinned
   # toolchain, ubuntu-latest, no `if:` so it runs on every branch and PR just
   # as `test` does. `--locked` is intentionally omitted to match this crate's
-  # policy (Cargo.lock is gitignored; --locked would fail without it).
+  # policy (Cargo.lock is committed but --locked can't satisfy the path-patch layout).
   coverage:
     needs: resolve-msrv
     runs-on: ubuntu-latest
@@ -131,6 +133,21 @@ jobs:
           files: lcov.info
           slug: freemkv/freemkv-unlock
           fail_ci_if_error: false
+
+  # cargo-deny gates the RESOLVED dependency graph: RUSTSEC advisories, a
+  # permissive licence allow-list, and source/ban hygiene. It mirrors the
+  # `test` job's checkout (single root checkout, no siblings) and runs on
+  # `stable` — advisory/licence debt is caught against current Rust, not the
+  # MSRV pin — so no `needs: resolve-msrv`.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          manifest-path: Cargo.toml
 
   # The crate ships on macOS and Windows through its consumers, so it has to
   # compile there. Build the tests (not just `cargo check`) — that forces
