@@ -42,20 +42,10 @@ pub struct Identity {
 
 /// Per-drive profile.
 ///
-/// VISIBILITY: only `identity` and `signature` are public — they are what the
-/// catalog is public FOR ("is this drive supported?", and the emulator's
-/// impersonation). Everything below them is unlock MECHANISM: the MediaTek
-/// firmware image and the per-drive vendor CDB templates. `Cargo.toml` says this
-/// crate is never published because it carries drive firmware; re-exporting
-/// `DriveProfile` with a `pub firmware: Vec<u8>` handed that firmware, and every
-/// vendor CDB, to any downstream crate that called `ld::profile()`. They are
-/// `pub(crate)` so the mechanism stays inside the unlocker.
-///
-/// `allow(dead_code)`: this is the on-disk catalog schema, and several captured
-/// CDB templates have no in-crate consumer yet. They were `pub` before, so the
-/// compiler saw the (external) use; making them `pub(crate)` is what exposes
-/// them as unread. Deleting them would silently drop fields from the format the
-/// profile-extraction pipeline emits.
+/// Only `identity` and `signature` are public; everything else (firmware
+/// image, per-drive vendor CDB templates) is `pub(crate)` unlock mechanism
+/// that must stay inside this unpublished crate.
+/// See docs/drive-profile-visibility.md — field-visibility and allow(dead_code) rationale.
 #[allow(dead_code)]
 #[derive(Clone, Deserialize)]
 pub struct DriveProfile {
@@ -72,11 +62,8 @@ pub struct DriveProfile {
     pub(crate) firmware: Vec<u8>,
 
     // ── OEM-extended-access CDB templates ──────────────────────────────
-    //
-    // All optional — older profile blobs that pre-date the CDB capture
-    // pipeline simply omit these fields and decode as `None`. Encoded
-    // in the JSON as lowercase hex strings without separators
-    // (e.g. `"3c014410e29100002400"` for a 10-byte CDB).
+    // All optional (`None` if pre-capture-pipeline). Hex strings, no
+    // separators, e.g. `"3c014410e29100002400"`.
     #[serde(default)]
     pub(crate) unlock_init_value: u8,
     #[serde(default)]
@@ -113,14 +100,9 @@ pub struct DriveProfile {
     pub(crate) speed_calc_table: Option<Vec<u8>>,
 }
 
-// Hand-written, REDACTING Debug. `DriveProfile` is `pub` and reachable through
-// the public `Profiles` catalog (`ld::bundled` / `ld::profiles`), whose own
-// derived `Debug` would recurse into this one. `Cargo.toml` says this crate is
-// NEVER published because it carries drive firmware; a derived `Debug` would
-// render that firmware image AND every captured per-drive vendor CDB (the unlock
-// MECHANISM) straight into any log. Show only the PUBLIC identity + signature
-// (what the catalog is public FOR); collapse the firmware to a byte length and
-// omit the vendor CDB templates entirely so no mechanism bytes reach a log.
+// Hand-written, REDACTING Debug: a derived one would recurse through the
+// public `Profiles` catalog and print raw firmware + vendor CDB bytes into
+// logs. Show only identity + signature; collapse firmware to a length.
 impl std::fmt::Debug for DriveProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DriveProfile")
@@ -167,16 +149,9 @@ pub struct ProfileMatch {
     pub platform: Platform,
 }
 
-// ── Parsing ────────────────────────────────────────────────────────────
-
-/// Decode an even-length ASCII hex string into bytes.
-///
-/// Operates on raw bytes rather than `&str` char-boundary slices: a
-/// non-ASCII input (e.g. a hand-edited profile with a multi-byte char)
-/// could otherwise have `&s[i..i+2]` land inside a UTF-8 char boundary and
-/// panic. Hex is ASCII, so any non-ASCII or non-hex byte simply fails to
-/// decode. The error is a stable, language-neutral token (`"hex"`), not a
-/// translatable English message.
+// ── Parsing: decode hex on raw bytes (not `&str` slices) so non-ASCII
+// can't land `&s[i..i+2]` inside a UTF-8 char boundary and panic — it
+// just fails to decode with `"hex"`.
 fn decode_hex(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
@@ -223,9 +198,7 @@ where
 }
 
 // ── Fixed-length hex deserializers for CDB templates ────────────────────
-//
-// Profile JSON encodes CDBs as lowercase hex strings without separators.
-// An empty string / null / missing field decodes as `None`.
+// Lowercase hex strings, no separators; empty/null/missing decodes as `None`.
 
 fn parse_hex_bytes(s: &str) -> std::result::Result<Vec<u8>, &'static str> {
     decode_hex(s)
@@ -306,12 +279,8 @@ pub fn bundled() -> Option<&'static Profiles> {
     CACHE
         .get_or_init(|| match load_from_str(BUNDLED_PROFILES) {
             Ok(p) => Some(p),
-            // The `None` is cached PERMANENTLY (correctly — the blob is fixed at
-            // compile time), which means a bad shipped profiles.json makes
-            // Mt1959Unlocker report "drive not supported" for every drive for the
-            // life of the process. Unlogged, that is indistinguishable from a
-            // genuinely uncataloged drive; log it once, loudly, at the one place
-            // the parse happens.
+            // `None` caches permanently; unlogged that's indistinguishable
+            // from a genuinely uncataloged drive, so log once, loudly, here.
             Err(e) => {
                 tracing::error!(
                     target: "freemkv::disc",
@@ -543,10 +512,8 @@ mod tests {
         assert_eq!(parse_hex4("aabbccdd").unwrap(), [0xaa, 0xbb, 0xcc, 0xdd]);
     }
 
-    /// Platform::name() returns stable, non-empty, language-neutral identifiers.
-    /// These strings are logged and keyed on in caller code; changing them is a
-    /// breaking change.
-    /// Mutation: swapping Mt1959A and Mt1959B names silently misroutes firmware upload.
+    // Platform::name() strings are logged/keyed by callers; changing them is
+    // a breaking change. Mutation: swapping A/B names misroutes firmware upload.
     #[test]
     fn platform_name_is_stable() {
         // The exact strings are part of the public stable API (logged/keyed).
@@ -555,11 +522,9 @@ mod tests {
         assert_eq!(Platform::Renesas.name(), "Renesas");
     }
 
-    /// find_by_drive_id: exact match (including firmware_date) wins over loose match.
-    /// Spec: two-pass — first an exact match including firmware_date, then looser.
-    /// Build two synthetic Profiles entries that differ only by firmware_date,
-    /// and verify the correct one is selected.
-    /// Mutation: doing only the loose pass would return the first entry regardless of date.
+    // find_by_drive_id: two-pass — exact match (incl. firmware_date) wins
+    // over loose. Mutation: skipping the exact pass returns the first entry
+    // regardless of date.
     #[test]
     fn find_by_drive_id_exact_date_wins_over_loose() {
         use serde_json::json;
@@ -651,10 +616,8 @@ mod tests {
         assert!(matches!(result, Err(Error::ProfileParse)));
     }
 
-    /// Bundled profiles is non-empty (mt1959_a has at least one entry).
-    /// This pins the embedded JSON: if profiles.json is accidentally emptied
-    /// or truncated, this test goes red.
-    /// Mutation: clearing profiles.json would make this fail.
+    // Pins the embedded JSON: if profiles.json is emptied/truncated, this
+    // goes red.
     #[test]
     fn bundled_profiles_has_entries() {
         let profiles = load_bundled().unwrap();
@@ -664,10 +627,8 @@ mod tests {
         );
     }
 
-    /// deserialization of a profile with missing optional CDB fields
-    /// produces None for those fields (not a parse error).
-    /// Spec: all CDB template fields are `#[serde(default)]` — they are optional.
-    /// Mutation: making a CDB field required breaks backward-compat with old blobs.
+    // All CDB fields are `#[serde(default)]`. Mutation: making one required
+    // breaks backward-compat with old blobs.
     #[test]
     fn profile_optional_cdb_fields_default_to_none() {
         use serde_json::json;
@@ -715,12 +676,8 @@ mod tests {
         );
     }
 
-    /// `DriveProfile`'s `Debug` must NOT render the firmware image or the
-    /// per-drive vendor CDB templates — this crate is unpublished precisely
-    /// because it carries drive firmware, and the profile is reachable through
-    /// the public `Profiles` catalog.
-    /// MUTATION: restoring `#[derive(Debug)]` prints the raw firmware bytes
-    /// (e.g. the 0xEE marker below) and the CDB bytes, so this goes red.
+    // `Debug` must not render firmware/CDB bytes. Mutation: restoring
+    // `#[derive(Debug)]` prints them (e.g. the 0xEE marker below), goes red.
     #[test]
     fn drive_profile_debug_redacts_firmware_and_cdbs() {
         use serde_json::json;
@@ -749,10 +706,8 @@ mod tests {
         assert!(s.contains("VIS"), "identity must remain visible: {s}");
     }
 
-    /// deserialize_hex4 of an empty string must produce [0;4] without error.
-    /// This matches `deserialize_hex4`'s explicit early-return for empty strings.
-    /// Mutation: treating empty string as an error prevents profiles where signature
-    ///           was not captured from loading.
+    // deserialize_hex4("") must produce [0;4]. Mutation: treating empty as
+    // an error blocks profiles with no captured signature from loading.
     #[test]
     fn profile_empty_signature_deserialises_as_zeroes() {
         use serde_json::json;

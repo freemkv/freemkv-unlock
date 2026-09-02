@@ -19,17 +19,13 @@ const RENESAS_MARKER_OFFSET: usize = 16;
 /// `Ok(true)` if `scsi` is a Renesas-platform drive (Pioneer or HL-DT-ST
 /// Renesas).
 ///
-/// Issues the vendor READ_BUFFER 0x02/0xF1 probe: a Renesas controller serves a
-/// 48-byte identity block whose bytes `[16..19]` are the ASCII `SAT` interface
-/// tag. A MediaTek drive rejects it — as a CHECK CONDITION (`Ok` with a
-/// non-zero status) or, through a non-conforming transport, as an `Err`
-/// carrying a sense — which is `Ok(false)`: not a Renesas drive. This is the
-/// definitive Renesas-vs-MediaTek split.
+/// Issues the vendor READ_BUFFER 0x02/0xF1 probe: a Renesas controller serves
+/// a 48-byte identity block whose bytes `[16..19]` are the ASCII `SAT`
+/// interface tag. A rejection (CHECK CONDITION or `Err` with a sense) is
+/// `Ok(false)`: not a Renesas drive.
 ///
-/// A TRANSPORT fault is `Err(Transport)`. It used to be folded into the same
-/// `false` as a drive rejection, and because this probe is the first SCSI
-/// command the unlocker issues, a dead bus read as "not a Renesas drive" — the
-/// consumer then walked the remaining unlockers against a bus that was gone.
+/// `Err(Transport)` on a dead bus. See docs/renesas-mod.md for why a
+/// transport fault must not be folded into `Ok(false)`.
 pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
     let mut buf = [0u8; RB_F1_LEN];
     match scsi.execute(&RB_F1_CDB, DataDirection::FromDevice, &mut buf, 5_000) {
@@ -70,28 +66,9 @@ impl Renesas {
         Renesas
     }
 
-    /// The Pioneer/Renesas vendor "open" — MakeMKV's live sequence, replicated in
-    /// full: a primary read, and on its failure a payload-less "knock" + a second
-    /// read at a different window.
-    ///
-    ///   A. `READ_BUFFER 0x02/0xB0 @0x000004` (164 B) — the primary open.
-    ///   B. (only if A refuses) `WRITE_BUFFER 0x02/0x41 @0xA5AAAA` (0-byte knock)
-    ///      then `READ_BUFFER 0x02/0xB0 @0x500000` (164 B).
-    ///
-    /// Success is by SCSI *status* alone (the 164-byte payload CONTENT is not
-    /// validated — verified empirically: a real drive's table and an all-zero
-    /// buffer are accepted identically as long as status is GOOD). We run the
-    /// whole A→knock→B path rather than bailing after A, because the knock is a
-    /// per-firmware fallback: some firmware revisions only answer the `0x500000`
-    /// window *after* the knock (MakeMKV issues the knock exactly when A returns
-    /// CHECK CONDITION). If NEITHER A nor B returns GOOD, the drive did not open →
-    /// defer to the next unlocker.
-    ///
-    /// (There may be more than one knock offset across firmware families; only
-    /// the observed `0xA5AAAA` is issued here — add variants as they are proven.)
-    ///
-    /// `Ok(true)` = opened (A or B GOOD). `Ok(false)` = neither opened (CHECK
-    /// CONDITION). `Err(Transport)` = dead bus.
+    // MakeMKV's vendor "open" sequence: primary read (A), and on refusal a
+    // knock + second read (B). See docs/renesas-mod.md for the full sequence
+    // and why we run A→knock→B rather than bailing after A.
     fn vendor_open(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
         const RB_B0_04_CDB: [u8; 10] = [0x3C, 0x02, 0xB0, 0x00, 0x00, 0x04, 0x00, 0x00, 0xA4, 0x00];
         const KNOCK_A5AAAA_CDB: [u8; 10] =
@@ -142,17 +119,9 @@ impl Unlocker for Renesas {
         "Renesas"
     }
 
-    /// Recognize and open a Renesas/Pioneer drive the way MakeMKV does:
-    ///   1. `READ_BUFFER 0xF1` identity gate (the `SAT` marker) — else this is
-    ///      not our drive → `NotApplicable`.
-    ///   2. the single vendor open read `READ_BUFFER 0xB0 @0x04` — GOOD status
-    ///      confirms the drive is rip-ready. A CHECK CONDITION here is exactly
-    ///      where MakeMKV gives up on the drive, so we defer to the next unlocker
-    ///      (`NotApplicable`) rather than claim a drive we could not open.
-    ///
-    /// On success returns `drive_unlocked: false`: the vendor open makes the
-    /// drive readable, but AACS bus decryption is still the host cert's job (the
-    /// cert unlocker runs next), so we do not assert the bus is handled here.
+    // Gate on the `0xF1` SAT identity, then the vendor open read `0xB0@0x04`;
+    // `drive_unlocked: false` since AACS bus decryption is the cert's job.
+    // See docs/renesas-mod.md for the full MakeMKV-parity rationale.
     fn unlock_features(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -210,11 +179,8 @@ mod tests {
         }
     }
 
-    /// Rejects the command the way a MediaTek drive does: ILLEGAL REQUEST. The
-    /// sense is what distinguishes this from a dead bus — the old fixture sent
-    /// `sense: None`, which is the wire shape of a TRANSPORT fault, and the test
-    /// built on it asserted `NotApplicable`, pinning exactly the
-    /// misclassification this file had.
+    // Rejects like a MediaTek drive: ILLEGAL REQUEST with a sense, which is
+    // what distinguishes this from a dead bus. See docs/renesas-mod.md.
     struct RejectingTransport;
     impl ScsiTransport for RejectingTransport {
         fn execute(
@@ -303,10 +269,8 @@ mod tests {
         assert_eq!(err, UnlockError::NotApplicable);
     }
 
-    /// The same rejection delivered the way a CONFORMING transport delivers it —
-    /// `Ok` with a CHECK CONDITION status — must reach the same answer. Catches
-    /// dropping the `r.status == 0` check, which would read the probe buffer's
-    /// zero fill as an identity block.
+    // Same rejection via a CONFORMING transport (`Ok` + CHECK CONDITION);
+    // must reach the same answer. See docs/renesas-mod.md.
     #[test]
     fn check_condition_is_not_a_renesas_drive() {
         use crate::scsi::mock::{MockTransport, Reply};
@@ -332,12 +296,8 @@ mod tests {
         );
     }
 
-    /// A genuine Renesas drive (passes the `0xF1` SAT gate) that REFUSES the
-    /// vendor open read `RB 0xB0@0x04` with CHECK CONDITION — the exact point
-    /// where MakeMKV abandons the drive. `unlock_features` must defer to the
-    /// next unlocker (`NotApplicable`), not claim a drive it could not open.
-    /// MUTATION: dropping the `vendor_open` gate makes this return `Ok` and
-    /// wrongly claim the drive.
+    // A recognized Renesas drive that REFUSES the vendor open read must
+    // defer to the next unlocker, not claim the drive. See docs/renesas-mod.md.
     #[test]
     fn open_rejection_defers_to_next_unlocker() {
         struct GateOkOpenRefused;

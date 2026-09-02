@@ -13,11 +13,9 @@ const FIRMWARE_EXTRA: [u8; 16] = [0; 16];
 /// that drive — real profiles must supply their own (see `DriveProfile`).
 const VENDOR_VERIFY: [u8; 10] = [0xF1, 0x01, 0x02, 0x00, 0x0D, 0x30, 0x01, 0xF3, 0xAD, 0x23];
 
-/// Trace the outcome of a best-effort firmware-upload step and swallow
-/// everything EXCEPT a transport fault. These steps are advisory (the unlock
-/// retries below are the real gate) but their results were previously thrown
-/// away entirely, so a firmware upload could fail end to end and leave nothing
-/// in the log to say so — and a dead bus kept the sequence running.
+// See docs/variant-b-firmware-upload.md — trace_step rationale.
+// Swallows everything except a transport fault; these steps are advisory,
+// the unlock retries below are the real gate.
 fn trace_step(phase: &'static str, r: crate::scsi::Result<crate::scsi::ScsiResult>) -> Result<()> {
     match r {
         Ok(res) if res.status == 0 => {
@@ -60,12 +58,9 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         return Err(crate::ld::error::Error::UnlockFailed);
     }
 
-    // Step 1: Upload the firmware via MODE SELECT. The profile's `firmware` is
-    // the exact per-drive image — extracted at the drive's own load-CDB length
-    // (2192..2528 bytes; the old fixed 0x9C0 truncated some drives and over-read
-    // others into blob strings). Upload all of it. MODE SELECT(10)'s
-    // parameter-list length is 16-bit, so reject only a blob that can't be
-    // expressed in the CDB.
+    // Step 1: Upload the firmware via MODE SELECT (see docs/variant-b-firmware-upload.md).
+    // MODE SELECT(10)'s parameter-list length is 16-bit, so reject only a
+    // blob that can't be expressed in the CDB.
     let write_len = firmware.len();
     if write_len > u16::MAX as usize {
         return Err(crate::ld::error::Error::UnlockFailed);
@@ -128,13 +123,9 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         scsi.execute(&write_extra_cdb, DataDirection::ToDevice, &mut data2, 5_000),
     )?;
 
-    // Step 4: Vendor verify (0xF1 — B-only, not standard SCSI). PER-DRIVE: take
-    // it from the profile (39 distinct values across the 140 B drives). The
-    // const is only a legacy fallback — it carries one drive's token.
-    // The result used to be discarded with `let _ =` despite the comment calling
-    // this a verify step: a corrupt upload proceeded straight to the do_unlock
-    // retries with no diagnostic. There is no documented expected payload, so
-    // the outcome is TRACED; only a dead bus aborts.
+    // Step 4: Vendor verify (0xF1 — B-only, not standard SCSI), per-drive.
+    // See docs/variant-b-firmware-upload.md for why the outcome is traced
+    // rather than discarded.
     let verify_cdb = mt.profile.fw_verify_cdb.unwrap_or(VENDOR_VERIFY);
     let mut dummy = [0u8; 0];
     trace_step(
@@ -142,11 +133,9 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         scsi.execute(&verify_cdb, DataDirection::None, &mut dummy, 5_000),
     )?;
 
-    // Step 5: Unlock retries (up to 5, then a final fatal attempt). On a
-    // successful unlock we issue one confirmation pass; its result is
-    // intentionally best-effort — the first call already established the
-    // unlock state, so a hiccup on the redundant confirmation must not fail
-    // an otherwise-good unlock.
+    // Step 5: Unlock retries (up to 5, then a final fatal attempt). The
+    // confirmation pass after success is intentionally best-effort — see
+    // docs/variant-b-firmware-upload.md.
     for _attempt in 0..5 {
         match mt.do_unlock(scsi) {
             Ok(_) => {

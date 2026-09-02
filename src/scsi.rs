@@ -100,14 +100,8 @@ pub(crate) fn build_set_cd_speed(read_speed: u16) -> [u8; 12] {
 }
 
 // ── Test fixture ────────────────────────────────────────────────────────────
-//
-// The crate-wide mock transport. Before this existed, EVERY mock in the crate
-// returned `Ok` with status 0 and a full `bytes_transferred` — so no test could
-// ever exercise the three outcomes the contract actually distinguishes, and a
-// whole class of transport-fault misclassification bugs sat uncaught (a dead bus
-// read as "this unlocker doesn't apply", a zero-filled buffer read as valid
-// drive data). This fixture can express all of them, and is the red-before-green
-// vehicle for the transport-contract fixes across ld / aacs / css / renesas.
+// Crate-wide mock transport, able to express all three transport outcomes.
+// See docs/scsi-mock-fixture.md — why this fixture exists
 #[cfg(test)]
 #[allow(dead_code)] // a fixture: each helper is used by a subset of the modules
 pub(crate) mod mock {
@@ -322,10 +316,9 @@ mod tests {
         assert_eq!(build_set_cd_speed(0xFFFF)[2..4], [0xFF, 0xFF]);
     }
 
-    /// The fixture itself must honour the contract it exists to test: a drive
-    /// sense is `Ok` with a non-zero status, a bus fault is `Err`. If this ever
-    /// drifts, every transport-contract test built on it silently stops testing
-    /// anything.
+    // The fixture must honour the contract it tests: a drive sense is `Ok`
+    // with non-zero status, a bus fault is `Err`. If this drifts, every
+    // transport-contract test built on it silently stops testing anything.
     #[test]
     fn mock_transport_expresses_the_three_contract_outcomes() {
         let mut t = MockTransport::scripted(
