@@ -1,0 +1,15 @@
+THIRD-PARTY NOTICE for profiles.json
+====================================
+
+`profiles.json` in this directory contains volatile, RAM-only optical-drive
+microcode ("LibreDrive") authored and owned by the MakeMKV team (GuinpinSoft
+inc.). Each payload embeds its own notice:
+
+    "This is volatile RAM-only microcode for LibreDrive by MakeMKV -
+     http://www.makemkv.com/libredrive/
+     Copyright (c) MakeMKV team, all rights reserved."
+
+This microcode is third-party proprietary material — Copyright (c) MakeMKV team,
+all rights reserved — and is NOT covered by this repository's MIT LICENSE. No
+ownership is claimed. See the repository-root NOTICE. Thanks to the MakeMKV team
+for LibreDrive: https://www.makemkv.com/ , http://www.makemkv.com/libredrive/ .
