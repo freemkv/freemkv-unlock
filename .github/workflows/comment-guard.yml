@@ -1,0 +1,17 @@
+name: comment-guard
+
+# Caps explanatory prose by COMMENT INTENT (not visibility):
+#   //! / /*! module docs  — unbounded (module-scoped, can't hide per-item text)
+#   ///  / /** */ item docs — 8 prose lines (fenced ``` examples excluded)
+#   //   / /* */  asides    — 3 lines (single-blank-separated runs count as one)
+# Overflow belongs in the module //! or docs/<topic>.md with a one-line // pointer.
+
+on: [push, pull_request]
+
+jobs:
+  comment-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run comment-guard
+        run: python3 ci/comment-guard.py

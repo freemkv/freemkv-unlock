@@ -17,10 +17,31 @@ on:
 # seven others down with it, which is why it gets the full OS matrix rather
 # than a token Linux run.
 #
-# Cargo.lock is gitignored (library convention), so `--locked` is deliberately
-# NOT used: with no committed lockfile it fails rather than resolves.
+# Cargo.lock is now committed (issue #15), so the resolved dependency graph is
+# recorded and the `deny` job audits it. `--locked` is still deliberately NOT
+# used, matching the binary crates' ci.yml: CI's sibling path-patch layout
+# resolves the freemkv crates as path packages, which `--locked` can't satisfy.
 
 jobs:
+  # ── Single source of truth for the MSRV ─────────────────────────────────────
+  #
+  # `rust-version` in Cargo.toml is the ONE place the MSRV is declared. This job
+  # reads it; every job that must build/test AT the MSRV consumes
+  # `needs.resolve-msrv.outputs.v` instead of a hardcoded pin, so the floor
+  # cannot drift out of sync across workflow files. The `test` job building
+  # green at this value IS the verification that the declared MSRV is real.
+  # clippy deliberately does NOT use it — it runs on `stable` (lint debt is
+  # caught against current Rust).
+  resolve-msrv:
+    runs-on: ubuntu-latest
+    outputs:
+      v: ${{ steps.msrv.outputs.v }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: msrv
+        shell: bash
+        run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
   # CI owns the changelog: main may never carry a released version without a
   # CHANGELOG.md entry for it. The release orchestrator dates an existing
   # `## [X.Y.Z]` heading — it does NOT invent one — so a version bump that
@@ -48,24 +69,36 @@ jobs:
           echo "::warning::${msg} (allowed on ${GITHUB_REF_NAME:-unknown}; required before it can reach main)."
 
   lint:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # fmt runs on the pinned MSRV toolchain; clippy runs on stable. Linting on
+      # stable makes new-lint debt a BLOCKING gate the pinned version would
+      # otherwise hide. The MSRV pin is installed second so it stays the default
+      # toolchain (fmt uses it implicitly); clippy is invoked with `+stable`.
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: freemkv-unlock-ci
       - run: cargo fmt --check
       # --all-targets so the test code is linted too, not just the library.
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo +stable clippy --all-targets -- -D warnings
 
   test:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: freemkv-unlock-ci
@@ -79,13 +112,15 @@ jobs:
   # release gate). It mirrors the `test` job's environment — same pinned
   # toolchain, ubuntu-latest, no `if:` so it runs on every branch and PR just
   # as `test` does. `--locked` is intentionally omitted to match this crate's
-  # policy (Cargo.lock is gitignored; --locked would fail without it).
+  # policy (Cargo.lock is committed but --locked can't satisfy the path-patch layout).
   coverage:
+    needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
         with:
@@ -98,6 +133,21 @@ jobs:
           files: lcov.info
           slug: freemkv/freemkv-unlock
           fail_ci_if_error: false
+
+  # cargo-deny gates the RESOLVED dependency graph: RUSTSEC advisories, a
+  # permissive licence allow-list, and source/ban hygiene. It mirrors the
+  # `test` job's checkout (single root checkout, no siblings) and runs on
+  # `stable` — advisory/licence debt is caught against current Rust, not the
+  # MSRV pin — so no `needs: resolve-msrv`.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          manifest-path: Cargo.toml
 
   # The crate ships on macOS and Windows through its consumers, so it has to
   # compile there. Build the tests (not just `cargo check`) — that forces
@@ -115,11 +165,14 @@ jobs:
     # than a slow one: release.sh's CI gate refuses while any run for the
     # commit is still in progress, so a never-scheduled job blocks releases
     # silently -- see the note on real-media in qa.yml.
+    needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: freemkv-unlock-ci
@@ -138,11 +191,14 @@ jobs:
     # than a slow one: release.sh's CI gate refuses while any run for the
     # commit is still in progress, so a never-scheduled job blocks releases
     # silently -- see the note on real-media in qa.yml.
+    needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: freemkv-unlock-ci

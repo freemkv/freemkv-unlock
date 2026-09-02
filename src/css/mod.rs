@@ -12,18 +12,9 @@ mod error;
 use crate::css::error::{Error, Result, step_err};
 use crate::scsi::{DataDirection, ScsiTransport};
 
-/// Issue ONE CSS bus-auth CDB, honouring the transport contract.
-///
-/// The single seam every bus-auth step now goes through. It closes two holes
-/// that each step open-coded before:
-///   * `Err` was collapsed to `CssAuthFailed`, so a dead bus looked like "this
-///     unlocker doesn't apply" and the consumer kept probing it ([`step_err`]);
-///   * `Ok` was never inspected, but per the contract a CHECK CONDITION arrives
-///     as `Ok` with a non-zero `status` — so a refused command handed the step
-///     back its own zero-filled buffer to parse as drive data.
-///
-/// `min_bytes` is the number of bytes the step must actually receive (0 for a
-/// write / no-data command, whose transferred count no transport promises).
+// Issue ONE CSS bus-auth CDB, honouring the transport contract: treats a
+// non-zero status as CssAuthFailed and checks bytes_transferred >= min_bytes
+// rather than trusting an unfilled buffer. See docs/css-mod.md#css_scsi.
 fn css_scsi(
     scsi: &mut dyn ScsiTransport,
     cdb: &[u8],
@@ -209,13 +200,9 @@ impl Default for DvdUnlocker {
 
 impl crate::Unlocker for DvdUnlocker {
     fn name(&self) -> &'static str {
-        // User-facing unlocker label. This unlocker's job is the DVD
-        // read-enablement bus-auth (it clears the drive's scrambled-read
-        // barrier and learns no key) — a property of the DVD medium, NOT of
-        // whether the content happens to be CSS-scrambled. Reporting it as
-        // "DVD" is honest: on any DVD the bus-auth ran; the CSS descramble
-        // itself is keyless and handled downstream, so it is not a separate
-        // "did an unlocker run" signal.
+        // "DVD" names the medium this bus-auth unlocks, not the CSS scheme:
+        // the bus-auth runs on any DVD regardless of whether the content is
+        // actually scrambled. See docs/css-mod.md#dvdunlocker-name.
         "DVD"
     }
 
@@ -227,10 +214,9 @@ impl crate::Unlocker for DvdUnlocker {
         scsi: &mut dyn ScsiTransport,
         _ctx: &crate::UnlockCtx,
     ) -> std::result::Result<crate::Unlocked, crate::UnlockError> {
-        // Self-guard against the hardware — do NOT trust the caller-declared
-        // DiscKind alone. If the drive does not report a DVD profile, refuse
-        // (NotApplicable) WITHOUT issuing any CSS CDB, so a mis-routed
-        // Blu-ray/UHD is never sent CSS bus-auth.
+        // Self-guard against the hardware, not just the caller-declared
+        // DiscKind: refuse (NotApplicable) without issuing any CSS CDB when
+        // the drive doesn't report a DVD profile.
         if !mounted_disc_is_dvd(scsi)? {
             tracing::debug!(
                 target: "freemkv::css",
@@ -247,14 +233,9 @@ impl crate::Unlocker for DvdUnlocker {
     }
 }
 
-/// Transport-level "is the mounted disc a DVD?" probe (GET CONFIGURATION
-/// current-profile, DVD family `0x0010..=0x001F`). Lets the DvdUnlocker
-/// self-verify against the drive instead of trusting the caller's DiscKind.
-///
-/// `Err(Transport)` on a dead bus. This is the FIRST command the DVD unlocker
-/// issues, and its match had no `Err` arm at all: a transport fault fell into
-/// `_ => false`, which the caller turned into `NotApplicable` — a dead bus read
-/// as "not a DVD", with nothing logged anywhere on the path.
+// Probes GET CONFIGURATION current-profile (DVD family 0x0010..=0x001F) so
+// DvdUnlocker can self-verify against the drive rather than trust the
+// caller's DiscKind. See docs/css-mod.md#mounted_disc_is_dvd.
 fn mounted_disc_is_dvd(
     scsi: &mut dyn ScsiTransport,
 ) -> std::result::Result<bool, crate::UnlockError> {
@@ -305,19 +286,16 @@ fn mounted_disc_is_dvd(
 
 fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()> {
     tracing::debug!(target: "freemkv::css", "css unlock: begin");
-    // The bus-auth challenge-response sets the drive's Authentication Success
-    // Flag (ASF=1), which is what opens scrambled-sector reads. This is the
-    // ONLY step required to unlock reads; a failure here is fatal — we
-    // genuinely cannot read scrambled sectors.
+    // The bus-auth challenge-response sets ASF=1, which is what opens
+    // scrambled-sector reads. It's the only required step, so a failure
+    // here is fatal.
     let agid = establish_authenticated_session(scsi).inspect_err(|e| {
         tracing::warn!(target: "freemkv::css", error_code = e.code(), "css unlock: bus authentication failed");
     })?;
     tracing::debug!(target: "freemkv::css", agid, "css unlock: bus authentication ok");
-    // Disc-key REPORT KEY: issued BEST-EFFORT for any firmware that ties part
-    // of its read-unlock to it. The bytes are unused (the descramble key is
-    // recovered keylessly) and a failure is NON-FATAL — the gate is already
-    // open from bus-auth. This replaces the title-key REPORT KEY, whose hard
-    // failure used to abort the whole unlock (the 7014 bug on USB bridges).
+    // Disc-key REPORT KEY: best-effort only, for firmware that ties part of
+    // its read-unlock to it; bytes are unused and failure is non-fatal.
+    // See docs/css-mod.md#disc-key-report-key (7014 bug history).
     if let Err(e) = read_disc_key(scsi, agid) {
         tracing::debug!(target: "freemkv::css", error_code = e.code(), "css unlock: disc-key REPORT KEY skipped (non-fatal)");
     }
@@ -327,14 +305,8 @@ fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()>
 
 // ── Step 1: Bus Authentication ────────────────────────────────────────────
 
-/// Run the CSS bus-authentication challenge-response (invalidate AGIDs →
-/// allocate AGID → host challenge → brute-force the variant → drive challenge →
-/// send host key). Completing the handshake sets the drive's Authentication
-/// Success Flag (ASF=1) — which is the ENTIRE purpose: it unlocks
-/// scrambled-sector reads. Returns the negotiated AGID (the caller needs it for
-/// the best-effort disc-key REPORT KEY). The CSS bus key is intentionally NOT
-/// derived: descrambling is keyless — the key is recovered directly from the
-/// data — so the bus key has no consumer.
+// Runs the CSS bus-auth handshake to set ASF=1 (invalidate AGIDs, allocate,
+// challenge/response). Returns the AGID; no bus key is derived. See docs/css-mod.md.
 fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     // Invalidate all AGIDs via REPORT KEY format 0x3F. This is also what makes
     // an abandoned AGID self-heal — which is not a reason to abandon one.
@@ -453,22 +425,15 @@ fn authenticate_with_agid(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> 
     )?;
 
     // The authenticated session (ASF=1) is now established — scrambled-sector
-    // reads are unlocked, which is the only thing we needed. The CSS bus key
-    // would be CryptKey(2, variant, key1 || key2), but it has no consumer
-    // (descrambling is keyless — the key is recovered directly from the
-    // data), so it is not derived.
+    // reads are unlocked. The CSS bus key would be CryptKey(2, variant,
+    // key1 || key2), but has no consumer (descrambling is keyless).
     Ok(())
 }
 
 // ── Step 2: Disc Key ──────────────────────────────────────────────────────
 
-/// Issue READ DVD STRUCTURE format 0x02 (the Disc Key block — opcode 0xAD, NOT
-/// the REPORT KEY 0xA4 disc-key block; format 0x01 is Copyright Information)
-/// purely for the bus-auth unlock side
-/// effect. The returned block contents are not used — the descramble title key
-/// is recovered keylessly elsewhere, so the genuine disc-key REPORT KEY is
-/// intentionally skipped. (If a drive is ever found where bus-auth alone does
-/// not open scrambled reads, a real REPORT KEY format 0x02 belongs here.)
+// Issues READ DVD STRUCTURE format 0x02 (opcode 0xAD) purely for its
+// bus-auth side effect; returned bytes are unused. See docs/css-mod.md#read_disc_key.
 fn read_disc_key(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
     // READ DVD STRUCTURE, format 0x02 (disc key), 2048+4 bytes
     let alloc_len: u16 = 2048 + 4;
@@ -493,10 +458,8 @@ fn read_disc_key(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
 
 fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
     // key_type indexes PERM_CHALLENGE ([_;3]); variant indexes
-    // VARIANTS/PERM_VARIANT ([_;32]). All internal callers pass key_type in
-    // 0..3 and variant in 0..32; the asserts document the contract for the
-    // pub(crate) test entry point test_crypt_key and turn a would-be
-    // out-of-bounds panic into an explicit precondition violation.
+    // VARIANTS/PERM_VARIANT ([_;32]). Asserts turn an out-of-bounds index
+    // into an explicit precondition violation. See docs/css-mod.md.
     debug_assert!(key_type < 3, "crypt_key: key_type out of range");
     debug_assert!((variant as usize) < 32, "crypt_key: variant out of range");
     let perm = &PERM_CHALLENGE[key_type];
@@ -650,14 +613,9 @@ fn send_key_cdb(agid: u8, format: u8, param_len: u16) -> [u8; 12] {
 mod tests {
     use super::*;
 
-    /// SECURITY REGRESSION GUARD: no instrumentation in libfreemkv may emit
-    /// raw key material. Scan every source file for a `tracing` field that
-    /// binds a forbidden key name to a value-producing expression (`= expr`
-    /// or `%expr` / `?expr`). The only allowed forms are a string literal
-    /// (e.g. `disc_key = "<redacted>"`) or a `_fp` fingerprint field.
-    ///
-    /// This is a source-scan test (not a runtime capture) so it stays cheap
-    /// and catches re-introductions at compile/CI time.
+    // SECURITY REGRESSION GUARD: scans source files for a `tracing` field
+    // binding a forbidden key name to a value expression (only a string
+    // literal or `_fp` field is allowed). See docs/css-mod.md#key-guard.
     #[test]
     fn no_key_bytes_in_instrumentation() {
         use std::path::Path;
@@ -709,10 +667,9 @@ mod tests {
                         continue;
                     }
                     for &name in forbidden {
-                        // A fingerprint field (`<name>_fp = ...`) is allowed.
-                        // Match `<name>` followed by optional fingerprint
-                        // suffix then `=` and a value that is NOT a string
-                        // literal redaction marker.
+                        // A fingerprint field (`<name>_fp = ...`) is allowed;
+                        // match `<name>` then `=` with a value that is not a
+                        // string-literal redaction marker.
                         if let Some(idx) = line.find(name) {
                             let after = &line[idx + name.len()..];
                             let after = after.trim_start();
@@ -743,10 +700,9 @@ mod tests {
             }
         }
 
-        // Scan this crate's `src` plus the sibling workspace crates so the
-        // key-material logging guard covers every crate that can reach the
-        // CSS/AACS internals, not just libfreemkv. Missing sibling dirs (e.g.
-        // when building the crate standalone) are simply skipped.
+        // Scan this crate's `src` plus sibling workspace crates so the
+        // guard covers everything that can reach CSS/AACS internals.
+        // Missing sibling dirs (standalone builds) are simply skipped.
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace = manifest.parent().unwrap_or(manifest);
         let mut violations = Vec::new();
@@ -796,15 +752,8 @@ mod tests {
 
     // ── CSS constant-table integrity ───────────────────────────────────────
 
-    /// Each PERM_CHALLENGE row is a permutation of indices 0..10 (it reorders
-    /// the 10 challenge bytes). A non-permutation would drop/duplicate
-    /// challenge bytes, weakening or corrupting the bus key derivation.
-    ///
-    /// Grounding: crypt_key does `scratch[i] = challenge[perm[i]]` for i in
-    /// 0..10 — perm must be a bijection on 0..10 to use every challenge byte
-    /// exactly once.
-    /// Mutation: change PERM_CHALLENGE[0] entry `9` to `8` (duplicate) -> the
-    /// "covers 0..10" assert fires.
+    // Each PERM_CHALLENGE row must be a permutation of indices 0..10; a
+    // non-permutation would drop/duplicate bytes. See docs/css-mod.md#perm-challenge-rows.
     #[test]
     fn perm_challenge_rows_are_permutations() {
         for (row, perm) in PERM_CHALLENGE.iter().enumerate() {
@@ -821,15 +770,9 @@ mod tests {
         }
     }
 
-    /// Each PERM_VARIANT row maps the 32 variants to 32 distinct 5-bit values
-    /// (it is a permutation of 0..32). key_type 1 uses PERM_VARIANT[0],
-    /// key_type 2 uses PERM_VARIANT[1] to pick the css_variant; a collision
-    /// would make two variants indistinguishable.
-    ///
-    /// Grounding: `css_variant = PERM_VARIANT[k][variant]` then indexes
-    /// VARIANTS[css_variant] (0..32).
-    /// Mutation: set PERM_VARIANT[0][1] = PERM_VARIANT[0][0] -> duplicate
-    /// assert fires; also any value >= 32 would later index VARIANTS OOB.
+    // Each PERM_VARIANT row must map the 32 variants to 32 distinct 5-bit
+    // values; a collision would make two variants indistinguishable.
+    // See docs/css-mod.md#perm-variant-rows.
     #[test]
     fn perm_variant_rows_are_permutations_of_0_31() {
         for (row, perm) in PERM_VARIANT.iter().enumerate() {
@@ -849,16 +792,8 @@ mod tests {
 
     // ── crypt_key behaviour ────────────────────────────────────────────────
 
-    /// crypt_key result depends on every challenge byte. The challenge is
-    /// permuted into `scratch` and folded through the LFSR seeding and the 6
-    /// XOR rounds. Flipping any single challenge byte must change the output.
-    ///
-    /// Grounding: scratch[i]=challenge[perm[i]] for all 10 i, and scratch
-    /// seeds both LFSRs (bytes 5..10 via tmp1) and the round terms (bytes
-    /// 0..5).
-    /// Mutation: in `scratch[i] = challenge[perm[i]]` replace with
-    /// `challenge[i]` for a perm that drops a byte — or hardcode one scratch
-    /// entry — and some challenge byte stops mattering; this fails.
+    // crypt_key's result must depend on every challenge byte: flipping any
+    // single byte must change the output. See docs/css-mod.md#crypt-key-byte-dependence.
     #[test]
     fn crypt_key_depends_on_every_challenge_byte() {
         let base: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -874,17 +809,9 @@ mod tests {
         }
     }
 
-    /// crypt_key(0, v, ..) must produce a DISTINCT result for each of the 32
-    /// variants on a fixed challenge. bus_auth brute-forces the variant by
-    /// matching crypt_key(0, v, host_challenge) == key1; if two variants
-    /// collided, the wrong variant could be selected and the whole auth
-    /// derail.
-    ///
-    /// Grounding: variant selects css_variant -> VARIANTS[css_variant] -> cse,
-    /// which feeds every round; distinct variants give distinct cse-driven
-    /// keys in practice.
-    /// Mutation: make `cse` ignore the variant (e.g. `let cse = 0`) -> all 32
-    /// outputs collapse to one value; the distinctness assert fires.
+    // crypt_key(0, v, ..) must be distinct for each of the 32 variants:
+    // bus-auth brute-forces the variant by matching against key1, so a
+    // collision could select the wrong one. See docs/css-mod.md.
     #[test]
     fn crypt_key_type0_distinct_per_variant() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -899,16 +826,9 @@ mod tests {
         }
     }
 
-    /// crypt_key enforces its documented precondition `key_type < 3` via
-    /// debug_assert (active in test builds). A key_type of 3 would index
-    /// PERM_CHALLENGE (len 3) out of bounds; the assert turns that into an
-    /// explicit precondition panic.
-    ///
-    /// Grounding: `debug_assert!(key_type < 3, ...)`; PERM_CHALLENGE has 3
-    /// rows (indices 0,1,2).
-    /// Mutation: delete the debug_assert AND the match-arm guard — but the
-    /// match `_ =>` arm would then index PERM_CHALLENGE[3] OOB and panic
-    /// differently; with the assert in place this test pins the contract.
+    // crypt_key's `key_type < 3` debug_assert must fire for key_type 3
+    // (which would otherwise index PERM_CHALLENGE out of bounds).
+    // See docs/css-mod.md#crypt-key-preconditions.
     #[test]
     #[should_panic]
     fn crypt_key_rejects_out_of_range_key_type() {
@@ -916,12 +836,9 @@ mod tests {
         let _ = crypt_key(3, 0, &challenge);
     }
 
-    /// crypt_key enforces `variant < 32` via debug_assert. A variant of 32
-    /// would index VARIANTS / PERM_VARIANT (len 32) out of bounds.
-    ///
-    /// Grounding: `debug_assert!((variant as usize) < 32, ...)`.
-    /// Mutation: removing the assert makes this index VARIANTS[32] (still a
-    /// panic, but unguarded); the assert documents/enforces the contract.
+    // crypt_key's `variant < 32` debug_assert must fire for variant 32
+    // (which would otherwise index VARIANTS/PERM_VARIANT out of bounds).
+    // See docs/css-mod.md#crypt-key-preconditions.
     #[test]
     #[should_panic]
     fn crypt_key_rejects_out_of_range_variant() {
@@ -931,17 +848,8 @@ mod tests {
 
     // ── SCSI CDB builders (MMC REPORT KEY / SEND KEY layout) ───────────────
 
-    /// report_key_cdb encodes a 12-byte MMC REPORT KEY (opcode 0xA4) CDB:
-    ///   byte 0  = operation code 0xA4
-    ///   bytes 8-9 = allocation length, big-endian
-    ///   byte 10 = (AGID << 6) | (key_format & 0x3F)
-    /// All other bytes are zero.
-    ///
-    /// Grounding: MMC REPORT KEY CDB; the AGID is the top 2 bits of byte 10,
-    /// key format the low 6 bits.
-    /// Mutation: change `(alloc_len >> 8)` to `alloc_len` for byte 8 (lose the
-    /// big-endian split) -> byte 8/9 assert fails. Change `agid << 6` to
-    /// `agid << 5` -> the AGID-position assert fails.
+    // report_key_cdb encodes a 12-byte MMC REPORT KEY (opcode 0xA4) CDB:
+    // byte 0=0xA4, bytes 8-9=big-endian len, byte 10=(AGID<<6)|(format&0x3F).
     #[test]
     fn report_key_cdb_matches_mmc_layout() {
         let cdb = report_key_cdb(0b10, 0x04, 0x010C); // AGID=2, format=0x04, len=268
@@ -962,26 +870,18 @@ mod tests {
         assert_eq!(cdb.len(), 12, "REPORT KEY is a 12-byte CDB");
     }
 
-    /// The key format field is masked to 6 bits: a format with high bits set
-    /// must not corrupt the AGID. report_key_cdb(0, 0xFF, _) -> byte 10 low 6
-    /// bits = 0x3F, AGID = 0.
-    ///
-    /// Grounding: `(agid << 6) | (format & 0x3F)`.
-    /// Mutation: drop the `& 0x3F` mask -> 0xFF would overwrite the AGID bits;
-    /// byte 10 would be 0xFF not 0x3F, this fails.
+    // The key-format field is masked to 6 bits so a format with high bits
+    // set (e.g. 0xFF) cannot corrupt the AGID bits of byte 10.
+    // See docs/css-mod.md#cdb-builders.
     #[test]
     fn report_key_cdb_masks_format_to_6_bits() {
         let cdb = report_key_cdb(0, 0xFF, 8);
         assert_eq!(cdb[10], 0x3F, "format masked to 6 bits, AGID stays 0");
     }
 
-    /// send_key_cdb encodes a 12-byte MMC SEND KEY (opcode 0xA3) CDB with the
-    /// parameter-list length at bytes 8-9 (big-endian) and AGID/format at byte
-    /// 10.
-    ///
-    /// Grounding: MMC SEND KEY CDB layout.
-    /// Mutation: change opcode to SCSI_REPORT_KEY -> opcode assert fails;
-    /// swap bytes 8/9 -> length assert fails.
+    // send_key_cdb encodes a 12-byte MMC SEND KEY (opcode 0xA3) CDB with the
+    // parameter-list length at bytes 8-9 (big-endian) and AGID/format at
+    // byte 10. See docs/css-mod.md#cdb-builders.
     #[test]
     fn send_key_cdb_matches_mmc_layout() {
         let cdb = send_key_cdb(0b11, 0x03, 0x000C); // AGID=3, format=3, param_len=12
@@ -996,16 +896,9 @@ mod tests {
         assert_eq!(cdb.len(), 12);
     }
 
-    /// Allocation length larger than 255 must split across bytes 8 (high) and
-    /// 9 (low) — a 16-bit big-endian field. report_key_cdb with alloc_len
-    /// 0x0804 (2052, the disc-key block size used in read_disc_key) -> byte 8
-    /// = 0x08, byte 9 = 0x04.
-    ///
-    /// Grounding: read_disc_key uses `alloc_len = 2048 + 4 = 2052 = 0x0804`
-    /// and writes `cdb[8] = (alloc_len >> 8); cdb[9] = alloc_len`.
-    /// Mutation: write only byte 9 (`cdb[9] = alloc_len as u8`) without byte 8
-    /// -> the drive sees a 4-byte transfer, truncating the disc-key block;
-    /// this asserts the high byte is present.
+    // Allocation length > 255 must split across bytes 8 (high) and 9 (low)
+    // as a 16-bit big-endian field, e.g. 0x0804 (the disc-key block size).
+    // See docs/css-mod.md#cdb-builders.
     #[test]
     fn report_key_cdb_alloc_len_is_16bit_big_endian() {
         let cdb = report_key_cdb(0, 0x00, 0x0804);
@@ -1013,10 +906,9 @@ mod tests {
         assert_eq!(cdb[9], 0x04, "low byte of 2052-byte transfer");
     }
 
-    /// The unlocker's user-facing name is "DVD" (the medium it read-unlocks),
-    /// not "CSS" (the scheme). Apps render the unlocker report from this name,
-    /// so it is a stable contract — the bus-auth ran on any DVD, encrypted or
-    /// not, and the report must say so rather than conflate it with a CSS crack.
+    // The unlocker's user-facing name is "DVD" (the medium), not "CSS" (the
+    // scheme); apps render the unlocker report from this name, so it is a
+    // stable contract.
     #[test]
     fn dvd_unlocker_is_named_dvd() {
         use crate::Unlocker;
@@ -1056,10 +948,9 @@ mod tests {
         assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
     }
 
-    /// Defense in depth: even when the caller declares `DiscKind::Css`, the
-    /// DvdUnlocker self-verifies against the drive's GET CONFIGURATION profile.
-    /// A drive reporting a Blu-ray profile → `NotApplicable`, and NOT a single
-    /// CSS CDB is issued (no bus-auth fired at a BD).
+    // Defense in depth: even when the caller declares `DiscKind::Css`,
+    // DvdUnlocker self-verifies against GET CONFIGURATION; a BD profile
+    // must yield NotApplicable with no CSS CDB issued.
     #[test]
     fn dvd_unlocker_self_guards_against_non_dvd() {
         use crate::scsi::{DataDirection, ScsiResult};
@@ -1120,11 +1011,9 @@ mod tests {
     use crate::scsi::mock::{MockTransport, Reply};
     use crate::{DiscKind, DriveId, UnlockCtx, UnlockError, Unlocker};
 
-    /// THE defect-7 test. `mounted_disc_is_dvd` is the FIRST command the DVD
-    /// unlocker issues and its match had no `Err` arm: a transport fault fell
-    /// into `_ => false`, so a dead bus was reported as "not a DVD"
-    /// (`NotApplicable`) and the consumer kept probing it — with nothing logged
-    /// anywhere on the path. Catches restoring that catch-all arm.
+    // Defect-7 regression: a transport fault on the first probe command
+    // must abort as Transport, not fall through to NotApplicable (which
+    // let the consumer keep probing a dead bus). See docs/css-mod.md.
     #[test]
     fn transport_fault_probing_for_a_dvd_aborts() {
         let id = DriveId::default();
@@ -1149,11 +1038,9 @@ mod tests {
         assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
     }
 
-    /// A DVD is mounted, then the bus dies during bus-auth. THE defect-2 test:
-    /// every CSS step used to do `.map_err(|_| CssAuthFailed)`, discarding the
-    /// `ScsiError` and making the `Transport` arm of the error conversion
-    /// unreachable from any real call site — so a dead bus arrived as
-    /// `NotApplicable` and the consumer went on probing it.
+    // Defect-2 regression: a DVD is mounted, then the bus dies mid
+    // bus-auth — must abort as Transport, not collapse to CssAuthFailed /
+    // NotApplicable. See docs/css-mod.md.
     #[test]
     fn transport_fault_during_bus_auth_aborts() {
         let id = DriveId::default();
@@ -1178,10 +1065,9 @@ mod tests {
         assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
     }
 
-    /// A conforming transport answering the AGID allocation with a CHECK
-    /// CONDITION must NOT let the handshake carry on off the caller's own
-    /// zero-filled buffer (agid 0, a challenge answered by zeros). Catches
-    /// dropping the `status` check in `css_scsi`.
+    // A CHECK CONDITION on AGID allocation must not let the handshake carry
+    // on off the caller's own zero-filled buffer; catches a dropped
+    // `status` check in `css_scsi`.
     #[test]
     fn agid_allocation_check_condition_fails_the_auth() {
         // 4 AGID invalidations are best-effort; the 5th command is the alloc.
@@ -1198,10 +1084,9 @@ mod tests {
         assert!(matches!(e, Error::CssAuthFailed));
     }
 
-    /// Defect 18: an AGID allocated and then lost to a failed challenge must be
-    /// RELEASED (REPORT KEY format 0x3F), not abandoned. A drive has four; the
-    /// leak self-heals because the next session invalidates all of them, but
-    /// leaving a drive short between attempts is a state we should not create.
+    // Defect 18: an AGID lost to a failed challenge must be RELEASED
+    // (REPORT KEY format 0x3F), not abandoned, even though a drive's four
+    // AGIDs self-heal on the next session's invalidation pass.
     #[test]
     fn a_failed_handshake_releases_the_agid_it_allocated() {
         let mut t = MockTransport::scripted(
@@ -1281,10 +1166,9 @@ mod tests {
         );
     }
 
-    /// Host challenge + Key1 both succeed, but the drive challenge REPORT KEY
-    /// (step 3) is refused. Distinct from `key1_report_failure_fails_the_auth`
-    /// (step 2) and `key2_send_failure_fails_the_auth` (step 4) below — each
-    /// pins a different `css_scsi` call site's `?`.
+    // Host challenge + Key1 succeed but the drive-challenge REPORT KEY
+    // (step 3) is refused; distinct from the step-2 and step-4 failure
+    // tests, each pinning a different `css_scsi` call site's `?`.
     #[test]
     fn drive_challenge_report_failure_fails_the_auth() {
         struct FailAtDriveChallenge(FakeDvdDrive);
@@ -1368,13 +1252,8 @@ mod tests {
 
     // ── Full happy-path bus-auth ────────────────────────────────────────────
 
-    /// A fake drive that plays its half of the CSS bus-auth handshake for
-    /// real: it captures the host's genuinely-random per-session challenge
-    /// and answers Key1 with the actual `crypt_key(0, variant, ..)` for a
-    /// fixed `variant`, so the host's brute-force loop matches it honestly
-    /// (not via a canned constant the loop happens to hit). Also answers
-    /// GET CONFIGURATION as a DVD and READ DVD STRUCTURE (disc key) as a
-    /// success, so the full `unlock_bus` path can be driven end to end.
+    // A fake drive that plays its half of the CSS handshake for real:
+    // answers Key1 honestly, and DVD/disc-key probes as success.
     struct FakeDvdDrive {
         variant: u8,
         host_challenge: [u8; 10],
@@ -1445,12 +1324,9 @@ mod tests {
         }
     }
 
-    /// End-to-end happy path for the bus-auth handshake: AGID allocation,
-    /// host challenge, a Key1 that genuinely matches the brute-forced
-    /// variant, the drive-challenge/Key2 exchange, and the disc-key REPORT
-    /// KEY all succeed. Exercises `establish_authenticated_session`'s `Ok`
-    /// return and `read_disc_key`'s success path, neither of which the
-    /// failure-path tests above reach.
+    // End-to-end happy path for the bus-auth handshake (AGID, challenge,
+    // Key1/Key2, disc-key REPORT KEY), exercising the `Ok` returns that
+    // the failure-path tests above never reach.
     #[test]
     fn full_bus_auth_and_disc_key_succeed() {
         let mut t = FakeDvdDrive {
@@ -1463,10 +1339,9 @@ mod tests {
         read_disc_key(&mut t, agid).expect("disc-key REPORT KEY succeeds");
     }
 
-    /// The same happy path driven through the public `unlock_bus` entry
-    /// point (DVD self-guard, full bus-auth, best-effort disc key), proving
-    /// `DvdUnlocker::unlock_bus` returns `Ok(Unlocked::default())` on success
-    /// — the path every failure-injection test above deliberately avoids.
+    // The same happy path through the public `unlock_bus` entry point,
+    // proving it returns `Ok(Unlocked::default())` on success — the path
+    // every failure-injection test above deliberately avoids.
     #[test]
     fn dvd_unlocker_succeeds_end_to_end() {
         let id = DriveId::default();
@@ -1497,10 +1372,9 @@ mod tests {
         unlock_css_reads(&mut t, 0).expect("css bus-auth + best-effort disc key succeed");
     }
 
-    /// A drive whose bus-auth succeeds but refuses the best-effort disc-key
-    /// REPORT KEY (CHECK CONDITION). `unlock_css_reads_inner` must swallow
-    /// that failure — the read barrier is already open from bus-auth, so the
-    /// whole unlock must still report `Ok`, not propagate the disc-key error.
+    // A drive whose bus-auth succeeds but refuses the best-effort disc-key
+    // REPORT KEY; `unlock_css_reads_inner` must swallow that failure since
+    // the read barrier is already open from bus-auth.
     struct DiscKeyRefusingDrive(FakeDvdDrive);
 
     impl ScsiTransport for DiscKeyRefusingDrive {
@@ -1532,10 +1406,9 @@ mod tests {
             .expect("bus-auth succeeded; a refused best-effort disc-key read must not fail it");
     }
 
-    /// `crypt_key`'s `key_type == 2` arm (`PERM_VARIANT[1]`) has no
-    /// production caller (only key_type 0, the variant brute-force, and 1,
-    /// the drive-challenge Key2, are ever invoked from `authenticate_with_agid`)
-    /// but is a pure, directly-testable function of its documented contract.
+    // `crypt_key`'s key_type==2 arm (`PERM_VARIANT[1]`) has no production
+    // caller (only 0 and 1 are invoked from `authenticate_with_agid`) but
+    // is a pure, directly-testable function.
     #[test]
     fn crypt_key_type2_is_deterministic_and_distinct_from_type1() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];

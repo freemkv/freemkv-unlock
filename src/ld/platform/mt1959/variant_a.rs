@@ -21,9 +21,8 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     }
 
     // Upload firmware via WRITE_BUFFER. The CDB's length is a 24-bit field;
-    // if the blob exceeds that, the encoded length would silently disagree
-    // with the bytes actually sent (`data`). Reject rather than upload a
-    // length-mismatched command.
+    // reject blobs that would exceed it rather than send a length-mismatched
+    // command.
     let len = firmware.len();
     if len > WRITE_BUFFER_MAX_LEN {
         return Err(crate::ld::error::Error::UnlockFailed);
@@ -43,12 +42,9 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     let mut data = firmware.clone();
     scsi.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
 
-    // Verify the firmware loaded (non-fatal — different buffer_id 0x45). There
-    // is no documented expected payload to compare against, so the outcome is
-    // TRACED rather than asserted: discarding it with `let _ =` meant a corrupt
-    // upload proceeded straight into the do_unlock retries with no diagnostic
-    // whatsoever, which is exactly the silent-failure shape this crate exists to
-    // avoid.
+    // Verify the firmware loaded (non-fatal — different buffer_id 0x45). No
+    // documented expected payload exists, so the outcome is traced rather
+    // than asserted, instead of silently discarded before the unlock retries.
     let verify_cdb = [
         super::SCSI_READ_BUFFER,
         super::MODE_A,
@@ -100,10 +96,9 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         }
     }
 
-    // Double unlock after firmware upload. The first establishes the
-    // unlock and is fatal on failure; the second is a confirmation pass and
-    // is best-effort (matching variant B), so a benign hiccup on the
-    // redundant call doesn't fail an already-successful unlock.
+    // Double unlock after firmware upload: first is fatal on failure, second
+    // is a best-effort confirmation pass (matching variant B) so a benign
+    // hiccup there doesn't fail an already-successful unlock.
     mt.do_unlock(scsi)?;
     let _ = mt.do_unlock(scsi);
     Ok(())

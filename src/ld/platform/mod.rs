@@ -31,10 +31,8 @@ mod tests {
     use super::*;
     use crate::scsi::mock::{MockTransport, Reply};
 
-    /// A minimal driver that takes every `PlatformDriver` default (`is_unlocked`)
-    /// so the shim's dispatch and the default's `false` are both exercised —
-    /// every real driver (`Mt1959`) overrides `is_unlocked`, so without this the
-    /// default body is dead in coverage even though it is reachable code.
+    // Minimal driver taking the `PlatformDriver` default `is_unlocked`, so
+    // the default's `false` path is exercised (real drivers override it).
     struct StubDriver;
 
     impl PlatformDriver for StubDriver {

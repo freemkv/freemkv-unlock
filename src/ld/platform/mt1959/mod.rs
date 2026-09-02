@@ -117,21 +117,17 @@ impl Mt1959 {
         expected: usize,
     ) -> Result<usize> {
         // The READ_BUFFER CDB transfer-length is a single byte; an
-        // `expected` above 255 cannot be expressed and would silently
-        // truncate. All in-crate callers pass small fixed sizes (4); guard
-        // the invariant rather than emit a malformed CDB.
+        // `expected` above 255 would silently truncate. Guard the
+        // invariant rather than emit a malformed CDB.
         debug_assert!(
             expected <= u8::MAX as usize,
             "read_buffer_probe expected exceeds 1-byte CDB length field"
         );
         let cdb = self.read_buffer_sub(sub_cmd, address, expected as u8);
         let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 5_000)?;
-        // A drive sense arrives as `Ok` with a non-zero status (the transport
-        // contract), and a merely SHORT response is the drive answering badly —
-        // neither is a dead bus. Fabricating a transport-failure status here
-        // turned a short probe reply into a hard abort of a rip that would
-        // otherwise have succeeded; a real transport fault still propagates
-        // through the `?` above with its own status.
+        // A drive sense arrives as `Ok` with a non-zero status; a merely
+        // SHORT response is the drive answering badly — neither is a dead
+        // bus. See docs/mt1959.md — short-probe-not-transport-failure.
         if result.status != 0 || result.bytes_transferred != expected {
             return Err(Error::Scsi {
                 opcode: SCSI_READ_BUFFER,
@@ -183,13 +179,9 @@ impl Mt1959 {
             });
         }
 
-        // `response` is a fixed 64-byte buffer, so `response.len()` is
-        // always >= every offset below — the meaningful bound is how many
-        // bytes the drive actually delivered. Every marker check MUST be
-        // reachable: when the checks were each guarded by their own `n >= ..`
-        // the drive delivering ZERO bytes skipped all three and `do_unlock`
-        // returned `Ok` on a buffer the drive never wrote. Require enough bytes
-        // to actually validate, up front.
+        // `response` is a fixed 64-byte buffer; the meaningful bound is how
+        // many bytes the drive actually delivered. Require enough bytes to
+        // validate before checking markers, up front. See docs/mt1959.md — min-unlock-response-length.
         let n = result.bytes_transferred.min(response.len());
         if n < MIN_UNLOCK_RESPONSE {
             tracing::debug!(
@@ -212,15 +204,9 @@ impl Mt1959 {
             return Err(Error::UnlockFailed);
         }
 
-        // Extended-access state is active when BOTH the per-drive
-        // signature matched AND the response carries the secondary
-        // marker at offset 16 (repeated through bytes 16..64) AND the
-        // primary mode marker at [12..16] is present. The active-mode
-        // marker at [12..16] is the primary gate; the [16..20] marker
-        // is the redundant confirmation the firmware writes through
-        // the rest of the response. Requiring both before we tell the
-        // upper layer "OEM path is live" keeps any partial / corrupted
-        // response from steering us off the cert-auth fallback.
+        // Extended-access state requires the signature match AND both the
+        // primary marker at [12..16] AND the secondary marker at [16..20].
+        // See docs/mt1959.md — unlock-marker-gating.
         self.unlocked =
             response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
 
@@ -295,11 +281,8 @@ impl Mt1959 {
                     );
                     return Err(Error::UnlockFailed);
                 }
-                // A transport fault means the bus is gone. Re-uploading firmware
-                // into a dead bus three times accomplishes nothing and the
-                // generic UnlockFailed it used to end on is classified as
-                // "unlocker not applicable", so the consumer kept probing a dead
-                // drive instead of aborting. Surface the fault unchanged.
+                // A dead bus must abort here, not be retried three times as
+                // firmware reloads. See docs/mt1959.md — run-init-transport-fault.
                 Err(e) if e.is_transport_failure() => {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -365,10 +348,8 @@ impl Mt1959 {
             self.do_unlock(scsi)?;
         }
 
-        // Detect disc type from capacity to select probe mode.
-        // BD:  3C 01 44 12 01 00 00 00 04 00  (init_addr = 0x0100)
-        // UHD: 3C 01 44 12 02 00 00 00 04 00  (init_addr = 0x0200)
-        // Empirically verified via SCSI capture: BD and UHD use different init addresses.
+        // Detect disc type from capacity to select probe mode (BD vs UHD
+        // init address). See docs/mt1959.md — probe-init-address-detection.
         let cap_cdb = [
             SCSI_READ_CAPACITY,
             0x00,
@@ -382,16 +363,12 @@ impl Mt1959 {
             0x00,
         ];
         let mut cap_buf = [0u8; READ_CAPACITY_RESPONSE_SIZE];
-        // A transport fault here is a dead bus: propagate it (the caller
-        // classifies it as `Transport` and aborts) instead of silently
-        // defaulting the disc type. A drive sense (`Ok`, non-zero status) or a
-        // short reply just means "capacity unknown" -> assume BD.
+        // A transport fault here is a dead bus: propagate it. A drive
+        // sense or short reply just means "capacity unknown" -> assume BD.
         let cap = scsi.execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000)?;
         let disc_sectors = if cap.status == 0 && cap.bytes_transferred >= 4 {
-            // last_lba + 1 = sector count. A 0xFFFFFFFF last-LBA is the
-            // READ CAPACITY(10) "capacity exceeds 32 bits" sentinel; saturate
-            // rather than wrap to 0 (which would misclassify a huge disc as
-            // BD). A saturated count stays above the UHD threshold -> UHD.
+            // last_lba + 1 = sector count; saturate on the 32-bit-overflow
+            // sentinel rather than wrap to 0. See docs/mt1959.md — capacity-saturation.
             u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]).saturating_add(1)
         } else {
             0
@@ -434,14 +411,9 @@ impl Mt1959 {
                     );
                 })
             {
-                // A dead bus MUST keep its transport classification: this loop is
-                // reached from `probe_disc`, whose caller aborts the rip only when
-                // it sees `Transport`. Flattening every failure to `UnlockFailed`
-                // (which classifies as "not applicable") let a bus that died mid
-                // speed-probe fall through to `Ok(Unlocked{drive_unlocked:true})`.
-                // A short / rejected probe reply is still the drive's OWN failure —
-                // keep it as `UnlockFailed` so it doesn't hard-abort a rip that
-                // could continue on the default speed table.
+                // A dead bus MUST keep its transport classification; a
+                // short/rejected reply is the drive's own failure and stays
+                // `UnlockFailed`. See docs/mt1959.md — probe-failure-classification.
                 if e.is_transport_failure() {
                     return Err(e);
                 }
@@ -450,10 +422,8 @@ impl Mt1959 {
             addr = addr.wrapping_add(PROBE_STEP);
         }
 
-        // Pass 2: continue past the coarse range. It used to restart at 0 with
-        // the SAME PROBE_STEP, re-issuing all 88 pass-1 addresses verbatim — 88
-        // redundant SCSI round-trips per disc, which dominates drive prep at
-        // real bus latency and teaches the drive's speed table nothing new.
+        // Pass 2: continue past the coarse range (do not restart at 0).
+        // See docs/mt1959.md — probe-pass-overlap-fix.
         let mut addr: u32 = PROBE_COARSE_END as u32;
         while addr < PROBE_FINE_END {
             let mut resp = [0u8; PROBE_RESPONSE_SIZE as usize];
@@ -464,12 +434,9 @@ impl Mt1959 {
                 &mut resp,
                 PROBE_RESPONSE_SIZE as usize,
             ) {
-                // Fine probing is best-effort — a short / rejected reply just ends
-                // the sweep early. But a bus that DIED here must not be swallowed:
-                // a bare `break` returned `Ok(())` from `run_probe`, so a dead bus
-                // mid-pass-2 vanished into `Ok(Unlocked{drive_unlocked:true})` with
-                // no log at all (the flagship failure-that-looks-like-success). A
-                // transport fault keeps its classification and aborts.
+                // Fine probing is best-effort — a short/rejected reply just ends
+                // the sweep early, but a transport fault must keep its
+                // classification and abort. See docs/mt1959.md — probe-pass2-transport-fault.
                 if e.is_transport_failure() {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -619,10 +586,9 @@ mod tests {
         assert_eq!(len, 2208, "MODE SELECT length = firmware.len(), not 2496");
     }
 
-    /// variant_a had no direct test at all (variant_b did). Pins its upload
-    /// sequence: WRITE_BUFFER carrying the firmware at its real per-drive
-    /// length in the CDB's 24-bit length field, then the 0x45 verify READ_BUFFER
-    /// whose result used to be discarded outright.
+    // Pins variant_a's upload sequence: WRITE_BUFFER at the real per-drive
+    // length in the CDB's 24-bit length field, then the 0x45 verify
+    // READ_BUFFER whose result used to be discarded outright.
     #[test]
     fn variant_a_uploads_at_the_real_length_and_issues_the_verify_read() {
         let mut profile = fixture_profile([0x11, 0x22, 0x33, 0x44]);
@@ -660,12 +626,9 @@ mod tests {
         assert!(t.cdbs.is_empty(), "no CDB may reach the drive");
     }
 
-    /// THE defect-15 test. A drive that returns ZERO bytes used to skip the
-    /// signature check, the firmware-active check AND the mode check — every
-    /// gate was individually guarded by its own `n >= ..` — so `do_unlock`
-    /// returned `Ok(vec![0u8; 64])` and (with the old `drive_unlocked: true`)
-    /// reported a fully unlocked drive. Catches restoring those per-check
-    /// guards.
+    // THE defect-15 test: a zero-byte response used to skip every marker
+    // check (each individually `n >= ..` guarded) and report a fully
+    // unlocked drive. See docs/mt1959.md — defect-15.
     #[test]
     fn do_unlock_rejects_a_zero_length_response() {
         let sig = [0x99, 0x9E, 0xC3, 0x75];
@@ -706,10 +669,9 @@ mod tests {
         assert!(!e.is_transport_failure(), "a sense is not a dead bus");
     }
 
-    /// THE defect-16 test (the inverse misclassification). A merely SHORT probe
-    /// response used to be fabricated into a transport-failure status, which
-    /// hard-aborts a rip that would otherwise have succeeded. Catches
-    /// reintroducing the fabricated 0xFF.
+    // THE defect-16 test: a merely short probe response used to be
+    // fabricated into a transport-failure status, hard-aborting a rip
+    // that would otherwise have succeeded.
     #[test]
     fn short_probe_response_is_not_a_transport_failure() {
         let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(
@@ -744,11 +706,9 @@ mod tests {
         assert!(e.is_transport_failure());
     }
 
-    /// THE defect-4 test. A dead bus must abort `run_init` at once. It used to
-    /// match `Err(_)` and re-upload firmware into the dead bus on all three
-    /// attempts, then return the generic `UnlockFailed`, which classifies as
-    /// `NotApplicable` — so the consumer kept probing. Catches removing the
-    /// `is_transport_failure` arm.
+    // THE defect-4 test: a dead bus must abort `run_init` at once, not
+    // re-upload firmware on all three attempts and return the generic
+    // `UnlockFailed`. See docs/mt1959.md — defect-4.
     #[test]
     fn run_init_aborts_on_a_transport_fault_without_reloading_firmware() {
         let mut t =
@@ -823,11 +783,9 @@ mod tests {
         }
     }
 
-    /// A drive SENSE (not a dead bus) during the coarse speed probe is the
-    /// drive's OWN failure, not a transport fault — `run_probe` must report
-    /// `UnlockFailed`, not `Transport`. The sibling of
-    /// `transport_fault_during_pass1_probe_stays_a_transport_failure`, which
-    /// only exercises the `is_transport_failure()` arm.
+    // A drive SENSE (not a dead bus) during the coarse probe is the
+    // drive's own failure — `run_probe` must report `UnlockFailed`, not
+    // `Transport`. Sibling of the pass-1 transport-fault test below.
     #[test]
     fn drive_sense_during_pass1_probe_is_unlock_failed_not_transport() {
         struct SenseAtFirstProbe;
@@ -866,12 +824,9 @@ mod tests {
         assert!(matches!(e, Error::UnlockFailed));
     }
 
-    /// THE probe pass-1 dead-bus test. A bus that dies during the coarse speed
-    /// probe must keep its transport classification out of `run_probe` so the
-    /// caller (`firmware_unlock`) aborts with `Transport` rather than reporting a
-    /// fully-unlocked drive.
-    /// MUTATION: flattening the pass-1 error to `Error::UnlockFailed` makes the
-    /// `is_transport_failure` assert go red (UnlockFailed maps to NotApplicable).
+    // THE probe pass-1 dead-bus test: a bus that dies during the coarse
+    // probe must keep its transport classification so the caller aborts
+    // with `Transport`. See docs/mt1959.md — pass1-dead-bus-mutation.
     #[test]
     fn transport_fault_during_pass1_probe_stays_a_transport_failure() {
         let mut t = ProbeFaultsTransport { fault_at: 0 };
@@ -884,12 +839,9 @@ mod tests {
         assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
     }
 
-    /// THE probe pass-2 dead-bus test. Pass 1 completes; the bus dies in the fine
-    /// probe. The loop used to `break` on ANY error and return `Ok(())`, so a
-    /// dead bus mid-pass-2 vanished into `Ok`. It must now propagate a transport
-    /// fault (a short/rejected fine probe still ends the sweep benignly).
-    /// MUTATION: restoring the bare `break` makes `expect_err` panic (run_probe
-    /// returns Ok).
+    // THE probe pass-2 dead-bus test: the loop used to `break` on ANY
+    // error and return `Ok(())`, swallowing a dead bus mid-pass-2. It
+    // must now propagate. See docs/mt1959.md — pass2-dead-bus-mutation.
     #[test]
     fn transport_fault_during_pass2_probe_stays_a_transport_failure() {
         let mut t = ProbeFaultsTransport {
@@ -904,10 +856,8 @@ mod tests {
         assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
     }
 
-    /// `validate`'s transport-abort branch had no test. A dead bus must propagate
-    /// as a transport fault on the FIRST attempt, not be retried five times.
-    /// MUTATION: turning the `Err(e) => return Err(Error::from(e))` arm into a
-    /// `continue` makes this exhaust to `UnlockFailed` and the assert go red.
+    // `validate`'s transport-abort branch: a dead bus must propagate on
+    // the first attempt, not be retried five times.
     #[test]
     fn validate_propagates_a_transport_fault_without_retrying() {
         let mut t =
@@ -932,13 +882,9 @@ mod tests {
         assert_eq!(t.calls(), 5, "retries the full five attempts");
     }
 
-    /// variant_a's firmware-verify-read transport-abort branch (~variant_a.rs:97)
-    /// had no test. WRITE_BUFFER succeeds, the 0x45 verify read faults: a dead bus
-    /// must abort THERE, not be swallowed into the unlock retries.
-    /// MUTATION: dropping the `if err.is_transport_failure() { return Err }` lets
-    /// execution fall through to `do_unlock` (scripted to answer, so it fails on
-    /// the signature as `UnlockFailed`), and the `is_transport_failure` assert
-    /// goes red — a genuine red-before-green, not green-both-ways.
+    // variant_a's firmware-verify-read transport-abort branch: WRITE_BUFFER
+    // succeeds, the 0x45 verify read faults — a dead bus must abort there,
+    // not be swallowed into the unlock retries. See docs/mt1959.md — variant-a-verify-read-transport-abort.
     #[test]
     fn variant_a_verify_read_transport_fault_aborts() {
         let mut profile = fixture_profile([0; 4]);
@@ -974,14 +920,9 @@ mod tests {
         assert!(t.cdbs.is_empty(), "no CDB may reach the drive");
     }
 
-    /// THE full success path: WRITE_BUFFER upload, a fully-good verify read
-    /// (exercising the `Ok(r) if status==0 && bytes_transferred==len` arm no
-    /// other variant_a test reaches), then BOTH `do_unlock` calls succeed —
-    /// the first fatally-gated, the second best-effort. Every other
-    /// variant_a test above deliberately stops short (empty firmware, a
-    /// dead bus, or `do_unlock` failing against `RecordingTransport`'s empty
-    /// response) — this is the only one that reaches `load_firmware`'s final
-    /// `Ok(())`.
+    // THE full success path: WRITE_BUFFER upload, a fully-good verify
+    // read, then both `do_unlock` calls succeed. The only variant_a test
+    // that reaches `load_firmware`'s final `Ok(())`.
     #[test]
     fn variant_a_load_firmware_succeeds_end_to_end() {
         let sig = [0x11, 0x22, 0x33, 0x44];
@@ -1002,12 +943,9 @@ mod tests {
         assert!(mt.init_complete, "do_unlock #1 must have set init_complete");
     }
 
-    /// variant_b had no transport-abort test. A firmware-upload STEP that hits a
-    /// dead bus (here the metadata read) must abort via `trace_step`, not be
-    /// swallowed and carried into the unlock retries.
-    /// MUTATION: dropping `trace_step`'s `if err.is_transport_failure()` return
-    /// lets execution reach `do_unlock` (scripted good → signature fails as
-    /// `UnlockFailed`), so the `is_transport_failure` assert goes red.
+    // variant_b's firmware-upload step (here the metadata read) hitting a
+    // dead bus must abort via `trace_step`, not be swallowed into the
+    // unlock retries. See docs/mt1959.md — variant-b-upload-step-transport-abort.
     #[test]
     fn variant_b_upload_step_transport_fault_aborts() {
         let mut profile = fixture_profile([0; 4]);
@@ -1056,12 +994,9 @@ mod tests {
         }
     }
 
-    /// Build a synthetic 64-byte unlock response.
-    ///
-    /// `mode_marker`: bytes [12..16]. Pass `FIRMWARE_ACTIVE_SIG` for the
-    /// active-mode primary marker.
-    /// `id_marker`:   bytes [16..20] (and repeated through [20..64] in
-    /// real responses; only [16..20] is checked).
+    // Build a synthetic 64-byte unlock response. `mode_marker` fills
+    // bytes [12..16]; `id_marker` fills bytes [16..20] (repeated through
+    // [20..64] in real responses; only [16..20] is checked).
     fn build_response(signature: [u8; 4], mode_marker: [u8; 4], id_marker: [u8; 4]) -> Vec<u8> {
         let mut r = vec![0u8; 64];
         r[0..4].copy_from_slice(&signature);
@@ -1144,11 +1079,9 @@ mod tests {
         assert_eq!(t.calls(), 1, "must not retry a signature mismatch");
     }
 
-    /// `run_init`'s retry loop: `do_unlock` fails generically (too short to
-    /// validate — not a signature mismatch, not a transport fault), the
-    /// firmware reload it falls back to also fails generically (an empty
-    /// firmware blob) rather than fatally, so the loop must `continue` and
-    /// try again — three times — before exhausting to the last error.
+    // `run_init`'s retry loop: a generic `do_unlock` failure plus a
+    // generic firmware-reload failure must `continue` and retry three
+    // times before exhausting to the last error.
     #[test]
     fn run_init_exhausts_after_three_generic_failures() {
         let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(
@@ -1168,11 +1101,9 @@ mod tests {
         );
     }
 
-    /// Same shape as `run_init_exhausts_after_three_generic_failures`, but for
-    /// a MODE_B (`is_variant_b = true`) drive — pins that `run_init`'s mode
-    /// dispatch (`self.mode == MODE_A`) actually reaches `variant_b::load_firmware`
-    /// and not just its `variant_a` sibling, which every other `run_init` test
-    /// above exercises exclusively.
+    // Same shape as the mode-A generic-failure test, but for a MODE_B
+    // drive — pins that `run_init`'s dispatch actually reaches
+    // `variant_b::load_firmware`, not just its variant_a sibling.
     #[test]
     fn run_init_exhausts_after_three_generic_failures_mode_b() {
         let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(
@@ -1190,10 +1121,9 @@ mod tests {
         );
     }
 
-    /// Same generic `do_unlock` failure, but this time the firmware-reload
-    /// fallback itself hits a dead bus. That must abort `run_init`
-    /// immediately (transport classification preserved), not be folded into
-    /// `last_err` and retried.
+    // Same generic `do_unlock` failure, but the firmware-reload fallback
+    // itself hits a dead bus — must abort `run_init` immediately, not be
+    // folded into `last_err` and retried.
     #[test]
     fn run_init_firmware_reload_transport_fault_aborts() {
         let mut profile = fixture_profile([0; 4]);
@@ -1232,10 +1162,9 @@ mod tests {
         assert!(mt.init_complete, "run_probe must do_unlock itself first");
     }
 
-    /// A READ CAPACITY drive sense (status != 0) means "capacity unknown" ->
-    /// `disc_sectors` falls back to 0, which is still below the UHD
-    /// threshold, so probing continues with the BD init address rather than
-    /// aborting.
+    // A READ CAPACITY drive sense means "capacity unknown" -> falls back
+    // to 0 sectors, which is below the UHD threshold, so probing
+    // continues with the BD init address rather than aborting.
     #[test]
     fn run_probe_capacity_check_condition_falls_back_to_zero_sectors() {
         struct CapacitySenseTransport;
@@ -1327,10 +1256,9 @@ mod tests {
         );
     }
 
-    /// The fine (pass-2) probe sweep ends early on a merely-rejected probe
-    /// reply (not a transport fault) — it must `break` out of the sweep and
-    /// let `run_probe` still return `Ok`, rather than propagating the drive's
-    /// refusal as a hard failure.
+    // The fine (pass-2) probe sweep ends early on a merely-rejected
+    // probe reply (not a transport fault) — it must `break` and let
+    // `run_probe` still return `Ok`.
     #[test]
     fn run_probe_pass2_ends_early_on_a_rejected_probe_without_failing() {
         struct Pass2RejectsTransport {

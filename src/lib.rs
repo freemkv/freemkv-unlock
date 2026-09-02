@@ -1,34 +1,28 @@
 //! freemkv-unlock — the unlock layer for the freemkv toolchain.
 //!
 //! An **unlocker removes a drive-level bus-encryption barrier** so the drive
-//! serves readable (de-bus'd / de-scrambled) sectors. Content-key decryption is
-//! a separate layer — the consumer's (libfreemkv's) job.
+//! serves readable (de-bus'd / de-scrambled) sectors. Content-key decryption
+//! is a separate layer — the consumer's (libfreemkv's) job.
 //!
-//! This crate defines the [`Unlocker`] contract + the SCSI transport contract,
-//! and holds the self-contained unlocker modules (firmware / AACS cert / CSS).
-//! libfreemkv depends on this crate and dispatches via [`all_unlockers`]; it
-//! never names an individual unlocker. To remove an unlocker, delete its module
-//! dir and its one line in [`all_unlockers`] — nothing else changes.
+//! This crate defines the [`Unlocker`] contract + the SCSI transport
+//! contract, and holds the self-contained unlocker modules (firmware / AACS
+//! cert / CSS). libfreemkv depends on this crate and dispatches via
+//! [`all_unlockers`]; it never names an individual unlocker directly.
 
 pub mod scsi;
 
 mod aacs;
 mod css;
-// `ld` is public ONLY for its drive-profile catalog (`ld::profiles` / the
-// `Profiles` object) and, under the `emulation` feature, the unlock-handshake
-// wire format the bdemu test-emulator needs. The unlocker impl itself
-// (`Mt1959Unlocker`) is `pub(crate)` — clients still reach unlockers only through
-// [`all_unlockers`]. `aacs` and `css` carry no such public catalog, so they
-// stay fully private.
+// `ld` is public only for its drive-profile catalog + (under `emulation`) the
+// handshake wire format bdemu needs; the unlocker impl stays `pub(crate)`.
+// See docs/module-visibility.md — module visibility rationale.
 pub mod ld;
-// `renesas` is public for its `is_renesas` drive-probe (which reports a dead
-// bus as `Err(UnlockError::Transport)` rather than "not a Renesas drive"); the unlocker impl
-// (`Renesas`) is `pub(crate)` — reached only through [`all_unlockers`].
+// `renesas` is public for its `is_renesas` drive-probe (dead bus vs. "not a
+// Renesas drive"); the unlocker impl stays `pub(crate)`.
+// See docs/module-visibility.md — module visibility rationale.
 pub mod renesas;
-// `freemkv` carries no public catalog (the firmware self-identifies rather
-// than matching a bundled profile) and no emulation wire format yet, so it
-// stays fully private — the unlocker impl (`FreemkvUnlocker`) is reached only
-// through [`all_unlockers`].
+// `freemkv` self-identifies rather than matching a bundled profile, so it
+// stays fully private. See docs/module-visibility.md — module visibility rationale.
 mod freemkv;
 
 use scsi::ScsiTransport;
@@ -95,13 +89,9 @@ pub struct Unlocked {
     pub drive_unlocked: bool,
 }
 
-// Hand-written, REDACTING Debug — `Unlocked` is the public carrier that leaves
-// this crate, and both `bus_key` (the AACS bus key) and `vid` (the Volume ID
-// that feeds VUK derivation) are key material that must never reach a log or a
-// test-failure message in plaintext. The `AacsAuth` / `CertHandshake` siblings
-// already redact; a derived `Debug` here would print the very bytes they hide.
-// Presence is still observable (Some/None) so a log can say WHETHER a key was
-// obtained without revealing WHAT it is.
+// Hand-written, REDACTING Debug: `bus_key`/`vid` are key material that must
+// never reach a log in plaintext; presence (Some/None) stays observable.
+// See docs/unlocked-debug-redaction.md — full rationale.
 impl std::fmt::Debug for Unlocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Unlocked")
@@ -206,11 +196,9 @@ pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
 mod tests {
     use super::*;
 
-    /// The dispatch order is a documented contract (`firmware → cert → css`) and
-    /// had NO test: `all_unlockers` is the one place an unlocker is named, and
-    /// the consumer stops at the first that doesn't decline, so reordering this
-    /// list silently changes which unlocker claims a drive. Catches a reorder,
-    /// a rename, and an accidental addition/removal.
+    // Dispatch order is a documented contract (`firmware → cert → css`); the
+    // consumer stops at the first unlocker that doesn't decline, so reordering
+    // this list silently changes which unlocker claims a drive.
     #[test]
     fn all_unlockers_dispatch_order_is_firmware_then_cert_then_css() {
         let names: Vec<&'static str> = all_unlockers().iter().map(|u| u.name()).collect();
@@ -265,10 +253,9 @@ mod tests {
         assert_eq!(unlocker_name(&DriveId::default()), None);
     }
 
-    /// `Unlocked` is the public carrier that leaves the crate, and its `bus_key`
-    /// and `vid` are key material. Its `Debug` must NOT print those bytes.
-    /// MUTATION: restoring `#[derive(Debug)]` prints the raw byte arrays, so the
-    /// distinctive marker bytes appear in the output and this goes red.
+    // `bus_key`/`vid` are key material; `Debug` must NOT print those bytes.
+    // MUTATION: restoring `#[derive(Debug)]` prints the raw byte arrays, so
+    // the marker bytes appear in the output and this test goes red.
     #[test]
     fn unlocked_debug_redacts_key_material() {
         let u = Unlocked {
