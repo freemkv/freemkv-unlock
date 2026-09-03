@@ -66,10 +66,6 @@ mod subfn {
 /// (no bundled profile database — the firmware self-identifies).
 const IDENTITY_MARKER: &[u8] = b"freemkv";
 
-/// Response buffer size for the Identity probe — comfortably larger than the
-/// current `"freemkv 0.6.4"` payload.
-const IDENTITY_RESPONSE_LEN: usize = 32;
-
 // Fixed response length for EVERY freemkv knock command; the drive commits this
 // many bytes on data-in regardless of subfn. A short/zero allocation desyncs the
 // transfer (ABORTED COMMAND, then a wedged FIFO) — see docs/freemkv-abi.md.
@@ -138,8 +134,11 @@ impl FreemkvUnlocker {
     // Ok(false) if rejected/mismatched (not this firmware). A dead bus is
     // Err(Transport) — this is the FIRST command, so a transport fault must abort.
     fn identify(&self, scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
-        let cdb = build_cdb(subfn::IDENTITY, STATE_OFF, IDENTITY_RESPONSE_LEN as u32);
-        let mut buf = vec![0u8; IDENTITY_RESPONSE_LEN];
+        // Identity MUST request the fixed KNOCK_RESP_LEN (64) allocation like
+        // every other knock: the firmware commits 64 bytes on every subfn, so a
+        // short 32-byte read desyncs the data-in phase and wedges the VID read.
+        let cdb = build_cdb(subfn::IDENTITY, STATE_OFF, KNOCK_RESP_LEN as u32);
+        let mut buf = [0u8; KNOCK_RESP_LEN];
         match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
             Ok(r) => {
                 let matched = r.status == 0
@@ -389,7 +388,7 @@ mod tests {
     }
 
     fn freemkv_identity_payload() -> Vec<u8> {
-        let mut p = vec![0u8; IDENTITY_RESPONSE_LEN];
+        let mut p = vec![0u8; KNOCK_RESP_LEN];
         let s = b"freemkv 0.6.4";
         p[..s.len()].copy_from_slice(s);
         p
@@ -409,7 +408,7 @@ mod tests {
     /// The 10-byte knock CDB layout is a pinned wire-format contract.
     #[test]
     fn build_cdb_encodes_the_knock_shape() {
-        let cdb = build_cdb(subfn::IDENTITY, STATE_OFF, IDENTITY_RESPONSE_LEN as u32);
+        let cdb = build_cdb(subfn::IDENTITY, STATE_OFF, KNOCK_RESP_LEN as u32);
         assert_eq!(cdb.len(), 10);
         assert_eq!(cdb[0], 0x3C);
         assert_eq!(cdb[1], 0x0E);
@@ -417,7 +416,7 @@ mod tests {
         assert_eq!(cdb[3], 0xDE);
         assert_eq!(cdb[4], subfn::IDENTITY);
         assert_eq!(cdb[5], 0x00);
-        assert_eq!([cdb[6], cdb[7], cdb[8]], [0x00, 0x00, 0x20]); // 32, 24-bit BE
+        assert_eq!([cdb[6], cdb[7], cdb[8]], [0x00, 0x00, 0x40]); // 64 (KNOCK_RESP_LEN), 24-bit BE
         assert_eq!(cdb[9], 0x00);
     }
 
@@ -454,8 +453,8 @@ mod tests {
     #[test]
     fn build_cdb_exact_bytes_per_subfn() {
         assert_eq!(
-            build_cdb(subfn::IDENTITY, STATE_OFF, IDENTITY_RESPONSE_LEN as u32),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x01, 0x00, 0x00, 0x00, 0x20, 0x00]
+            build_cdb(subfn::IDENTITY, STATE_OFF, KNOCK_RESP_LEN as u32),
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x01, 0x00, 0x00, 0x00, 0x40, 0x00]
         );
         // Toggles carry the fixed KNOCK_RESP_LEN (64 = 0x40) data-in allocation in
         // bytes 6..8 — the host must read the response or the drive wedges.
@@ -481,14 +480,14 @@ mod tests {
         assert!(FreemkvUnlocker::new().identify(&mut t).expect("no fault"));
         assert_eq!(
             t.cdbs[0],
-            build_cdb(subfn::IDENTITY, STATE_OFF, IDENTITY_RESPONSE_LEN as u32)
+            build_cdb(subfn::IDENTITY, STATE_OFF, KNOCK_RESP_LEN as u32)
         );
     }
 
     #[test]
     fn identify_false_on_non_matching_payload() {
         let mut t = FakeTransport {
-            payload: vec![0u8; IDENTITY_RESPONSE_LEN],
+            payload: vec![0u8; KNOCK_RESP_LEN],
         };
         assert!(!FreemkvUnlocker::new().identify(&mut t).expect("no fault"));
     }
