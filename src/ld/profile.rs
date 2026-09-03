@@ -3,7 +3,7 @@
 use crate::ld::error::{Error, Result};
 use serde::Deserialize;
 
-/// The Mt1959Unlocker profile catalog — the set of optical drives the firmware
+/// The LdUnlocker profile catalog — the set of optical drives the firmware
 /// unlocker recognizes, keyed by chipset + variant. Loaded from the bundled
 /// JSON; the public entry point is [`crate::ld::profiles`].
 #[derive(Debug, Deserialize)]
@@ -286,7 +286,7 @@ pub fn bundled() -> Option<&'static Profiles> {
                     target: "freemkv::disc",
                     phase = "bundled_profiles_parse_failed",
                     error_code = e.code(),
-                    "bundled Mt1959Unlocker profile catalog failed to parse; no drive can match"
+                    "bundled LdUnlocker profile catalog failed to parse; no drive can match"
                 );
                 None
             }

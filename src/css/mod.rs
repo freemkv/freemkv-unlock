@@ -206,30 +206,35 @@ impl crate::Unlocker for DvdUnlocker {
         "DVD"
     }
 
-    /// CSS removes the scrambled-sector barrier (a bus-level concern); it
-    /// provides no drive features. Self-guards against the hardware (below), so
-    /// it declines cleanly when the consumer iterates it on a non-DVD.
-    fn unlock_bus(
+    /// CSS removes the scrambled-sector barrier via bus-auth. Self-guards
+    /// against the hardware (below), so it declines cleanly (`Ok(None)`) when the
+    /// consumer iterates it on a non-DVD. `Some` once the bus-auth runs;
+    /// `Err(Transport)` on a dead bus. Yields no VID and no bus key (descrambling
+    /// is keyless — the returned `Unlocked` is empty).
+    fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         _ctx: &crate::UnlockCtx,
-    ) -> std::result::Result<crate::Unlocked, crate::UnlockError> {
+    ) -> std::result::Result<Option<crate::Unlocked>, crate::UnlockError> {
         // Self-guard against the hardware, not just the caller-declared
-        // DiscKind: refuse (NotApplicable) without issuing any CSS CDB when
-        // the drive doesn't report a DVD profile.
+        // DiscKind: decline without issuing any CSS CDB when the drive doesn't
+        // report a DVD profile.
         if !mounted_disc_is_dvd(scsi)? {
             tracing::debug!(
                 target: "freemkv::css",
                 phase = "dvd_unlocker_not_dvd",
-                "DvdUnlocker invoked on a non-DVD profile; refusing (NotApplicable)"
+                "DvdUnlocker invoked on a non-DVD profile; declining"
             );
-            return Err(crate::UnlockError::NotApplicable);
+            return Ok(None);
         }
-        // The bus-auth handshake is what unlocks scrambled-sector reads; the lba
-        // is not consumed by the unlock primitive (the disc-key REPORT KEY is
-        // best-effort). CSS yields neither a Volume ID nor an AACS bus key.
-        unlock_css_reads(scsi, 0)?;
-        Ok(crate::Unlocked::default())
+        // Bus-auth unlocks scrambled-sector reads (the lba isn't consumed here;
+        // the disc-key REPORT KEY is best-effort). A refused handshake falls
+        // through (`fallthrough` → `Ok(None)`); only a dead bus is an `Err`.
+        crate::fallthrough(
+            unlock_css_reads(scsi, 0)
+                .map(|()| crate::Unlocked::default())
+                .map_err(crate::UnlockError::from),
+        )
     }
 }
 
@@ -925,36 +930,13 @@ mod tests {
     }
 
     /// DvdUnlocker provides bus removal only — it never provides drive features.
-    #[test]
-    fn dvd_unlocker_provides_no_features() {
-        use crate::scsi::{DataDirection, ScsiResult};
-        use crate::{DiscKind, DriveId, UnlockCtx, UnlockError, Unlocker};
-        struct DeadTransport;
-        impl ScsiTransport for DeadTransport {
-            fn execute(
-                &mut self,
-                _cdb: &[u8],
-                _dir: DataDirection,
-                _data: &mut [u8],
-                _timeout_ms: u32,
-            ) -> crate::scsi::Result<ScsiResult> {
-                panic!("unlock_features must not touch the transport");
-            }
-        }
-        let id = DriveId::default();
-        let mut t = DeadTransport;
-        let r =
-            DvdUnlocker::new().unlock_features(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
-        assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
-    }
-
     // Defense in depth: even when the caller declares `DiscKind::Css`,
     // DvdUnlocker self-verifies against GET CONFIGURATION; a BD profile
     // must yield NotApplicable with no CSS CDB issued.
     #[test]
     fn dvd_unlocker_self_guards_against_non_dvd() {
         use crate::scsi::{DataDirection, ScsiResult};
-        use crate::{DiscKind, DriveId, UnlockCtx, UnlockError, Unlocker};
+        use crate::{DiscKind, DriveId, UnlockCtx, Unlocker};
 
         /// Reports a BD-ROM profile (0x0040) to GET CONFIGURATION and counts any
         /// other CDB (i.e. CSS bus-auth activity).
@@ -995,10 +977,9 @@ mod tests {
         };
 
         let mut t = BdTransport { non_config_cdbs: 0 };
-        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
-        assert_eq!(
-            r.unwrap_err(),
-            UnlockError::NotApplicable,
+        let r = DvdUnlocker::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css));
+        assert!(
+            r.expect("BD profile declines, not a hard error").is_none(),
             "a BD-profile drive must be refused"
         );
         assert_eq!(
@@ -1018,7 +999,7 @@ mod tests {
     fn transport_fault_probing_for_a_dvd_aborts() {
         let id = DriveId::default();
         let mut t = MockTransport::always(Reply::TransportFault);
-        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        let r = DvdUnlocker::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css));
         assert_eq!(r.unwrap_err(), UnlockError::Transport);
         assert_eq!(
             t.calls(),
@@ -1034,8 +1015,8 @@ mod tests {
     fn check_condition_probing_for_a_dvd_declines() {
         let id = DriveId::default();
         let mut t = MockTransport::always(Reply::illegal_request());
-        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
-        assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
+        let r = DvdUnlocker::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css));
+        assert!(r.expect("inconclusive probe declines").is_none());
     }
 
     // Defect-2 regression: a DVD is mounted, then the bus dies mid
@@ -1049,7 +1030,7 @@ mod tests {
         config[6] = 0x00;
         config[7] = 0x10;
         let mut t = MockTransport::scripted(vec![Reply::good(config)], Reply::TransportFault);
-        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
+        let r = DvdUnlocker::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css));
         assert_eq!(r.unwrap_err(), UnlockError::Transport);
     }
 
@@ -1061,8 +1042,8 @@ mod tests {
         let mut config = vec![0u8; 8];
         config[7] = 0x10;
         let mut t = MockTransport::scripted(vec![Reply::good(config)], Reply::illegal_request());
-        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
-        assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
+        let r = DvdUnlocker::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css));
+        assert!(r.expect("a refused bus-auth declines").is_none());
     }
 
     // A CHECK CONDITION on AGID allocation must not let the handshake carry
@@ -1339,9 +1320,9 @@ mod tests {
         read_disc_key(&mut t, agid).expect("disc-key REPORT KEY succeeds");
     }
 
-    // The same happy path through the public `unlock_bus` entry point,
-    // proving it returns `Ok(Unlocked::default())` on success — the path
-    // every failure-injection test above deliberately avoids.
+    // The same happy path through the public `unlock` entry point, proving it
+    // returns `Some(Unlocked::default())` on success — the path every
+    // failure-injection test above deliberately avoids.
     #[test]
     fn dvd_unlocker_succeeds_end_to_end() {
         let id = DriveId::default();
@@ -1349,14 +1330,12 @@ mod tests {
             variant: 3,
             host_challenge: [0u8; 10],
         };
-        let r = DvdUnlocker::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Css, &[]));
-        let unlocked = r.expect("full unlock succeeds");
+        let r = DvdUnlocker::new().unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Css));
+        let unlocked = r
+            .expect("full unlock succeeds")
+            .expect("DVD bus-auth unlocks the drive");
         assert!(unlocked.vid.is_none(), "CSS yields no Volume ID");
         assert!(unlocked.bus_key.is_none(), "CSS yields no AACS bus key");
-        assert!(
-            !unlocked.drive_unlocked,
-            "CSS is a bus-auth unlock, not a firmware drive-unlock"
-        );
     }
 
     /// `unlock_css_reads` (the crate-level public entry point, distinct from

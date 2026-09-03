@@ -1,4 +1,4 @@
-//! Platform-specific drive unlock + disc probing (Mt1959Unlocker internals).
+//! Platform-specific drive unlock + disc probing (LdUnlocker internals).
 
 pub mod mt1959;
 
@@ -18,7 +18,7 @@ pub(crate) trait PlatformDriver: Send {
     fn is_ready(&self) -> bool;
 
     /// True if the drive is currently in the extended-access state. THE gate
-    /// `Mt1959Unlocker::firmware_unlock` reports `drive_unlocked` from — `init()`
+    /// `LdUnlocker::firmware_unlock` reports `drive_unlocked` from — `init()`
     /// returning `Ok` only means the handshake completed, not that the drive
     /// serves clear content.
     fn is_unlocked(&self) -> bool {

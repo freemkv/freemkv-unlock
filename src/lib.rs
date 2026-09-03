@@ -6,13 +6,16 @@
 //!
 //! This crate defines the [`Unlocker`] contract + the SCSI transport
 //! contract, and holds the self-contained unlocker modules (firmware / AACS
-//! cert / CSS). libfreemkv depends on this crate and dispatches via
-//! [`all_unlockers`]; it never names an individual unlocker directly.
+//! cert / CSS). The consumer (libfreemkv) assembles its own dispatch list from
+//! the exported unlocker types and drives them all through the same trait.
 
 pub mod scsi;
 
 mod aacs;
 mod css;
+// Shared best-effort AACS Volume ID read, used by every route that opens the
+// drive to raw reads (freemkv / MT1959 / Renesas). See `vid`.
+mod vid;
 // `ld` is public only for its drive-profile catalog + (under `emulation`) the
 // handshake wire format bdemu needs; the unlocker impl stays `pub(crate)`.
 // See docs/module-visibility.md — module visibility rationale.
@@ -26,6 +29,15 @@ pub mod renesas;
 mod freemkv;
 
 use scsi::ScsiTransport;
+
+// The five unlockers, exposed as concrete types so the consumer assembles its
+// own dispatch list and injects each one's deps at construction (certs → AACS)
+// — no central factory to thread another unlocker's config through.
+pub use aacs::AacsUnlocker;
+pub use css::DvdUnlocker;
+pub use freemkv::FreemkvUnlocker;
+pub use ld::LdUnlocker;
+pub use renesas::Renesas;
 
 /// Drive identity an unlocker matches against — four raw INQUIRY-derived fields,
 /// filled by the consumer (this crate parses no INQUIRY itself).
@@ -61,32 +73,31 @@ pub struct HostCert {
     pub certificate_v2: Option<Vec<u8>>,
 }
 
-/// Context handed to an unlocker: drive identity, disc kind, and (for the cert
-/// route) the host certs the consumer collected.
+/// Per-attempt context the consumer hands to EVERY unlocker, uniformly: the
+/// drive identity and the mounted disc's kind. These are the shared facts the
+/// dispatch loop knows; anything an individual unlocker needs beyond them (the
+/// AACS cert route's host certs) is injected into THAT unlocker at construction,
+/// so the loop and the other unlockers never see it. See docs/module-visibility.md.
 pub struct UnlockCtx<'a> {
     pub drive_id: &'a DriveId,
     pub kind: DiscKind,
-    pub host_certs: &'a [HostCert],
 }
 
 impl<'a> UnlockCtx<'a> {
-    pub fn new(drive_id: &'a DriveId, kind: DiscKind, host_certs: &'a [HostCert]) -> Self {
-        Self {
-            drive_id,
-            kind,
-            host_certs,
-        }
+    pub fn new(drive_id: &'a DriveId, kind: DiscKind) -> Self {
+        Self { drive_id, kind }
     }
 }
 
-/// What removing bus encryption yielded. `drive_unlocked` means the drive now
-/// serves clear content (firmware route) — equivalent, for the gate, to a cert
-/// `bus_key`.
+/// What a successful unlock captured: the Volume ID (best-effort — may be `None`
+/// even on success) and, for the cert route, the bus key the read path applies
+/// to de-bus content. Returned inside the `Some` of [`Unlocker::unlock`]; there
+/// is no `drive_unlocked` flag — "unlocked" is simply `unlock()` returning
+/// `Some`, uniformly for every route.
 #[derive(Clone, Default)]
 pub struct Unlocked {
     pub vid: Option<[u8; 16]>,
     pub bus_key: Option<[u8; 16]>,
-    pub drive_unlocked: bool,
 }
 
 // Hand-written, REDACTING Debug: `bus_key`/`vid` are key material that must
@@ -97,7 +108,6 @@ impl std::fmt::Debug for Unlocked {
         f.debug_struct("Unlocked")
             .field("vid", &self.vid.map(|_| "[redacted]"))
             .field("bus_key", &self.bus_key.map(|_| "[redacted]"))
-            .field("drive_unlocked", &self.drive_unlocked)
             .finish()
     }
 }
@@ -120,47 +130,46 @@ pub enum UnlockError {
 }
 
 /// An unlocker removes a drive-level bus-encryption barrier. Implementors are
-/// the self-contained modules in this crate; the consumer only ever sees the
-/// trait, via [`all_unlockers`]. (Each module owns its own conversion from its
-/// internal error to [`UnlockError`].)
+/// the self-contained modules in this crate; the consumer drives them all
+/// through this trait. (Each module owns its own conversion from its internal
+/// error to [`UnlockError`].)
 ///
 /// NOTE: drive tuning (e.g. SET CD SPEED to lift riplock) is deliberately NOT
 /// here — that is the consumer's concern, not bus removal.
 pub trait Unlocker: Send + Sync {
-    /// Short, stable identifier for this unlocker (e.g. "MT1959", "AACS",
-    /// "DVD", "Renesas"). The ONE place a name lives — apps render the unlocker
-    /// report from [`all_unlockers`], never hardcoding names, so adding/removing
+    /// Short, stable identifier for this unlocker (e.g. "freemkv", "LD",
+    /// "AACS", "DVD", "Renesas"). The ONE place a name lives — apps render the
+    /// unlocker report from `name()`, never hardcoding names, so adding/removing
     /// an unlocker updates every report with no app change.
     fn name(&self) -> &'static str;
 
-    /// Unlock DRIVE FEATURES — riplock/speed, OEM Volume ID, OEM extended-access
-    /// reads. The consumer runs this at drive-prep, trying each unlocker until
-    /// one handles the drive. `Ok(_)` = this unlocker handled it (Mt1959Unlocker also
-    /// removes bus encryption at the drive, so its result carries
-    /// `drive_unlocked: true`); `Err(NotApplicable)` = not this unlocker's drive;
-    /// `Err(Transport)` = dead bus (the consumer aborts). Default: not provided.
-    fn unlock_features(
+    /// Attempt to unlock the drive, whatever the mechanism (vendor CDB, profile
+    /// firmware handshake, AACS cert AKE, CSS auth):
+    /// `Ok(Some(unlocked))` = this one unlocked it (read `vid`/`bus_key`, stop);
+    /// `Ok(None)` = not this unlocker's drive (try the next); `Err(Transport)` =
+    /// dead bus (abort). Only a dead bus is `Err` — a missing VID, rejected
+    /// handshake, missing cert, or wrong disc kind all fall through as `Ok(None)`
+    /// (the VID inside `Unlocked` is best-effort). `&self`: stateless, returns
+    /// what it learned rather than stashing it.
+    fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
-        let _ = (scsi, ctx);
-        Err(UnlockError::NotApplicable)
-    }
+    ) -> std::result::Result<Option<Unlocked>, UnlockError>;
+}
 
-    /// Remove BUS ENCRYPTION for the mounted disc (AACS host-cert handshake, or
-    /// CSS scrambled-sector auth). The consumer runs this only when the bus isn't
-    /// already clear, trying each unlocker until one handles it. Same `Ok` /
-    /// `Err(NotApplicable)` / `Err(Transport)` contract as
-    /// [`Unlocker::unlock_features`].
-    /// Default: not provided.
-    fn unlock_bus(
-        &self,
-        scsi: &mut dyn ScsiTransport,
-        ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
-        let _ = (scsi, ctx);
-        Err(UnlockError::NotApplicable)
+/// The shared "only a dead bus is fatal" rule every unlocker uses to turn its
+/// mechanism's `Result<Unlocked>` into the trait's outcome: success → `Some`, a
+/// dead bus → `Err(Transport)`, any other failure → `None` (fall through to the
+/// next unlocker). Written once here so the five unlockers stay identical in
+/// error handling and differ only in their CDBs and checks.
+pub(crate) fn fallthrough(
+    r: std::result::Result<Unlocked, UnlockError>,
+) -> std::result::Result<Option<Unlocked>, UnlockError> {
+    match r {
+        Ok(u) => Ok(Some(u)),
+        Err(UnlockError::Transport) => Err(UnlockError::Transport),
+        Err(_) => Ok(None),
     }
 }
 
@@ -173,75 +182,46 @@ pub fn unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
     ld::firmware_name(drive_id)
 }
 
-/// Every unlocker, in dispatch order (freemkv → firmware → cert → css). This
-/// is the ONLY place an unlocker is named. Remove one = delete its line here +
-/// its module dir; the consumer never changes.
-///
-/// `FreemkvUnlocker` runs FIRST: its detection is a single, unambiguous
-/// self-identification probe (the drive's own firmware answers `"freemkv"`)
-/// rather than a profile-catalog match, so it is the cheapest and most
-/// certain check to run before falling back to the MT1959 profile lookup or
-/// the Renesas/cert/css routes.
-pub fn all_unlockers() -> Vec<Box<dyn Unlocker>> {
-    vec![
-        Box::new(freemkv::FreemkvUnlocker::new()),
-        Box::new(ld::Mt1959Unlocker::new()),
-        Box::new(renesas::Renesas::new()),
-        Box::new(aacs::AacsCert::new()),
-        Box::new(css::DvdUnlocker::new()),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Dispatch order is a documented contract (`firmware → cert → css`); the
-    // consumer stops at the first unlocker that doesn't decline, so reordering
-    // this list silently changes which unlocker claims a drive.
-    #[test]
-    fn all_unlockers_dispatch_order_is_firmware_then_cert_then_css() {
-        let names: Vec<&'static str> = all_unlockers().iter().map(|u| u.name()).collect();
-        assert_eq!(names, vec!["freemkv", "MT1959", "Renesas", "AACS", "DVD"]);
+    // The canonical dispatch order the consumer assembles (freemkv → firmware →
+    // Renesas → cert → css). It lives in the consumer now (no factory), but the
+    // types are ours, so pin their names here so a rename is caught crate-local.
+    fn canonical_unlockers() -> Vec<Box<dyn Unlocker>> {
+        vec![
+            Box::new(FreemkvUnlocker::new()),
+            Box::new(LdUnlocker::new()),
+            Box::new(Renesas::new()),
+            Box::new(AacsUnlocker::new(Vec::new())),
+            Box::new(DvdUnlocker::new()),
+        ]
     }
 
-    /// Every unlocker declines by default rather than claiming a capability it
-    /// does not provide — and declines WITHOUT touching the transport, so the
-    /// consumer can iterate the whole registry on any drive.
     #[test]
-    fn unlockers_decline_capabilities_they_do_not_provide() {
-        struct DeadTransport;
-        impl scsi::ScsiTransport for DeadTransport {
-            fn execute(
-                &mut self,
-                _cdb: &[u8],
-                _dir: scsi::DataDirection,
-                _data: &mut [u8],
-                _timeout_ms: u32,
-            ) -> scsi::Result<scsi::ScsiResult> {
-                panic!("a declining unlocker must not issue a CDB");
-            }
-        }
-        let id = DriveId::default(); // matches no bundled profile
-        let ctx = UnlockCtx::new(&id, DiscKind::Unencrypted, &[]);
-        let mut t = DeadTransport;
-        for u in all_unlockers() {
-            // AACS/DVD provide no drive features; Mt1959Unlocker/Renesas are the
-            // feature unlockers but decline an unknown drive identity.
+    fn unlocker_names_are_stable() {
+        let names: Vec<&'static str> = canonical_unlockers().iter().map(|u| u.name()).collect();
+        assert_eq!(names, vec!["freemkv", "LD", "Renesas", "AACS", "DVD"]);
+    }
+
+    /// The uniform contract every unlocker obeys, whatever its mechanism: on a
+    /// DEAD BUS, `unlock()` either declined before touching it (`Ok(false)`) or
+    /// engaged it and reported the fault (`Err(Transport)`) — but NEVER claims a
+    /// dead bus as unlocked, and NEVER surfaces a non-`Transport` hard error.
+    /// This is the guardrail that was missing: it holds the next new unlocker to
+    /// the same discipline the loop relies on.
+    #[test]
+    fn no_unlocker_claims_a_dead_bus_or_hard_errors() {
+        let id = DriveId::default();
+        let ctx = UnlockCtx::new(&id, DiscKind::Aacs);
+        for u in canonical_unlockers() {
             let name = u.name();
-            if name == "AACS" || name == "DVD" {
-                assert_eq!(
-                    u.unlock_features(&mut t, &ctx).unwrap_err(),
-                    UnlockError::NotApplicable,
-                    "{name} must not claim drive features"
-                );
-            }
-            if name == "Renesas" {
-                assert_eq!(
-                    u.unlock_bus(&mut t, &ctx).unwrap_err(),
-                    UnlockError::NotApplicable,
-                    "{name} leaves bus removal to the cert unlocker"
-                );
+            let mut t = scsi::mock::MockTransport::always(scsi::mock::Reply::TransportFault);
+            match u.unlock(&mut t, &ctx) {
+                Ok(None) => {}                    // declined before touching — fine
+                Err(UnlockError::Transport) => {} // engaged, dead bus — fine
+                other => panic!("{name} violated the dead-bus contract: {other:?}"),
             }
         }
     }
@@ -261,7 +241,6 @@ mod tests {
         let u = Unlocked {
             vid: Some([0xAB; 16]),
             bus_key: Some([0xCD; 16]),
-            drive_unlocked: true,
         };
         let s = format!("{u:?}");
         // A derived Debug renders `[171, 171, ...]` (0xAB) / `[205, ...]` (0xCD).
@@ -270,6 +249,5 @@ mod tests {
         assert!(s.contains("[redacted]"), "must mark redaction: {s}");
         // Presence (Some/None) stays observable.
         assert!(s.contains("Some"), "must still show a key WAS present: {s}");
-        assert!(s.contains("drive_unlocked: true"));
     }
 }

@@ -75,16 +75,6 @@ const IDENTITY_RESPONSE_LEN: usize = 32;
 // transfer (ABORTED COMMAND, then a wedged FIFO) — see docs/freemkv-abi.md.
 const KNOCK_RESP_LEN: usize = 64;
 
-/// The 16-byte AACS Volume ID.
-const VID_LEN: usize = 16;
-
-/// AACS `READ DISC STRUCTURE` (`0xAD`) format for the Volume ID.
-const DISC_STRUCT_FMT_VID: u8 = 0x80;
-/// Response length requested for the format-0x80 VID structure: a 4-byte header,
-/// the 16-byte VID, and a 16-byte MAC. On the bare-read path (no AKE → no bus
-/// key) the MAC cannot be verified and is ignored; only `buf[4..20]` matters.
-const VID_STRUCT_LEN: u16 = 36;
-
 /// Bytes returned by one DumpAll (subfn 0x09) diagnostic read — the firmware
 /// always commits a fixed 64-byte window.
 const MEMREAD_LEN: usize = 64;
@@ -126,20 +116,6 @@ fn build_memread_cdb(addr: u32) -> [u8; 10] {
     ]
 }
 
-// Build the STANDARD AACS READ DISC STRUCTURE (0xAD) CDB for the Volume ID
-// (format 0x80, Blu-ray, AGID 0) — NOT a vendor knock; valid only once Raw
-// Read is on. Mirrors libfreemkv's read_volume_id.
-fn build_read_disc_structure_vid_cdb() -> [u8; 12] {
-    let mut cdb = [0u8; 12];
-    cdb[0] = crate::scsi::SCSI_READ_DISC_STRUCTURE;
-    cdb[1] = 0x01; // Blu-ray
-    cdb[7] = DISC_STRUCT_FMT_VID;
-    cdb[8] = (VID_STRUCT_LEN >> 8) as u8;
-    cdb[9] = (VID_STRUCT_LEN & 0xFF) as u8;
-    // cdb[10] = agid << 6; AGID 0 on the bare path (no AKE) → 0.
-    cdb
-}
-
 /// Whether a transport error is a genuine dead bus (a senseless
 /// transport-failure status) rather than a drive rejection surfaced through a
 /// non-conforming transport (`Err` carrying a sense).
@@ -147,13 +123,14 @@ fn is_dead_bus(e: &crate::scsi::ScsiError) -> bool {
     e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none()
 }
 
-// The freemkv custom-firmware unlocker; pub(crate) so clients reach it only via
-// crate::all_unlockers. Detection: subfn-01 Identity, checking the response starts
-// "freemkv" — no bundled profile catalog needed, unlike crate::ld::Mt1959Unlocker.
-pub(crate) struct FreemkvUnlocker;
+// The freemkv custom-firmware unlocker. Detection: subfn-01 Identity, checking
+// the response starts "freemkv" — no bundled profile catalog needed, unlike
+// crate::ld::LdUnlocker. Stateless: `unlock()` returns what it learned.
+#[derive(Default)]
+pub struct FreemkvUnlocker;
 
 impl FreemkvUnlocker {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         FreemkvUnlocker
     }
 
@@ -274,71 +251,6 @@ impl FreemkvUnlocker {
         self.send_state(scsi, subfn::RAW_READ, RAW_READ_CERT_VALID)
     }
 
-    // Read the AACS VID with a BARE 0xAD fmt 0x80 (valid only after set_raw_read):
-    // no AKE/cert/bus key needed; VID comes back clear at response[4..20], MAC at
-    // [20..36] is unverifiable and ignored. Ok/Err semantics: see docs/freemkv-abi.md.
-    fn read_vid(
-        &self,
-        scsi: &mut dyn ScsiTransport,
-    ) -> std::result::Result<[u8; VID_LEN], UnlockError> {
-        let cdb = build_read_disc_structure_vid_cdb();
-        let mut buf = [0u8; VID_STRUCT_LEN as usize];
-        let result = match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
-            Ok(r) => r,
-            Err(e) => {
-                if is_dead_bus(&e) {
-                    return Err(UnlockError::Transport);
-                }
-                tracing::debug!(
-                    target: "freemkv::disc",
-                    phase = "freemkv_vid_rejected_as_err",
-                    status = e.status,
-                    "bare VID read rejected (via Err); no Volume ID"
-                );
-                return Err(UnlockError::VidUnavailable);
-            }
-        };
-        // A drive sense arrives as Ok with a non-zero status; without this check
-        // a CHECK CONDITION's zero-filled buffer would parse as a VID.
-        if result.status != 0 {
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "freemkv_vid_check_condition",
-                status = result.status,
-                "bare VID read returned a drive sense (no medium / Raw Read not honoured)"
-            );
-            return Err(UnlockError::VidUnavailable);
-        }
-        // Need the 4-byte header + the 16-byte VID.
-        if result.bytes_transferred < 4 + VID_LEN {
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "freemkv_vid_short_response",
-                bytes_transferred = result.bytes_transferred,
-                "bare VID response too short"
-            );
-            return Err(UnlockError::VidUnavailable);
-        }
-        let mut vid = [0u8; VID_LEN];
-        vid.copy_from_slice(&buf[4..4 + VID_LEN]);
-        // An all-zero VID is what a permissive stub or an unfilled response
-        // leaves behind — reject it rather than pass a bogus key downstream.
-        if vid.iter().all(|&b| b == 0) {
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "freemkv_vid_all_zero",
-                "bare VID read returned an all-zero Volume ID"
-            );
-            return Err(UnlockError::VidUnavailable);
-        }
-        tracing::debug!(
-            target: "freemkv::disc",
-            phase = "freemkv_vid_ok",
-            "Volume ID retrieved via bare 0xAD read"
-        );
-        Ok(vid)
-    }
-
     /// DumpAll diagnostic RAM read (subfn 0x09): return the 64-byte window at
     /// `addr`. A host-side diagnostic path only — not used by the unlock flow.
     #[allow(dead_code)]
@@ -409,18 +321,17 @@ impl FreemkvUnlocker {
                 return Err(UnlockError::VidUnavailable);
             }
         }
-        // Bare 0xAD VID read (LOAD-BEARING). No VID ⇒ fail (propagates).
-        let vid = self.read_vid(scsi)?;
+        // Bare 0xAD VID read — the shared BEST-EFFORT reader (identical to the
+        // LD/Renesas routes). Raw Read already unlocked the drive, so a VID miss
+        // must not discard it: only a dead bus propagates (`?`), else `None`.
+        let vid = crate::vid::read_aacs_vid(scsi)?;
         tracing::debug!(
             target: "freemkv::disc",
             phase = "freemkv_unlocked",
-            "freemkv drive unlocked (Raw Read on, VID read)"
+            has_vid = vid.is_some(),
+            "freemkv drive unlocked (Raw Read on)"
         );
-        Ok(Unlocked {
-            vid: Some(vid),
-            bus_key: None,
-            drive_unlocked: true,
-        })
+        Ok(Unlocked { vid, bus_key: None })
     }
 }
 
@@ -429,26 +340,18 @@ impl Unlocker for FreemkvUnlocker {
         "freemkv"
     }
 
-    /// Unlock a freemkv drive at drive-prep: recognise it, lift riplock and
-    /// region (best-effort), turn on Raw Read, and read the Volume ID with a
-    /// bare `0xAD`. One pass turns every capability on and returns the VID.
-    fn unlock_features(
+    /// Recognise the drive by its Identity knock, lift riplock/region
+    /// (best-effort), turn on Raw Read (the actual unlock), and read the Volume
+    /// ID with a bare `0xAD` (best-effort). `Some` when Raw Read succeeded — the
+    /// drive is unlocked whether or not the VID read did; `None` if it isn't a
+    /// freemkv drive; `Err(Transport)` on a dead bus. `ctx` is unused: this
+    /// unlocker self-identifies rather than matching on drive identity.
+    fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         _ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
-        self.full_unlock(scsi)
-    }
-
-    /// Same full sequence as [`Unlocker::unlock_features`]: a freemkv drive is
-    /// unlocked in one pass, removing bus encryption (Raw Read on) and returning
-    /// the Volume ID.
-    fn unlock_bus(
-        &self,
-        scsi: &mut dyn ScsiTransport,
-        _ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
-        self.full_unlock(scsi)
+    ) -> std::result::Result<Option<Unlocked>, UnlockError> {
+        crate::fallthrough(self.full_unlock(scsi))
     }
 }
 
@@ -460,7 +363,7 @@ mod tests {
     use crate::scsi::{DataDirection, Result, ScsiResult, ScsiTransport};
 
     fn ctx(id: &crate::DriveId) -> UnlockCtx<'_> {
-        UnlockCtx::new(id, DiscKind::Unknown, &[])
+        UnlockCtx::new(id, DiscKind::Unknown)
     }
 
     /// Serves a fixed payload with a GOOD status (used for the Identity probe).
@@ -493,9 +396,10 @@ mod tests {
     }
 
     /// A well-formed format-0x80 VID structure: 4-byte header, 16-byte VID at
-    /// offset 4, 16-byte MAC (zeroed on the bare path — it isn't checked).
+    /// offset 4, 16-byte MAC (zeroed on the bare path — it isn't checked). 36 =
+    /// the fixed `0xAD` fmt-0x80 response length (see `crate::vid`).
     fn vid_ds_response(vid: [u8; 16]) -> Vec<u8> {
-        let mut p = vec![0u8; VID_STRUCT_LEN as usize];
+        let mut p = vec![0u8; 36];
         p[4..20].copy_from_slice(&vid);
         p
     }
@@ -567,18 +471,6 @@ mod tests {
             build_cdb(subfn::RAW_READ, RAW_READ_CERT_VALID, KNOCK_RESP_LEN as u32),
             [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x01, 0x00, 0x00, 0x40, 0x00]
         );
-    }
-
-    /// The bare VID read is the STANDARD 0xAD READ DISC STRUCTURE (format 0x80,
-    /// Blu-ray, AGID 0, len 36) — NOT a vendor knock.
-    #[test]
-    fn build_read_disc_structure_vid_cdb_is_standard_0xad_fmt_80() {
-        let cdb = build_read_disc_structure_vid_cdb();
-        assert_eq!(cdb[0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
-        assert_eq!(cdb[1], 0x01); // Blu-ray
-        assert_eq!(cdb[7], 0x80); // AACS Volume ID
-        assert_eq!([cdb[8], cdb[9]], [0x00, 0x24]); // 36, BE16
-        assert_eq!(cdb[10], 0x00); // AGID 0 (no AKE)
     }
 
     // ── Detection ────────────────────────────────────────────────────────
@@ -690,75 +582,9 @@ mod tests {
         assert_eq!(err, UnlockError::Transport);
     }
 
-    // ── Bare 0xAD VID read ───────────────────────────────────────────────
-
-    /// read_vid issues the STANDARD 0xAD READ DISC STRUCTURE and lifts the VID
-    /// from response[4..20].
-    #[test]
-    fn read_vid_issues_standard_0xad_and_parses_offset_4() {
-        let vid = [0x5Au8; 16];
-        let mut t = MockTransport::always(Reply::good(vid_ds_response(vid)));
-        let got = FreemkvUnlocker::new().read_vid(&mut t).expect("parse ok");
-        assert_eq!(got, vid);
-        assert_eq!(t.cdbs.len(), 1, "exactly one command");
-        assert_eq!(t.cdbs[0][0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
-        assert_eq!(t.cdbs[0][7], 0x80);
-    }
-
-    /// The MAC region (bytes 20..36) is ignored on the bare path — a zero MAC
-    /// still yields the VID.
-    #[test]
-    fn read_vid_ignores_the_unverifiable_mac() {
-        let vid: [u8; 16] = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
-            0xEE, 0xFF,
-        ];
-        let resp = vid_ds_response(vid); // MAC left zero
-        let mut t = MockTransport::always(Reply::good(resp));
-        assert_eq!(FreemkvUnlocker::new().read_vid(&mut t).expect("ok"), vid);
-    }
-
-    /// A response too short to carry header + VID → VidUnavailable.
-    #[test]
-    fn read_vid_short_response_is_vid_unavailable() {
-        let mut t = MockTransport::always(Reply::short(vid_ds_response([0x11; 16]), 19));
-        assert_eq!(
-            FreemkvUnlocker::new().read_vid(&mut t).unwrap_err(),
-            UnlockError::VidUnavailable
-        );
-    }
-
-    /// A CHECK CONDITION (no medium / Raw Read not honoured) → VidUnavailable,
-    /// never a VID parsed from the zero fill.
-    #[test]
-    fn read_vid_check_condition_is_vid_unavailable() {
-        let mut t = MockTransport::always(Reply::illegal_request());
-        assert_eq!(
-            FreemkvUnlocker::new().read_vid(&mut t).unwrap_err(),
-            UnlockError::VidUnavailable
-        );
-    }
-
-    /// An all-zero VID (permissive stub / unfilled response) is rejected.
-    #[test]
-    fn read_vid_all_zero_is_vid_unavailable() {
-        let mut t = MockTransport::always(Reply::good(vid_ds_response([0u8; 16])));
-        assert_eq!(
-            FreemkvUnlocker::new().read_vid(&mut t).unwrap_err(),
-            UnlockError::VidUnavailable
-        );
-    }
-
-    #[test]
-    fn read_vid_transport_fault_propagates() {
-        let mut t = MockTransport::always(Reply::TransportFault);
-        assert_eq!(
-            FreemkvUnlocker::new().read_vid(&mut t).unwrap_err(),
-            UnlockError::Transport
-        );
-    }
-
-    // ── full_unlock / unlock_features / unlock_bus ───────────────────────
+    // ── full_unlock / unlock ─────────────────────────────────────────────
+    // The bare 0xAD VID read itself is tested in crate::vid; here we cover the
+    // full unlock sequence end-to-end, including the best-effort VID handling.
 
     /// The full unlock runs `01→03→02→04→AD` in order: identity, region, speed,
     /// raw-read, bare VID read. This is the load-bearing sequence test.
@@ -776,11 +602,11 @@ mod tests {
             Reply::TransportFault,
         );
         let id = crate::DriveId::default();
-        let u = FreemkvUnlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .expect("recognized");
-        assert!(u.drive_unlocked, "Raw Read on ⇒ drive unlocked");
-        assert_eq!(u.vid, Some(vid));
+        let out = FreemkvUnlocker::new()
+            .unlock(&mut t, &ctx(&id))
+            .expect("no fault")
+            .expect("Raw Read on ⇒ unlocked");
+        assert_eq!(out.vid, Some(vid));
         // Four vendor knocks then the standard 0xAD read.
         assert_eq!(t.cdbs.len(), 5);
         let vendor_subfns: Vec<u8> = t.cdbs[..4].iter().map(|c| c[4]).collect();
@@ -804,17 +630,18 @@ mod tests {
             Reply::TransportFault,
         );
         let id = crate::DriveId::default();
-        let u = FreemkvUnlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .expect("recognized");
-        assert_eq!(u.vid, Some(vid));
-        assert!(u.drive_unlocked);
+        let out = FreemkvUnlocker::new()
+            .unlock(&mut t, &ctx(&id))
+            .expect("no fault")
+            .expect("unlocked");
+        assert_eq!(out.vid, Some(vid));
     }
 
-    /// Raw Read is LOAD-BEARING: if the drive rejects it, the unlock FAILS with
-    /// VidUnavailable — no fallback.
+    /// Raw Read is LOAD-BEARING: if the drive rejects it, this isn't an
+    /// unlockable freemkv drive, so `unlock()` declines (`Ok(false)`) and falls
+    /// through — never a hard error.
     #[test]
-    fn full_unlock_fails_when_raw_read_rejected() {
+    fn declines_when_raw_read_rejected() {
         let mut t = MockTransport::scripted(
             vec![
                 Reply::good(freemkv_identity_payload()), // identity
@@ -825,16 +652,20 @@ mod tests {
             Reply::TransportFault,
         );
         let id = crate::DriveId::default();
-        let err = FreemkvUnlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .unwrap_err();
-        assert_eq!(err, UnlockError::VidUnavailable);
+        assert!(
+            FreemkvUnlocker::new()
+                .unlock(&mut t, &ctx(&id))
+                .expect("no fault")
+                .is_none()
+        );
     }
 
-    /// No VID (Raw Read accepted but the bare read yields nothing) is a FAIL,
-    /// not an Ok with vid: None.
+    /// Best-effort VID: Raw Read succeeded (drive unlocked), but the bare VID
+    /// read was rejected — `unlock()` still returns `true`, with `vid() == None`.
+    /// This is the fix: the old load-bearing VID aborted the whole unlock here,
+    /// dropping a genuinely-unlocked drive to the cert path.
     #[test]
-    fn full_unlock_fails_when_no_vid() {
+    fn unlocks_without_vid_when_bare_read_fails() {
         let mut t = MockTransport::scripted(
             vec![
                 Reply::good(freemkv_identity_payload()), // identity
@@ -846,62 +677,35 @@ mod tests {
             Reply::TransportFault,
         );
         let id = crate::DriveId::default();
-        let err = FreemkvUnlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .unwrap_err();
-        assert_eq!(err, UnlockError::VidUnavailable);
+        let out = FreemkvUnlocker::new()
+            .unlock(&mut t, &ctx(&id))
+            .expect("no fault")
+            .expect("unlocked despite no VID");
+        assert_eq!(out.vid, None);
     }
 
     #[test]
-    fn unlock_features_not_applicable_on_non_freemkv_drive() {
+    fn declines_non_freemkv_drive() {
         let mut t = MockTransport::always(Reply::illegal_request());
         let id = crate::DriveId::default();
-        let err = FreemkvUnlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .unwrap_err();
-        assert_eq!(err, UnlockError::NotApplicable);
+        assert!(
+            FreemkvUnlocker::new()
+                .unlock(&mut t, &ctx(&id))
+                .expect("no fault")
+                .is_none()
+        );
     }
 
     #[test]
-    fn unlock_features_transport_fault_propagates() {
+    fn transport_fault_propagates() {
         let mut t = MockTransport::always(Reply::TransportFault);
         let id = crate::DriveId::default();
-        let err = FreemkvUnlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .unwrap_err();
-        assert_eq!(err, UnlockError::Transport);
-    }
-
-    /// unlock_bus runs the same full sequence and reports the VID + unlocked.
-    #[test]
-    fn unlock_bus_runs_full_sequence_and_reports_unlocked() {
-        let vid = [0x9Au8; 16];
-        let mut t = MockTransport::scripted(
-            vec![
-                Reply::good(freemkv_identity_payload()),
-                Reply::good(vec![]),
-                Reply::good(vec![]),
-                Reply::good(vec![]),
-                Reply::good(vid_ds_response(vid)),
-            ],
-            Reply::TransportFault,
+        assert_eq!(
+            FreemkvUnlocker::new()
+                .unlock(&mut t, &ctx(&id))
+                .unwrap_err(),
+            UnlockError::Transport
         );
-        let id = crate::DriveId::default();
-        let u = FreemkvUnlocker::new()
-            .unlock_bus(&mut t, &ctx(&id))
-            .expect("bus removed");
-        assert!(u.drive_unlocked);
-        assert_eq!(u.vid, Some(vid));
-    }
-
-    #[test]
-    fn unlock_bus_not_applicable_on_non_freemkv_drive() {
-        let mut t = MockTransport::always(Reply::illegal_request());
-        let id = crate::DriveId::default();
-        let err = FreemkvUnlocker::new()
-            .unlock_bus(&mut t, &ctx(&id))
-            .unwrap_err();
-        assert_eq!(err, UnlockError::NotApplicable);
     }
 
     // ── DumpAll (subfn 0x09) ─────────────────────────────────────────────

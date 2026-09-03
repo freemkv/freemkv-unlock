@@ -57,12 +57,15 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
     }
 }
 
-/// The Renesas-platform unlocker. `pub(crate)` — reached only through
-/// [`crate::all_unlockers`].
-pub(crate) struct Renesas;
+/// The Renesas/Pioneer-platform unlocker. Its vendor "open" CDB puts the drive
+/// in the same raw-read / extended-access state the firmware routes reach (this
+/// is what MakeMKV's LibreDrive does on stock Pioneer firmware), so the Volume
+/// ID is then read with the SAME standard `0xAD` reader as freemkv/MT1959 — no
+/// host cert, no AKE. Stateless: `unlock()` returns what it learned.
+pub struct Renesas;
 
 impl Renesas {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Renesas
     }
 
@@ -119,16 +122,19 @@ impl Unlocker for Renesas {
         "Renesas"
     }
 
-    // Gate on the `0xF1` SAT identity, then the vendor open read `0xB0@0x04`;
-    // `drive_unlocked: false` since AACS bus decryption is the cert's job.
-    // See docs/renesas-mod.md for the full MakeMKV-parity rationale.
-    fn unlock_features(
+    /// Gate on the `0xF1` SAT identity, then the vendor open read `0xB0@0x04`
+    /// (LOAD-BEARING — it's the unlock), then read the Volume ID with the shared
+    /// best-effort `0xAD` reader. `Some` once the open succeeds — the drive
+    /// serves clear content whether or not the bonus VID read did; `None` if it
+    /// isn't a Renesas drive or the open is refused; `Err(Transport)` on a dead
+    /// bus. See docs/renesas-mod.md for the MakeMKV-parity rationale.
+    fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         _ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
+    ) -> std::result::Result<Option<Unlocked>, UnlockError> {
         if !is_renesas(scsi)? {
-            return Err(UnlockError::NotApplicable);
+            return Ok(None);
         }
         if !Self::vendor_open(scsi)? {
             tracing::debug!(
@@ -136,18 +142,19 @@ impl Unlocker for Renesas {
                 phase = "renesas_open_rejected",
                 "Renesas drive recognized but RB 0xB0@0x04 refused; deferring to next unlocker"
             );
-            return Err(UnlockError::NotApplicable);
+            return Ok(None);
         }
+        // The open enabled raw reads (extended-access) — read the VID exactly as
+        // the firmware routes do. Best-effort: a VID miss must not discard the
+        // unlock (only a dead bus propagates via `?`).
+        let vid = crate::vid::read_aacs_vid(scsi)?;
         tracing::debug!(
             target: "freemkv::disc",
             phase = "renesas_opened",
-            "Renesas drive opened (RB 0xB0@0x04 GOOD); bus handled by cert"
+            has_vid = vid.is_some(),
+            "Renesas drive opened (RB 0xB0@0x04 GOOD, raw reads enabled)"
         );
-        Ok(Unlocked {
-            vid: None,
-            bus_key: None,
-            drive_unlocked: false,
-        })
+        Ok(Some(Unlocked { vid, bus_key: None }))
     }
 }
 
@@ -240,33 +247,35 @@ mod tests {
     }
 
     #[test]
-    fn features_report_match_without_bus_removal_on_renesas() {
+    fn opened_renesas_reports_unlocked_and_reads_vid() {
         let mut t = RenesasTransport {
             payload: renesas_payload(),
         };
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
-        // Recognized → Ok, but a feature-only unlock: bus NOT removed, no VID.
-        let u = Renesas::new()
-            .unlock_features(&mut t, &ctx)
-            .expect("renesas → Ok");
-        assert!(
-            !u.drive_unlocked,
-            "renesas does not remove the bus (cert does)"
-        );
-        assert_eq!(u.vid, None);
-        assert_eq!(u.bus_key, None);
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        // Recognized + vendor-open GOOD → unlocked; the open enables raw reads,
+        // so the standard 0xAD VID read returns a (non-zero) VID best-effort.
+        let out = Renesas::new()
+            .unlock(&mut t, &ctx)
+            .expect("no fault")
+            .expect("renesas → unlocked");
+        assert!(out.vid.is_some(), "opened drive yields a VID via 0xAD");
+        assert_eq!(out.bus_key, None, "raw-read route needs no bus key");
     }
 
     /// A drive REJECTION (ILLEGAL REQUEST, with a sense) is "not a Renesas
-    /// drive" → fall through to the next unlocker.
+    /// drive" → `Ok(false)`, fall through to the next unlocker.
     #[test]
-    fn features_not_applicable_on_non_renesas() {
+    fn declines_non_renesas() {
         let mut t = RejectingTransport;
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
-        let err = Renesas::new().unlock_features(&mut t, &ctx).unwrap_err();
-        assert_eq!(err, UnlockError::NotApplicable);
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert!(
+            Renesas::new()
+                .unlock(&mut t, &ctx)
+                .expect("non-renesas declines")
+                .is_none()
+        );
     }
 
     // Same rejection via a CONFORMING transport (`Ok` + CHECK CONDITION);
@@ -289,9 +298,9 @@ mod tests {
 
         let mut t = MockTransport::always(Reply::TransportFault);
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
         assert_eq!(
-            Renesas::new().unlock_features(&mut t, &ctx).unwrap_err(),
+            Renesas::new().unlock(&mut t, &ctx).unwrap_err(),
             UnlockError::Transport
         );
     }
@@ -333,22 +342,13 @@ mod tests {
         }
         let mut t = GateOkOpenRefused;
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown, &[]);
-        assert_eq!(
-            Renesas::new().unlock_features(&mut t, &ctx).unwrap_err(),
-            UnlockError::NotApplicable
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert!(
+            Renesas::new()
+                .unlock(&mut t, &ctx)
+                .expect("open refused → declines, not a hard error")
+                .is_none(),
+            "a refused vendor open must defer to the next unlocker"
         );
-    }
-
-    #[test]
-    fn does_not_provide_bus_removal() {
-        // Renesas leaves bus encryption to the cert: unlock_bus is the default.
-        let mut t = RenesasTransport {
-            payload: renesas_payload(),
-        };
-        let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Aacs, &[]);
-        let err = Renesas::new().unlock_bus(&mut t, &ctx).unwrap_err();
-        assert_eq!(err, UnlockError::NotApplicable);
     }
 }

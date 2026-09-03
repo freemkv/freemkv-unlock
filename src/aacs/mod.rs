@@ -12,7 +12,7 @@ use aes::Aes128;
 use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
 
 use crate::scsi::ScsiTransport;
-use crate::{DiscKind, UnlockCtx, UnlockError, Unlocked, Unlocker};
+use crate::{DiscKind, HostCert, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
 /// AES-128-ECB decrypt a single 16-byte block — used to decrypt the bus key /
 /// read_data_key the drive returns after the handshake.
@@ -25,53 +25,47 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     out
 }
 
-/// The AACS host-certificate unlocker. Matches a Blu-ray/UHD disc
-/// (`DiscKind::Aacs`) and runs the cert handshake against the host certs the
-/// consumer collected (via [`UnlockCtx::host_certs`]), learning the Volume ID
-/// and — on AACS 2.0 — the bus key.
-pub struct AacsCert;
+/// The AACS host-certificate unlocker — the fallback for a drive with NO vendor
+/// unlock (can't be raw-read-enabled), so the bus is removed by a real host-cert
+/// AKE + bus key rather than a CDB. The host certs are injected at CONSTRUCTION
+/// (the one place certs enter the system). Owns its AKE crypto — no reach into
+/// libfreemkv.
+pub struct AacsUnlocker {
+    host_certs: Vec<HostCert>,
+}
 
-impl AacsCert {
-    pub fn new() -> Self {
-        AacsCert
+impl AacsUnlocker {
+    pub fn new(host_certs: Vec<HostCert>) -> Self {
+        AacsUnlocker { host_certs }
     }
 }
 
-impl Default for AacsCert {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Unlocker for AacsCert {
+impl Unlocker for AacsUnlocker {
     fn name(&self) -> &'static str {
         "AACS"
     }
 
-    /// AACS removes BUS encryption via the host-cert handshake; it provides no
-    /// drive features. Self-guards on the disc kind (the consumer iterates every
-    /// unlocker's `unlock_bus`, so a non-AACS disc must decline here).
-    fn unlock_bus(
+    /// Remove AACS bus encryption via the host-cert handshake. Like every other
+    /// unlocker this DOES unlock the drive — just with a cert + AKE instead of a
+    /// vendor CDB. `Some` on a successful handshake (VID + bus key learned);
+    /// `None` on a non-AACS disc, no usable cert, or a rejected handshake (fall
+    /// through); `Err(Transport)` on a dead bus.
+    fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
-        if ctx.kind != DiscKind::Aacs {
-            return Err(UnlockError::NotApplicable);
+    ) -> std::result::Result<Option<Unlocked>, UnlockError> {
+        if ctx.kind != DiscKind::Aacs || self.host_certs.is_empty() {
+            // Wrong disc kind, or no host cert to authenticate with — the loop
+            // falls through to a VID-less / keysource path.
+            return Ok(None);
         }
-        if ctx.host_certs.is_empty() {
-            // No host cert to authenticate with — the consumer falls back to a
-            // VID-less / keysource path.
-            return Err(UnlockError::NoUsableHostCert);
-        }
-        let h = handshake::run_cert_handshake(scsi, ctx.host_certs)?;
-        Ok(Unlocked {
-            vid: Some(h.volume_id),
-            // Host-cert AKE path: bus removal depends on the bus key, not a
-            // firmware unlock.
-            bus_key: h.read_data_key,
-            drive_unlocked: false,
-        })
+        crate::fallthrough(
+            handshake::run_cert_handshake(scsi, &self.host_certs).map(|h| Unlocked {
+                vid: Some(h.volume_id),
+                bus_key: h.read_data_key,
+            }),
+        )
     }
 }
 
@@ -115,11 +109,11 @@ mod tests {
         crate::DriveId::default()
     }
 
-    /// `unlock_bus` self-guards on the disc kind: on a non-AACS disc it declines
-    /// (`NotApplicable`) WITHOUT touching the transport, so iterating it on a
-    /// CSS/unknown disc is safe.
+    /// Self-guards on the disc kind: on a non-AACS disc `unlock()` declines
+    /// (`Ok(false)`) WITHOUT touching the transport, even WITH a cert present —
+    /// so the reason is the kind, not a missing cert.
     #[test]
-    fn unlock_bus_declines_non_aacs_kinds() {
+    fn declines_non_aacs_kinds() {
         struct DeadTransport;
         impl ScsiTransport for DeadTransport {
             fn execute(
@@ -135,49 +129,41 @@ mod tests {
         let id = id();
         let mut t = DeadTransport;
         for k in [DiscKind::Unknown, DiscKind::Unencrypted, DiscKind::Css] {
-            let r = AacsCert::new().unlock_bus(&mut t, &UnlockCtx::new(&id, k, &[]));
-            assert_eq!(r.unwrap_err(), UnlockError::NotApplicable, "declines {k:?}");
+            assert!(
+                AacsUnlocker::new(vec![host_cert()])
+                    .unlock(&mut t, &UnlockCtx::new(&id, k))
+                    .expect("declines")
+                    .is_none(),
+                "declines {k:?}"
+            );
         }
     }
 
-    /// `Default` must delegate to `new()` (there is only one way to build an
-    /// `AacsCert`, so this pins the two constructors never drift apart).
+    // Full success path through `Unlocker::unlock`: a self-consistent AACS 1.0
+    // emulator proves the entry point learns `vid`/`bus_key` — and that the cert
+    // route reports `unlock() == true` (it DOES unlock the drive, via the cert).
     #[test]
-    #[allow(clippy::default_constructed_unit_structs)]
-    fn default_matches_new() {
-        let _ = AacsCert::default();
-        let _ = AacsCert::new();
-    }
-
-    // Full success path through `Unlocker::unlock_bus`: a self-consistent
-    // AACS 1.0 emulator proves the public entry point (not just
-    // `run_cert_handshake`) wires `volume_id`/`read_data_key` into `Unlocked`.
-    #[test]
-    fn unlock_bus_succeeds_end_to_end() {
+    fn unlock_succeeds_end_to_end() {
         let mut t = handshake::tests::DriveEmu::new();
         t.serve_data_keys = true;
         let id = id();
-        let certs = [host_cert()];
-        let ctx = UnlockCtx::new(&id, DiscKind::Aacs, &certs);
-        let unlocked = AacsCert::new()
-            .unlock_bus(&mut t, &ctx)
-            .expect("auth + VID + data-key reads all succeed");
-        assert_eq!(unlocked.vid, Some([0x5Au8; 16]));
-        assert!(unlocked.bus_key.is_some());
-        assert!(
-            !unlocked.drive_unlocked,
-            "cert path never sets drive_unlocked"
-        );
+        let ctx = UnlockCtx::new(&id, DiscKind::Aacs);
+        let out = AacsUnlocker::new(vec![host_cert()])
+            .unlock(&mut t, &ctx)
+            .expect("auth + VID + data-key reads all succeed")
+            .expect("the cert route unlocks the drive");
+        assert_eq!(out.vid, Some([0x5Au8; 16]));
+        assert!(out.bus_key.is_some());
     }
 
     fn host_cert() -> crate::HostCert {
         handshake::tests::dummy_cert()
     }
 
-    /// With no host certs there is nothing to authenticate with → NoUsableHostCert,
+    /// With no host certs there is nothing to authenticate with → `Ok(false)`,
     /// and the transport is never touched.
     #[test]
-    fn no_host_certs_is_no_usable_host_cert() {
+    fn no_host_certs_declines() {
         struct DeadTransport;
         impl ScsiTransport for DeadTransport {
             fn execute(
@@ -192,7 +178,11 @@ mod tests {
         }
         let id = id();
         let mut t = DeadTransport;
-        let r = AacsCert::new().unlock_bus(&mut t, &UnlockCtx::new(&id, DiscKind::Aacs, &[]));
-        assert_eq!(r.unwrap_err(), UnlockError::NoUsableHostCert);
+        assert!(
+            AacsUnlocker::new(vec![])
+                .unlock(&mut t, &UnlockCtx::new(&id, DiscKind::Aacs))
+                .expect("no certs declines")
+                .is_none()
+        );
     }
 }
