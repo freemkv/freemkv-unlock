@@ -46,14 +46,14 @@ pub fn profile(drive_id: &DriveId) -> Option<ProfileMatch> {
 #[cfg(feature = "emulation")]
 pub use cdb::{UNLOCK_MARKER, is_unlock_read_buffer};
 
-// The MT1959 unlocker, reached only through `crate::all_unlockers` (never by
-// name). Matches a drive against the bundled profile database and runs the
-// firmware-unlock + disc-speed-calibration handshake over raw SCSI.
-pub(crate) struct Mt1959Unlocker;
+// The MT1959 unlocker. Matches a drive against the bundled profile database and
+// runs the firmware-unlock + disc-speed-calibration handshake over raw SCSI.
+// Stateless: `unlock()` returns what it learned.
+pub struct LdUnlocker;
 
-impl Mt1959Unlocker {
-    pub(crate) fn new() -> Self {
-        Mt1959Unlocker
+impl LdUnlocker {
+    pub fn new() -> Self {
+        LdUnlocker
     }
 }
 
@@ -61,10 +61,10 @@ impl Mt1959Unlocker {
 /// drive-info "is this drive supported?" display), or `None`. A pure profile
 /// lookup — does NOT touch the drive or unlock anything.
 pub(crate) fn firmware_name(id: &DriveId) -> Option<&'static str> {
-    profile::find_bundled(id).map(|_| "MT1959")
+    profile::find_bundled(id).map(|_| "LD")
 }
 
-impl Mt1959Unlocker {
+impl LdUnlocker {
     // Read the OEM Volume ID via the matched profile's vendor CDB (profile passed
     // in to avoid a redundant 206-entry catalog scan). Ok(Some) on a well-formed
     // response; Ok(None) if unreadable; Err only on a transport fault.
@@ -118,7 +118,7 @@ impl Mt1959Unlocker {
     }
 }
 
-impl Mt1959Unlocker {
+impl LdUnlocker {
     // The MediaTek firmware unlock. Since it removes AACS at the drive (clear
     // content), this one op satisfies both features and bus-removal, so both
     // trait methods delegate here. See docs/ld-mod.md — firmware_unlock contract.
@@ -175,38 +175,26 @@ impl Mt1959Unlocker {
             );
         }
         let vid = self.read_oem_vid(scsi, &m.profile)?;
-        Ok(Unlocked {
-            vid,
-            bus_key: None,
-            drive_unlocked: true,
-        })
+        Ok(Unlocked { vid, bus_key: None })
     }
 }
 
-impl Unlocker for Mt1959Unlocker {
+impl Unlocker for LdUnlocker {
     fn name(&self) -> &'static str {
-        "MT1959"
+        "LD"
     }
 
-    /// Mt1959Unlocker provides drive features (riplock/speed, OEM VID) — and, because
-    /// its firmware unlock serves clear content, bus removal comes free with it.
-    fn unlock_features(
+    /// Match the drive against the bundled profile database and run the firmware
+    /// unlock — one op that removes bus encryption at the drive (clear content)
+    /// and reads the OEM Volume ID (best-effort). `Some` when the firmware
+    /// handshake reached the extended-access state; `None` for an unknown drive
+    /// or an incomplete handshake; `Err(Transport)` on a dead bus.
+    fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
         ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
-        self.firmware_unlock(scsi, ctx)
-    }
-
-    /// Same firmware code as [`unlock_features`]: Mt1959Unlocker removes the bus at
-    /// the drive. In practice the consumer skips this because drive-prep already
-    /// set `drive_unlocked`; it's here for completeness / a bus-first call order.
-    fn unlock_bus(
-        &self,
-        scsi: &mut dyn ScsiTransport,
-        ctx: &UnlockCtx,
-    ) -> std::result::Result<Unlocked, UnlockError> {
-        self.firmware_unlock(scsi, ctx)
+    ) -> std::result::Result<Option<Unlocked>, UnlockError> {
+        crate::fallthrough(self.firmware_unlock(scsi, ctx))
     }
 }
 
@@ -219,7 +207,7 @@ mod tests {
     /// Unlock context for a fake drive id (kind/host-certs irrelevant to the
     /// firmware unlocker — it keys off the drive identity).
     fn ctx(id: &DriveId) -> UnlockCtx<'_> {
-        UnlockCtx::new(id, DiscKind::Unknown, &[])
+        UnlockCtx::new(id, DiscKind::Unknown)
     }
 
     /// A fake transport that fills the response buffer from a fixed payload and
@@ -285,7 +273,7 @@ mod tests {
             payload,
             bytes_transferred: 36,
         };
-        let got = Mt1959Unlocker::new()
+        let got = LdUnlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("parse ok");
         assert_eq!(got, Some(vid), "VID parsed from [4..20]");
@@ -298,7 +286,7 @@ mod tests {
             payload: vec![0u8; 36],
             bytes_transferred: 20,
         };
-        let got = Mt1959Unlocker::new()
+        let got = LdUnlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("short response is Ok(None)");
         assert_eq!(got, None);
@@ -313,7 +301,7 @@ mod tests {
             payload,
             bytes_transferred: 36,
         };
-        let got = Mt1959Unlocker::new()
+        let got = LdUnlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("bad header is Ok(None)");
         assert_eq!(got, None);
@@ -326,7 +314,7 @@ mod tests {
     fn read_oem_vid_check_condition_is_none_not_a_vid() {
         use crate::scsi::mock::{MockTransport, Reply};
         let mut t = MockTransport::always(Reply::illegal_request());
-        let got = Mt1959Unlocker::new()
+        let got = LdUnlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect("a drive sense is not a transport fault");
         assert_eq!(got, None, "a CHECK CONDITION must never yield a VID");
@@ -338,7 +326,7 @@ mod tests {
     fn read_oem_vid_transport_fault_propagates() {
         use crate::scsi::mock::{MockTransport, Reply};
         let mut t = MockTransport::always(Reply::TransportFault);
-        let err = Mt1959Unlocker::new()
+        let err = LdUnlocker::new()
             .read_oem_vid(&mut t, &known_vid_profile())
             .expect_err("a dead bus must not be Ok(None)");
         assert!(err.is_transport_failure());
@@ -354,7 +342,7 @@ mod tests {
             payload: vec![0u8; 36],
             bytes_transferred: 36,
         };
-        let got = Mt1959Unlocker::new()
+        let got = LdUnlocker::new()
             .read_oem_vid(&mut t, &p)
             .expect("no CDB is Ok(None)");
         assert_eq!(got, None);
@@ -377,13 +365,13 @@ mod tests {
             payload: vec![0u8; 36],
             bytes_transferred: 36,
         };
-        let err = Mt1959Unlocker::new()
-            .unlock_features(
+        let unlocked = LdUnlocker::new()
+            .unlock(
                 &mut t,
                 &ctx(&make_drive_id("FAKE-VND", "9.99", "XX12345", "")),
             )
-            .expect_err("no profile → NotApplicable");
-        assert_eq!(err, UnlockError::NotApplicable);
+            .expect("no profile → declines, not a hard error");
+        assert!(unlocked.is_none());
     }
 
     // THE defect-1 test: response carries the signature + primary marker but not
@@ -405,17 +393,20 @@ mod tests {
         resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
 
         let mut t = MockTransport::always(Reply::good(resp));
-        let err = Mt1959Unlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .expect_err("a half-unlocked drive must fall through to cert-auth");
-        assert_eq!(err, UnlockError::NotApplicable);
+        let unlocked = LdUnlocker::new()
+            .unlock(&mut t, &ctx(&id))
+            .expect("a half-unlock declines, not a hard error");
+        assert!(
+            unlocked.is_none(),
+            "a half-unlocked drive must fall through to cert-auth"
+        );
     }
 
-    /// The whole-unlock happy path still reports `drive_unlocked` when BOTH
-    /// firmware markers are present — the `is_unlocked()` gate must not have
-    /// made a genuinely unlocked drive fall through.
+    /// The whole-unlock happy path still reports unlocked when BOTH firmware
+    /// markers are present — the `is_unlocked()` gate must not have made a
+    /// genuinely unlocked drive fall through.
     #[test]
-    fn fully_unlocked_drive_reports_drive_unlocked() {
+    fn fully_unlocked_drive_reports_unlocked() {
         use crate::scsi::mock::{MockTransport, Reply};
         let id = known_vid_drive_id();
         let sig = profile::find_bundled(&id)
@@ -429,10 +420,13 @@ mod tests {
         resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
 
         let mut t = MockTransport::always(Reply::good(resp));
-        let u = Mt1959Unlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .expect("both markers → unlocked");
-        assert!(u.drive_unlocked);
+        assert!(
+            LdUnlocker::new()
+                .unlock(&mut t, &ctx(&id))
+                .expect("no fault")
+                .is_some(),
+            "both markers → unlocked"
+        );
     }
 
     // THE probe-disc dead-bus test: bus dies during speed calibration after a
@@ -481,8 +475,8 @@ mod tests {
         resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]); // secondary marker
         let mut t = ProbeFaultsDrive { resp };
 
-        let err = Mt1959Unlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
+        let err = LdUnlocker::new()
+            .unlock(&mut t, &ctx(&id))
             .expect_err("a dead bus during probe must abort, not report success");
         assert_eq!(err, UnlockError::Transport);
     }
@@ -532,34 +526,12 @@ mod tests {
             }
         }
         let mut t = ProbeSenseDrive { resp };
-        let u = Mt1959Unlocker::new()
-            .unlock_features(&mut t, &ctx(&id))
-            .expect("a calibration miss must not fail the whole unlock");
-        assert!(u.drive_unlocked);
-    }
-
-    /// `unlock_bus` is the same firmware code as `unlock_features` (bus removal
-    /// comes free with the drive unlock) — pins that the trait method actually
-    /// delegates rather than being an accidental no-op stub.
-    #[test]
-    fn unlock_bus_delegates_to_the_same_firmware_unlock() {
-        use crate::scsi::mock::{MockTransport, Reply};
-        let id = known_vid_drive_id();
-        let sig = profile::find_bundled(&id)
-            .expect("profile")
-            .profile
-            .signature;
-
-        let mut resp = vec![0u8; 64];
-        resp[0..4].copy_from_slice(&sig);
-        resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
-        resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
-
-        let mut t = MockTransport::always(Reply::good(resp));
-        let u = Mt1959Unlocker::new()
-            .unlock_bus(&mut t, &ctx(&id))
-            .expect("unlock_bus runs the same firmware handshake");
-        assert!(u.drive_unlocked);
+        assert!(
+            LdUnlocker::new()
+                .unlock(&mut t, &ctx(&id))
+                .expect("a calibration miss must not fail the whole unlock")
+                .is_some()
+        );
     }
 
     /// Catches classifying a dead bus as "not this unlocker's drive": the very
@@ -569,8 +541,8 @@ mod tests {
     fn transport_fault_during_unlock_is_transport_not_not_applicable() {
         use crate::scsi::mock::{MockTransport, Reply};
         let mut t = MockTransport::always(Reply::TransportFault);
-        let err = Mt1959Unlocker::new()
-            .unlock_features(&mut t, &ctx(&known_vid_drive_id()))
+        let err = LdUnlocker::new()
+            .unlock(&mut t, &ctx(&known_vid_drive_id()))
             .expect_err("dead bus");
         assert_eq!(err, UnlockError::Transport);
     }
