@@ -49,6 +49,7 @@ pub use cdb::{UNLOCK_MARKER, is_unlock_read_buffer};
 // The MT1959 unlocker. Matches a drive against the bundled profile database and
 // runs the firmware-unlock + disc-speed-calibration handshake over raw SCSI.
 // Stateless: `unlock()` returns what it learned.
+#[derive(Default)]
 pub struct LdUnlocker;
 
 impl LdUnlocker {

@@ -62,6 +62,7 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
 /// is what MakeMKV's LibreDrive does on stock Pioneer firmware), so the Volume
 /// ID is then read with the SAME standard `0xAD` reader as freemkv/MT1959 — no
 /// host cert, no AKE. Stateless: `unlock()` returns what it learned.
+#[derive(Default)]
 pub struct Renesas;
 
 impl Renesas {
