@@ -61,7 +61,7 @@ pub enum DiscKind {
 
 /// A host certificate for the AACS cert handshake (raw; the consumer collects
 /// these from its key sources and passes them in).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostCert {
     /// AACS 1.0 host private key (20 bytes).
     pub private_key: [u8; 20],
@@ -71,6 +71,20 @@ pub struct HostCert {
     pub private_key_v2: Option<[u8; 32]>,
     /// AACS 2.0 host certificate (type 0x11). `None` for AACS 1.0 only.
     pub certificate_v2: Option<Vec<u8>>,
+}
+
+// Manual Debug: `private_key`/`private_key_v2` are the raw host private keys —
+// they must never reach a log in plaintext; presence (Some/None) of the v2 key
+// stays observable. Mirrors the redacting Debug on AacsAuth/Unlocked.
+impl std::fmt::Debug for HostCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostCert")
+            .field("private_key", &"[redacted]")
+            .field("certificate", &self.certificate)
+            .field("private_key_v2", &self.private_key_v2.map(|_| "[redacted]"))
+            .field("certificate_v2", &self.certificate_v2)
+            .finish()
+    }
 }
 
 /// Per-attempt context the consumer hands to EVERY unlocker, uniformly: the
@@ -249,5 +263,30 @@ mod tests {
         assert!(s.contains("[redacted]"), "must mark redaction: {s}");
         // Presence (Some/None) stays observable.
         assert!(s.contains("Some"), "must still show a key WAS present: {s}");
+    }
+
+    // `private_key`/`private_key_v2` are the raw host private keys; `Debug` must
+    // NOT print those bytes. Restoring `#[derive(Debug)]` renders the byte
+    // arrays (e.g. 0xAB → 171 / 0xCD → 205), turning this test red.
+    #[test]
+    fn host_cert_debug_redacts_private_keys() {
+        let c = HostCert {
+            private_key: [0xAB; 20],
+            certificate: vec![0x01, 0x02],
+            private_key_v2: Some([0xCD; 32]),
+            certificate_v2: None,
+        };
+        let s = format!("{c:?}");
+        assert!(!s.contains("171"), "private_key bytes must not appear: {s}");
+        assert!(
+            !s.contains("205"),
+            "private_key_v2 bytes must not appear: {s}"
+        );
+        assert!(s.contains("[redacted]"), "must mark redaction: {s}");
+        // Presence of the v2 key stays observable.
+        assert!(
+            s.contains("Some"),
+            "must still show the v2 key WAS present: {s}"
+        );
     }
 }
