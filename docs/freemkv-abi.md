@@ -72,9 +72,11 @@ The full freemkv unlock sequence, in fixed order:
 
 Identity is a hard gate (a non-freemkv drive is `NotApplicable`). Region and
 Speed are best-effort features (a firmware lacking one is logged and
-skipped). Raw Read (`04 01`) and the VID read are LOAD-BEARING: this
-firmware's whole purpose is the one-command VID unlock, so if Raw Read is
-rejected or the bare `0xAD` returns no VID, the unlock FAILS
-(`VidUnavailable`) — there is no fallback. A dead bus (`Transport`) always
-aborts. On success `drive_unlocked` is true (Raw Read on ⇒ no bus
-encryption; the VID and sectors come back clear).
+skipped). Raw Read (`04 01`) is LOAD-BEARING: this firmware's whole purpose
+is the one-command unlock, so if Raw Read is rejected the unlock FAILS
+(`VidUnavailable`) — there is no fallback. The bare `0xAD` VID read is
+BEST-EFFORT: Raw Read has already removed the bus, so a VID miss does NOT
+abort — `full_unlock` returns `Ok(Unlocked { vid: None, .. })` (a key source
+can still supply the key). A dead bus (`Transport`) always aborts. On success
+the drive is unlocked (Raw Read on ⇒ no bus encryption; the sectors come back
+clear, and the VID too when the drive served one).
