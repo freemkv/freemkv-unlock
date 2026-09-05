@@ -61,9 +61,25 @@ impl Unlocker for AacsUnlocker {
             return Ok(None);
         }
         crate::fallthrough(
-            handshake::run_cert_handshake(scsi, &self.host_certs).map(|h| Unlocked {
-                vid: Some(h.volume_id),
-                bus_key: h.read_data_key,
+            handshake::run_cert_handshake(scsi, &self.host_certs).map(|h| {
+                // A UHD disc whose bus-key fetch the drive refused (non-transport)
+                // returns Ok with read_data_key: None + read_data_key_err: Some —
+                // otherwise indistinguishable from an AACS-1.0 disc. Surface it.
+                if h.read_data_key.is_none()
+                    && let Some(code) = h.read_data_key_err
+                {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "read_data_key_dropped",
+                        error_code = code,
+                        "AACS auth + VID succeeded but the drive served no read_data_key (bus key); \
+                         unlock reports bus_key: None"
+                    );
+                }
+                Unlocked {
+                    vid: Some(h.volume_id),
+                    bus_key: h.read_data_key,
+                }
             }),
         )
     }
