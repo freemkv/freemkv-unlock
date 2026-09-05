@@ -586,6 +586,40 @@ mod tests {
         assert_eq!(len, 2208, "MODE SELECT length = firmware.len(), not 2496");
     }
 
+    // Byte-for-byte pin of variant_b's Step-2 metadata-read (READ_BUFFER offset
+    // 0x3000 at cdb[4]=0x30, length 0x10 at cdb[8]) and Step-3 write-extra CDBs.
+    #[test]
+    fn variant_b_meta_read_and_write_extra_cdbs_are_exact_bytes() {
+        let mut profile = fixture_profile([0x11, 0x22, 0x33, 0x44]);
+        profile.firmware = vec![0u8; 2208];
+        let mut mt = Mt1959::new(profile, true);
+        let mut t = RecordingTransport { cdbs: Vec::new() };
+        let _ = variant_b::load_firmware(&mut mt, &mut t);
+
+        // Step 2: READ_BUFFER mode 6, offset 0x3000, length 0x10.
+        let meta = t
+            .cdbs
+            .iter()
+            .find(|c| c.first() == Some(&SCSI_READ_BUFFER) && c.get(4) == Some(&0x30))
+            .expect("Step-2 metadata READ_BUFFER issued");
+        assert_eq!(
+            meta.as_slice(),
+            &[0x3C, 0x06, 0x00, 0x00, 0x30, 0x00, 0x00, 0x00, 0x10, 0x00]
+        );
+
+        // Step 3: WRITE_BUFFER of the 0x10-byte extra block. Distinguish from
+        // the Step-1 firmware upload (WRITE_BUFFER too) by its length byte.
+        let extra = t
+            .cdbs
+            .iter()
+            .find(|c| c.first() == Some(&SCSI_WRITE_BUFFER) && c.get(8) == Some(&0x10))
+            .expect("Step-3 write-extra WRITE_BUFFER issued");
+        assert_eq!(
+            extra.as_slice(),
+            &[0x3B, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00]
+        );
+    }
+
     // Pins variant_a's upload sequence: WRITE_BUFFER at the real per-drive
     // length in the CDB's 24-bit length field, then the 0x45 verify
     // READ_BUFFER whose result used to be discarded outright.
@@ -611,6 +645,40 @@ mod tests {
                 .iter()
                 .any(|c| c.first() == Some(&SCSI_READ_BUFFER) && c.get(2) == Some(&0x45)),
             "the 0x45 verify READ_BUFFER must be issued"
+        );
+    }
+
+    // Byte-for-byte pin of variant_a's two firmware-upload CDBs (not just the
+    // length field): the WRITE_BUFFER (mode cdb[1]=0x06, reserved, 24-bit len,
+    // control byte 9) and the whole 0x45 verify READ_BUFFER CDB.
+    #[test]
+    fn variant_a_write_buffer_and_verify_cdbs_are_exact_bytes() {
+        let mut profile = fixture_profile([0x11, 0x22, 0x33, 0x44]);
+        profile.firmware = vec![0u8; 2208]; // 0x0008A0
+        let mut mt = Mt1959::new(profile, false);
+        let mut t = RecordingTransport { cdbs: Vec::new() };
+        let _ = variant_a::load_firmware(&mut mt, &mut t);
+
+        let wb = t
+            .cdbs
+            .iter()
+            .find(|c| c.first() == Some(&SCSI_WRITE_BUFFER))
+            .expect("WRITE_BUFFER issued");
+        // 3B [mode 06] [rsvd 00 00 00 00] [len 24-bit BE = 0008A0] [control 00]
+        assert_eq!(
+            wb.as_slice(),
+            &[0x3B, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0xA0, 0x00]
+        );
+
+        let verify = t
+            .cdbs
+            .iter()
+            .find(|c| c.first() == Some(&SCSI_READ_BUFFER) && c.get(2) == Some(&0x45))
+            .expect("0x45 verify READ_BUFFER issued");
+        // 3C [MODE_A 01] [buffer_id 45] [rsvd ×5] [alloc len 04] [control 00]
+        assert_eq!(
+            verify.as_slice(),
+            &[0x3C, 0x01, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00]
         );
     }
 
