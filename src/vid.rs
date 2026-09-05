@@ -172,6 +172,18 @@ mod tests {
         assert_eq!(read_aacs_vid(&mut t).expect("no fault"), None);
     }
 
+    /// A rejection surfaced as `Err` WITH a sense (a non-conforming transport)
+    /// is a drive refusal, not a dead bus → `Ok(None)` VID-miss, never
+    /// `Err(Transport)`.
+    #[test]
+    fn err_with_sense_is_a_vid_miss_not_transport() {
+        let mut t = MockTransport::always(Reply::illegal_request_as_err());
+        assert_eq!(
+            read_aacs_vid(&mut t).expect("a sense is not a dead bus"),
+            None
+        );
+    }
+
     /// Only a dead bus is an error.
     #[test]
     fn transport_fault_propagates() {

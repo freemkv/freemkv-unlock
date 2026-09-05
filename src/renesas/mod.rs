@@ -306,6 +306,94 @@ mod tests {
         );
     }
 
+    // A recognized Renesas drive whose A read (RB 0xB0@0x04) is REFUSED but
+    // whose B read (RB 0xB0@0x50) SUCCEEDS after the knock must unlock — and the
+    // knock CDB has to be issued BETWEEN A and B. See docs/renesas-mod.md.
+    #[test]
+    fn knock_runs_between_a_and_b_and_b_opens() {
+        // The exact knock CDB the code issues (pinned wire format).
+        const KNOCK_A5AAAA_CDB: [u8; 10] =
+            [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00];
+
+        struct AFailsBSucceeds {
+            cdbs: Vec<Vec<u8>>,
+        }
+        impl ScsiTransport for AFailsBSucceeds {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                self.cdbs.push(cdb.to_vec());
+                // Gate 0xF1 → SAT identity.
+                if cdb.get(2) == Some(&0xF1) {
+                    let p = renesas_payload();
+                    let n = p.len().min(data.len());
+                    data[..n].copy_from_slice(&p[..n]);
+                    return Ok(ScsiResult {
+                        status: 0,
+                        bytes_transferred: n,
+                        sense: [0u8; 32],
+                    });
+                }
+                // A read (RB 0xB0@0x04) → refuse with a drive sense.
+                if cdb.get(2) == Some(&0xB0) && cdb.get(3) == Some(&0x00) {
+                    let mut sense = [0u8; 32];
+                    sense[2] = 0x05; // ILLEGAL REQUEST
+                    sense[12] = 0x20;
+                    return Err(ScsiError {
+                        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                        sense: Some(sense),
+                    });
+                }
+                // B read (RB 0xB0@0x50), the knock (0x3B/0x41), and the 0xAD VID
+                // read all return GOOD so the open + VID read succeed.
+                let n = data.len().min(36);
+                if !data.is_empty() {
+                    // Non-zero VID so read_aacs_vid yields Some.
+                    for b in data.iter_mut().take(n) {
+                        *b = 0x5A;
+                    }
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                })
+            }
+        }
+
+        let mut t = AFailsBSucceeds { cdbs: Vec::new() };
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        let out = Renesas::new()
+            .unlock(&mut t, &ctx)
+            .expect("no fault")
+            .expect("B read opens the drive → unlocked");
+        assert_eq!(out.bus_key, None);
+
+        // The knock must appear, between the A read (0xB0@0x04) and the B read
+        // (0xB0@0x50).
+        let a = t
+            .cdbs
+            .iter()
+            .position(|c| c.get(2) == Some(&0xB0) && c.get(3) == Some(&0x00))
+            .expect("A read issued");
+        let knock = t
+            .cdbs
+            .iter()
+            .position(|c| c.as_slice() == KNOCK_A5AAAA_CDB)
+            .expect("knock CDB issued");
+        let b = t
+            .cdbs
+            .iter()
+            .position(|c| c.get(2) == Some(&0xB0) && c.get(3) == Some(&0x50))
+            .expect("B read issued");
+        assert!(a < knock && knock < b, "knock must run between A and B");
+    }
+
     // A recognized Renesas drive that REFUSES the vendor open read must
     // defer to the next unlocker, not claim the drive. See docs/renesas-mod.md.
     #[test]
