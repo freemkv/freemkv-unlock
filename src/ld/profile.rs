@@ -307,21 +307,14 @@ fn load_from_str(data: &str) -> Result<Profiles> {
     serde_json::from_str(data).map_err(|_| Error::ProfileParse)
 }
 
-/// Find a profile matching a drive's INQUIRY fields.
+/// Find a profile matching a drive's INQUIRY fields, whitespace-trimmed.
 ///
-/// Per platform section (MT1959-A, then MT1959-B, then Renesas), two passes:
-///
-/// 1. Exact match including `product_id` (only when the drive reports one).
-/// 2. Product-id-blind fallback on the four-field identity
-///    (vendor/revision/vendor_specific/firmware_date). Catalogs store a GENERIC
-///    `product_id` (e.g. "BD-RE") while drives report a specific one (e.g.
-///    "BD-RE BU40N"), so pass 1 legitimately misses on real drives. Pass 2 binds
-///    a UNIQUE four-field match regardless of the reported product_id; when two
-///    cataloged siblings share the four-tuple (differing only by product_id) it
-///    binds only if the drive reported no product_id to disambiguate with —
-///    otherwise the drive is uncataloged and must not mis-bind to a sibling.
-///
-/// All comparisons are whitespace-trimmed. Returns the first section that matches.
+/// Per platform section (MT1959-A, -B, Renesas): (1) exact match including
+/// `product_id` when the drive reports one; (2) product-id-blind fallback on
+/// the four-field identity (vendor/revision/vendor_specific/firmware_date).
+/// Catalogs store a GENERIC product_id (e.g. "BD-RE") vs a drive's specific one
+/// ("BD-RE BU40N"), so pass 1 misses; pass 2 binds a UNIQUE four-field match —
+/// a shared four-tuple binds only when the drive reported no product_id.
 pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Option<ProfileMatch> {
     let v = drive_id.vendor_id.trim();
     let prod = drive_id.product_id.trim();
@@ -349,15 +342,9 @@ pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Optio
             });
         }
 
-        // Product-id-blind fallback. The catalog stores a GENERIC product_id
-        // (e.g. "BD-RE"), while a drive reports a specific one (e.g. "BD-RE
-        // BU40N"), so the exact pass above legitimately misses on real drives.
-        // Fall back to the four-field identity
-        // (vendor/revision/vendor_specific/firmware_date), which is unique per
-        // profile — but guard against MIS-BINDING: when two cataloged siblings
-        // share the four-tuple and differ only by product_id, a drive whose
-        // reported product_id matched neither (above) is an uncataloged variant
-        // and must NOT bind to the wrong sibling's firmware.
+        // Product-id-blind fallback: catalogs store a GENERIC product_id while
+        // drives report a specific one, so the exact pass misses. Match the
+        // four-field identity instead; guard mis-binding on shared tuples below.
         let four_field: Vec<&DriveProfile> = list
             .iter()
             .filter(|p| {
@@ -368,20 +355,18 @@ pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Optio
             })
             .collect();
         match four_field.as_slice() {
-            // Exactly one four-field match — unambiguous, so bind it regardless
-            // of the reported product_id. This is the common real-drive case (a
-            // generic cataloged product_id vs a specific reported one) and the
-            // pre-1.7.0 behaviour a UHD-capable LG BU40N relied on.
+            // Exactly one four-field match — unambiguous; bind regardless of
+            // the reported product_id (the common real-drive case, and the
+            // pre-1.7.0 behaviour a UHD-capable LG BU40N relied on).
             [only] => {
                 return Some(ProfileMatch {
                     profile: (*only).clone(),
                     platform,
                 });
             }
-            // Two-plus cataloged siblings share the four-tuple. Only bind when
-            // the drive reported NO product_id to disambiguate with; a non-empty
-            // product_id that missed the exact pass is an uncataloged variant and
-            // must not mis-bind to a sibling's firmware.
+            // Shared four-tuple: bind only when the drive reported NO
+            // product_id. A non-empty one that missed the exact pass is an
+            // uncataloged variant and must not mis-bind to a sibling.
             [first, ..] if prod.is_empty() => {
                 return Some(ProfileMatch {
                     profile: (*first).clone(),
