@@ -2,6 +2,10 @@
 
 ## [1.7.1] — UNRELEASED
 
+### Added
+
+- freemkv firmware: `full_unlock` now issues a trailing best-effort Raw Read `04 03` (data-clear / bus-off) after the VID read, so an unlocked drive is placed in bus-off mode and subsequent content `READ(10)`s return AACS-at-rest bytes without the in-transit AACS bus wrap. A no-op on firmware without the `04 03` lever and never discards an obtained unlock, so it is inert until the firmware side ships. Also exposed as `set_bus_off`.
+
 ### Fixed
 
 - `ld/profile`: `find_by_drive_id` now binds a UNIQUE four-field identity match even when the drive reports a specific `product_id` the catalog stores generically (drive reports "BD-RE BU40N", catalog "BD-RE"). The 1.7.0 gating on an empty product id broke LibreDrive unlock on UHD-capable LG BU40N drives; this restores it.

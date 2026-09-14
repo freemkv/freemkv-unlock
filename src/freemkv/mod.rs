@@ -44,6 +44,14 @@ const RAW_READ_CERT_VALID: u8 = 0x01;
 /// still runs the real AKE. Driven by the AACS cert unlocker, not here.
 #[allow(dead_code)]
 const RAW_READ_ACCEPT_ANY: u8 = 0x02;
+/// Raw Read (`0x04`) mode: "data clear" — remove AACS in-transit BUS encryption
+/// so content `READ(10)` returns the AACS-at-rest bytes unwrapped (the host then
+/// applies title keys). Unlike `01`/`02` (VID paths, followed by a bare `0xAD`),
+/// `03` is followed by ordinary `READ(10)`s. Issued as a trailing best-effort
+/// step of [`FreemkvUnlocker::full_unlock`] (after the VID read, since it
+/// repurposes `flag[0x04]`) so an unlocked drive ends up in bus-off for its
+/// content reads. Inert on firmware without the `04 03` lever.
+const RAW_READ_DATA_CLEAR: u8 = 0x03;
 
 /// Vendor sub-functions (CDB byte 4). These numeric values ARE the wire
 /// protocol and match `freemkv-firmware`'s `abi.rs::SubFn`.
@@ -250,6 +258,14 @@ impl FreemkvUnlocker {
         self.send_state(scsi, subfn::RAW_READ, RAW_READ_CERT_VALID)
     }
 
+    // Raw Read (subfn 0x04) in RAW_READ_DATA_CLEAR (0x03) mode: remove AACS
+    // in-transit BUS encryption so content READ(10) returns the AACS-at-rest
+    // bytes unwrapped (the host applies title keys). Issued best-effort as the
+    // trailing step of full_unlock; inert on firmware without the 04 03 lever.
+    fn set_bus_off(&self, scsi: &mut dyn ScsiTransport) -> std::result::Result<(), UnlockError> {
+        self.send_state(scsi, subfn::RAW_READ, RAW_READ_DATA_CLEAR)
+    }
+
     /// DumpAll diagnostic RAM read (subfn 0x09): return the 64-byte window at
     /// `addr`. A host-side diagnostic path only — not used by the unlock flow.
     #[allow(dead_code)]
@@ -275,7 +291,8 @@ impl FreemkvUnlocker {
 
     // Full freemkv unlock sequence: 01 Identity (hard gate) → 03 Region → 02 Speed
     // (best-effort) → 04 01 Raw Read → bare 0xAD VID (both load-bearing, no
-    // fallback). See docs/freemkv-abi.md for full failure-mode semantics.
+    // fallback) → 04 03 bus-off (trailing, fully best-effort). See
+    // docs/freemkv-abi.md for full failure-mode semantics.
     fn full_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -324,6 +341,19 @@ impl FreemkvUnlocker {
         // LD/Renesas routes). Raw Read already unlocked the drive, so a VID miss
         // must not discard it: only a dead bus propagates (`?`), else `None`.
         let vid = crate::vid::read_aacs_vid(scsi)?;
+        // 04 03 — Data Clear / bus-off: remove in-transit bus encryption so
+        // subsequent content READ(10)s return AACS-at-rest bytes unwrapped.
+        // Trailing (it repurposes flag[0x04] after the VID read) and FULLY
+        // best-effort — inert on firmware lacking the 04 03 lever, and a failure
+        // here (even a bus fault) must never discard an already-obtained unlock.
+        if let Err(e) = self.set_bus_off(scsi) {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "freemkv_bus_off_unavailable",
+                ?e,
+                "bus-off (04 03) not applied; continuing"
+            );
+        }
         tracing::debug!(
             target: "freemkv::disc",
             phase = "freemkv_unlocked",
@@ -441,12 +471,13 @@ mod tests {
     }
 
     /// The Raw Read mode selectors match the firmware: 00 OEM, 01 cert-valid
-    /// (this unlocker), 02 accept-any-cert (the AKE path).
+    /// (this unlocker), 02 accept-any-cert (the AKE path), 03 data-clear (bus-off).
     #[test]
     fn raw_read_modes_are_pinned() {
         assert_eq!(RAW_READ_OFF, 0x00);
         assert_eq!(RAW_READ_CERT_VALID, 0x01);
         assert_eq!(RAW_READ_ACCEPT_ANY, 0x02);
+        assert_eq!(RAW_READ_DATA_CLEAR, 0x03);
     }
 
     /// Exact CDB bytes for each vendor sub-function that build_cdb serves.
@@ -469,6 +500,10 @@ mod tests {
         assert_eq!(
             build_cdb(subfn::RAW_READ, RAW_READ_CERT_VALID, KNOCK_RESP_LEN as u32),
             [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x01, 0x00, 0x00, 0x40, 0x00]
+        );
+        assert_eq!(
+            build_cdb(subfn::RAW_READ, RAW_READ_DATA_CLEAR, KNOCK_RESP_LEN as u32),
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x03, 0x00, 0x00, 0x40, 0x00]
         );
     }
 
@@ -566,6 +601,16 @@ mod tests {
     }
 
     #[test]
+    fn set_bus_off_issues_the_04_03_cdb() {
+        let mut t = MockTransport::always(Reply::good(vec![]));
+        FreemkvUnlocker::new().set_bus_off(&mut t).expect("ok");
+        assert_eq!(
+            t.cdbs[0],
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x03, 0x00, 0x00, 0x40, 0x00]
+        );
+    }
+
+    #[test]
     fn toggle_drive_rejection_is_not_applicable() {
         let mut t = MockTransport::always(Reply::illegal_request());
         let err = FreemkvUnlocker::new().set_raw_read(&mut t).unwrap_err();
@@ -585,8 +630,8 @@ mod tests {
     // The bare 0xAD VID read itself is tested in crate::vid; here we cover the
     // full unlock sequence end-to-end, including the best-effort VID handling.
 
-    /// The full unlock runs `01→03→02→04→AD` in order: identity, region, speed,
-    /// raw-read, bare VID read. This is the load-bearing sequence test.
+    /// The full unlock runs `01→03→02→04 01→AD→04 03` in order: identity, region,
+    /// speed, raw-read, bare VID read, then the trailing bus-off knock.
     #[test]
     fn full_unlock_issues_identity_region_speed_rawread_then_bare_vid() {
         let vid = [0x7Cu8; 16];
@@ -597,6 +642,7 @@ mod tests {
                 Reply::good(vec![]),                     // 02 Speed
                 Reply::good(vec![]),                     // 04 01 Raw Read
                 Reply::good(vid_ds_response(vid)),       // 0xAD bare VID
+                Reply::good(vec![]),                     // 04 03 bus-off (trailing)
             ],
             Reply::TransportFault,
         );
@@ -606,12 +652,15 @@ mod tests {
             .expect("no fault")
             .expect("Raw Read on ⇒ unlocked");
         assert_eq!(out.vid, Some(vid));
-        // Four vendor knocks then the standard 0xAD read.
-        assert_eq!(t.cdbs.len(), 5);
+        // Four vendor knocks, the standard 0xAD read, then the bus-off knock.
+        assert_eq!(t.cdbs.len(), 6);
         let vendor_subfns: Vec<u8> = t.cdbs[..4].iter().map(|c| c[4]).collect();
         assert_eq!(vendor_subfns, vec![0x01, 0x03, 0x02, 0x04]);
         assert_eq!(t.cdbs[3][5], RAW_READ_CERT_VALID); // Raw Read state 01
         assert_eq!(t.cdbs[4][0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
+        // Trailing bus-off: Raw Read sub-function, state 03 (data-clear).
+        assert_eq!(t.cdbs[5][4], subfn::RAW_READ);
+        assert_eq!(t.cdbs[5][5], RAW_READ_DATA_CLEAR);
     }
 
     /// A missing region/speed feature does not fail the unlock (best-effort).
