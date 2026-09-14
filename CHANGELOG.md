@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.1] — UNRELEASED
+
+### Fixed
+
+- `ld/profile`: `find_by_drive_id` now binds a UNIQUE four-field identity match even when the drive reports a specific `product_id` the catalog stores generically (drive reports "BD-RE BU40N", catalog "BD-RE"). The 1.7.0 gating on an empty product id broke LibreDrive unlock on UHD-capable LG BU40N drives; this restores it.
+
 ## [1.7.0] — 2026-09-02
 
 ### Added
