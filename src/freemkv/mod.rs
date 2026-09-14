@@ -258,10 +258,9 @@ impl FreemkvUnlocker {
         self.send_state(scsi, subfn::RAW_READ, RAW_READ_CERT_VALID)
     }
 
-    // Raw Read (subfn 0x04) in RAW_READ_DATA_CLEAR (0x03) mode: remove AACS
-    // in-transit BUS encryption so content READ(10) returns the AACS-at-rest
-    // bytes unwrapped (the host applies title keys). Issued best-effort as the
-    // trailing step of full_unlock; inert on firmware without the 04 03 lever.
+    // Raw Read (subfn 0x04) mode 0x03 "data clear": remove AACS in-transit bus
+    // encryption so content READ(10) returns at-rest bytes unwrapped. Best-effort
+    // trailing step of full_unlock; inert without the 04 03 firmware lever.
     fn set_bus_off(&self, scsi: &mut dyn ScsiTransport) -> std::result::Result<(), UnlockError> {
         self.send_state(scsi, subfn::RAW_READ, RAW_READ_DATA_CLEAR)
     }
@@ -289,10 +288,9 @@ impl FreemkvUnlocker {
         }
     }
 
-    // Full freemkv unlock sequence: 01 Identity (hard gate) → 03 Region → 02 Speed
-    // (best-effort) → 04 01 Raw Read → bare 0xAD VID (both load-bearing, no
-    // fallback) → 04 03 bus-off (trailing, fully best-effort). See
-    // docs/freemkv-abi.md for full failure-mode semantics.
+    // Full freemkv unlock: 01 Identity (hard gate) → 03 Region → 02 Speed (best-
+    // effort) → 04 01 Raw Read → bare 0xAD VID (load-bearing) → 04 03 bus-off
+    // (trailing, best-effort). See docs/freemkv-abi.md for failure-mode semantics.
     fn full_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -341,11 +339,9 @@ impl FreemkvUnlocker {
         // LD/Renesas routes). Raw Read already unlocked the drive, so a VID miss
         // must not discard it: only a dead bus propagates (`?`), else `None`.
         let vid = crate::vid::read_aacs_vid(scsi)?;
-        // 04 03 — Data Clear / bus-off: remove in-transit bus encryption so
-        // subsequent content READ(10)s return AACS-at-rest bytes unwrapped.
-        // Trailing (it repurposes flag[0x04] after the VID read) and FULLY
-        // best-effort — inert on firmware lacking the 04 03 lever, and a failure
-        // here (even a bus fault) must never discard an already-obtained unlock.
+        // 04 03 bus-off (trailing, repurposes flag[0x04] after the VID read):
+        // remove in-transit bus encryption. FULLY best-effort — inert without the
+        // lever, and a failure here never discards an already-obtained unlock.
         if let Err(e) = self.set_bus_off(scsi) {
             tracing::debug!(
                 target: "freemkv::disc",
