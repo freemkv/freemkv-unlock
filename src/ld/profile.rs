@@ -309,13 +309,19 @@ fn load_from_str(data: &str) -> Result<Profiles> {
 
 /// Find a profile matching a drive's INQUIRY fields.
 ///
-/// Per platform section (MT1959-A, then MT1959-B, then Renesas). A drive that
-/// reports a `product_id` matches ONLY on the full identity including it — if
-/// no cataloged profile matches exactly, the drive is treated as uncataloged
-/// (no match), never bound to a same-vendor/revision sibling. The looser
-/// four-field pass (vendor/revision/vendor_specific/firmware_date) runs only
-/// when the drive reports no `product_id` at all. All comparisons are
-/// whitespace-trimmed. Returns the first section that matches.
+/// Per platform section (MT1959-A, then MT1959-B, then Renesas), two passes:
+///
+/// 1. Exact match including `product_id` (only when the drive reports one).
+/// 2. Product-id-blind fallback on the four-field identity
+///    (vendor/revision/vendor_specific/firmware_date). Catalogs store a GENERIC
+///    `product_id` (e.g. "BD-RE") while drives report a specific one (e.g.
+///    "BD-RE BU40N"), so pass 1 legitimately misses on real drives. Pass 2 binds
+///    a UNIQUE four-field match regardless of the reported product_id; when two
+///    cataloged siblings share the four-tuple (differing only by product_id) it
+///    binds only if the drive reported no product_id to disambiguate with —
+///    otherwise the drive is uncataloged and must not mis-bind to a sibling.
+///
+/// All comparisons are whitespace-trimmed. Returns the first section that matches.
 pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Option<ProfileMatch> {
     let v = drive_id.vendor_id.trim();
     let prod = drive_id.product_id.trim();
@@ -343,21 +349,46 @@ pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Optio
             });
         }
 
-        // The product_id-blind pass runs ONLY when the drive reports none: a
-        // drive that reports a product_id but misses the exact match is an
-        // uncataloged variant, else it'd bind to a sibling's wrong firmware.
-        if prod.is_empty()
-            && let Some(p) = list.iter().find(|p| {
+        // Product-id-blind fallback. The catalog stores a GENERIC product_id
+        // (e.g. "BD-RE"), while a drive reports a specific one (e.g. "BD-RE
+        // BU40N"), so the exact pass above legitimately misses on real drives.
+        // Fall back to the four-field identity
+        // (vendor/revision/vendor_specific/firmware_date), which is unique per
+        // profile — but guard against MIS-BINDING: when two cataloged siblings
+        // share the four-tuple and differ only by product_id, a drive whose
+        // reported product_id matched neither (above) is an uncataloged variant
+        // and must NOT bind to the wrong sibling's firmware.
+        let four_field: Vec<&DriveProfile> = list
+            .iter()
+            .filter(|p| {
                 p.identity.vendor_id.trim() == v
                     && p.identity.product_revision.trim() == r
                     && p.identity.vendor_specific.trim() == vs
                     && p.identity.firmware_date.trim() == date
             })
-        {
-            return Some(ProfileMatch {
-                profile: p.clone(),
-                platform,
-            });
+            .collect();
+        match four_field.as_slice() {
+            // Exactly one four-field match — unambiguous, so bind it regardless
+            // of the reported product_id. This is the common real-drive case (a
+            // generic cataloged product_id vs a specific reported one) and the
+            // pre-1.7.0 behaviour a UHD-capable LG BU40N relied on.
+            [only] => {
+                return Some(ProfileMatch {
+                    profile: (*only).clone(),
+                    platform,
+                });
+            }
+            // Two-plus cataloged siblings share the four-tuple. Only bind when
+            // the drive reported NO product_id to disambiguate with; a non-empty
+            // product_id that missed the exact pass is an uncataloged variant and
+            // must not mis-bind to a sibling's firmware.
+            [first, ..] if prod.is_empty() => {
+                return Some(ProfileMatch {
+                    profile: (*first).clone(),
+                    platform,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -425,6 +456,37 @@ mod tests {
             find_by_drive_id(&profiles, &idc).is_none(),
             "an uncataloged product_id must not mis-bind to a same-vendor sibling",
         );
+    }
+
+    /// REGRESSION (1.7.0): a real drive reports a SPECIFIC product_id (e.g.
+    /// "BD-RE BU40N") while the catalog stores a GENERIC one ("BD-RE"), so the
+    /// exact pass misses. When the four-field identity is UNIQUE it must still
+    /// bind — the pre-1.7.0 behaviour a UHD LG BU40N relies on for LibreDrive
+    /// unlock. 1.7.0 gated the four-field pass behind an empty product_id, so it
+    /// silently stopped matching and the firmware unlocker was skipped entirely.
+    #[test]
+    fn find_by_drive_id_specific_product_id_binds_unique_four_field() {
+        use serde_json::json;
+        let profiles: Profiles = serde_json::from_str(
+            &json!({
+                "mt1959_a": [
+                    {"identity": {"vendor_id":"HL-DT-ST","product_id":"BD-RE",
+                        "product_revision":"1.03","vendor_specific":"NM00000",
+                        "firmware_date":"211810241934"},
+                        "signature":"12345678","firmware":""}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Drive reports the specific marketing product_id; catalog has "BD-RE".
+        let mut id = make_drive_id("HL-DT-ST", "1.03", "NM00000", "211810241934");
+        id.product_id = "BD-RE BU40N".to_string();
+        let m = find_by_drive_id(&profiles, &id)
+            .expect("unique four-field identity must match despite the product_id mismatch");
+        assert_eq!(m.profile.signature, [0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(m.platform, Platform::Mt1959A);
     }
 
     #[test]
