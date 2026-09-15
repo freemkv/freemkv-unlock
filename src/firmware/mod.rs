@@ -83,6 +83,11 @@ pub const SPEED_MAX: u8 = 0x01;
 /// valid-empty. Destructive; NOT undone by [`Verb::Reset`]. `0x02`.
 pub const HRL_WIPE_ONCE: u8 = 0x02;
 
+/// [`Feature::Bd`] state: force-refuse BD (AACS 1.0) discs (`0x02`). A distinct
+/// sentinel — NOT [`STATE_OFF`] (`0x00`, the SRAM boot value) — so an unarmed image
+/// leaves BD engaged (OEM). Mirrors the firmware ABI `STATE_BD_DISABLE`.
+pub const STATE_BD_DISABLE: u8 = 0x02;
+
 /// [`Feature::Region`] state: force BD region A (`0x2A`). See [`BdRegion`].
 pub const REGION_BD_A: u8 = 0x2A;
 /// [`Feature::Region`] state: force BD region B (`0x2B`).
@@ -121,9 +126,12 @@ pub enum Feature {
     /// Region (RPC) control. [`STATE_ON`] = region-free; `0x11..=0x18` = force
     /// DVD region 1..8; [`REGION_BD_A`]/`_B`/`_C` = force BD region A/B/C.
     Region = 0x02,
-    /// UHD (AACS 2.0) capability gate.
+    /// UHD (AACS 2.0) capability gate. [`STATE_ON`] = force enabled; [`STATE_OFF`]
+    /// is a reserved/OEM no-op (only the enable direction is emitted).
     Uhd = 0x03,
-    /// Blu-ray (AACS 1.0) capability gate.
+    /// Blu-ray (AACS 1.0) capability gate. [`STATE_BD_DISABLE`] (`0x02`) =
+    /// force-refuse BD discs; passthrough/`0x00` boot/[`STATE_ON`] = OEM (engaged —
+    /// the enable direction is a no-op, OEM already engages BD).
     Bd = 0x04,
     /// Host Revocation List handling. [`STATE_ON`] = skip lookup;
     /// [`HRL_WIPE_ONCE`] = one-time permanent wipe.
@@ -534,9 +542,11 @@ impl<'a> FirmwareControl<'a> {
     pub fn enable_bd(&mut self) -> Result<()> {
         self.set(Feature::Bd, STATE_ON)
     }
-    /// Force the Blu-ray capability gate off.
+    /// Force the Blu-ray capability gate off (drive refuses BD discs). Sends
+    /// [`STATE_BD_DISABLE`] (`0x02`) — a distinct sentinel, NOT `0x00` (the SRAM boot
+    /// value) — so an unarmed image stays OEM-behaviour-identical (BD engaged).
     pub fn disable_bd(&mut self) -> Result<()> {
-        self.set(Feature::Bd, STATE_OFF)
+        self.set(Feature::Bd, STATE_BD_DISABLE)
     }
     /// Skip the HRL lookup (revoked certs accepted; non-destructive).
     pub fn skip_hrl(&mut self) -> Result<()> {
