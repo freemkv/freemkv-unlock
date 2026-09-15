@@ -43,6 +43,13 @@ pub struct AacsUnlocker {
     /// — the drive is never touched with a vendor command. See
     /// [`AacsUnlocker::arm_before_unlock`].
     arm: Option<ArmRecipe>,
+    /// TEST-ONLY seam: a self-generated AACS 1.0 LA anchor to run the cert AKE
+    /// under. Production verifies against the real compiled-in anchor, which no
+    /// synthetic drive emulator can sign for, so the end-to-end unlock tests
+    /// drive the handshake under a test anchor instead. `None` in every real
+    /// build (the field does not exist off `cfg(test)`).
+    #[cfg(test)]
+    test_v1_anchor: Option<([u8; 20], [u8; 20])>,
 }
 
 impl AacsUnlocker {
@@ -50,7 +57,40 @@ impl AacsUnlocker {
         AacsUnlocker {
             host_certs,
             arm: None,
+            #[cfg(test)]
+            test_v1_anchor: None,
         }
+    }
+
+    /// TEST-ONLY: run the cert AKE under a self-generated AACS 1.0 LA anchor
+    /// (see [`AacsUnlocker::test_v1_anchor`]).
+    #[cfg(test)]
+    pub(crate) fn with_test_v1_anchor(mut self, la_x: [u8; 20], la_y: [u8; 20]) -> Self {
+        self.test_v1_anchor = Some((la_x, la_y));
+        self
+    }
+
+    /// Run the cert handshake against the drive. Production threads the real LA
+    /// anchors via [`handshake::run_cert_handshake`]; a test may override the
+    /// AACS 1.0 anchor so a synthetic drive can complete the AKE.
+    fn run_handshake(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+    ) -> std::result::Result<handshake::CertHandshake, UnlockError> {
+        #[cfg(test)]
+        if let Some((ax, ay)) = self.test_v1_anchor {
+            // v2 anchor is unused here: allow_p256 = false keeps the native 2.0
+            // path off, so a zeroed placeholder is never read.
+            let dummy_v2 = [0u8; 32];
+            return handshake::run_cert_handshake_with_anchors(
+                scsi,
+                &self.host_certs,
+                (&ax, &ay),
+                (&dummy_v2, &dummy_v2),
+                false,
+            );
+        }
+        handshake::run_cert_handshake(scsi, &self.host_certs)
     }
 
     /// Opt IN to arming a freemkv-firmware drive with a named recipe *before*
@@ -128,28 +168,26 @@ impl Unlocker for AacsUnlocker {
         // Opt-in: arm a freemkv-firmware drive before the AKE (no-op by default,
         // and on non-freemkv drives). Only a dead bus aborts here.
         self.maybe_arm(scsi)?;
-        crate::fallthrough(
-            handshake::run_cert_handshake(scsi, &self.host_certs).map(|h| {
-                // A UHD disc whose bus-key fetch the drive refused (non-transport)
-                // returns Ok with read_data_key: None + read_data_key_err: Some —
-                // otherwise indistinguishable from an AACS-1.0 disc. Surface it.
-                if h.read_data_key.is_none()
-                    && let Some(code) = h.read_data_key_err
-                {
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "read_data_key_dropped",
-                        error_code = code,
-                        "AACS auth + VID succeeded but the drive served no read_data_key (bus key); \
-                         unlock reports bus_key: None"
-                    );
-                }
-                Unlocked {
-                    vid: Some(h.volume_id),
-                    bus_key: h.read_data_key,
-                }
-            }),
-        )
+        crate::fallthrough(self.run_handshake(scsi).map(|h| {
+            // A UHD disc whose bus-key fetch the drive refused (non-transport)
+            // returns Ok with read_data_key: None + read_data_key_err: Some —
+            // otherwise indistinguishable from an AACS-1.0 disc. Surface it.
+            if h.read_data_key.is_none()
+                && let Some(code) = h.read_data_key_err
+            {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "read_data_key_dropped",
+                    error_code = code,
+                    "AACS auth + VID succeeded but the drive served no read_data_key (bus key); \
+                     unlock reports bus_key: None"
+                );
+            }
+            Unlocked {
+                vid: Some(h.volume_id),
+                bus_key: h.read_data_key,
+            }
+        }))
     }
 }
 
@@ -230,9 +268,11 @@ mod tests {
     fn unlock_succeeds_end_to_end() {
         let mut t = handshake::tests::DriveEmu::new();
         t.serve_data_keys = true;
+        let (lax, lay) = (t.la_x, t.la_y);
         let id = id();
         let ctx = UnlockCtx::new(&id, DiscKind::Aacs);
         let out = AacsUnlocker::new(vec![host_cert()])
+            .with_test_v1_anchor(lax, lay)
             .unlock(&mut t, &ctx)
             .expect("auth + VID + data-key reads all succeed")
             .expect("the cert route unlocks the drive");
@@ -247,9 +287,11 @@ mod tests {
     fn unlock_without_a_served_read_data_key_yields_vid_but_no_bus_key() {
         let mut t = handshake::tests::DriveEmu::new();
         t.serve_zero_data_keys = true; // GOOD status, all-zero key block
+        let (lax, lay) = (t.la_x, t.la_y);
         let id = id();
         let ctx = UnlockCtx::new(&id, DiscKind::Aacs);
         let out = AacsUnlocker::new(vec![host_cert()])
+            .with_test_v1_anchor(lax, lay)
             .unlock(&mut t, &ctx)
             .expect("auth + VID succeed even when the bus key is refused")
             .expect("the cert route still unlocks the drive");
