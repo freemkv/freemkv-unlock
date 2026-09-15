@@ -34,6 +34,9 @@ use scsi::ScsiTransport;
 // own dispatch list and injects each one's deps at construction (certs → AACS)
 // — no central factory to thread another unlocker's config through.
 pub use aacs::AacsUnlocker;
+// Keypair-validity check for a stored AACS 1.0 host cert (`priv·G ==
+// cert_pub_key`), for the key service's host-cert health gate.
+pub use aacs::aacs1_keypair_matches;
 pub use css::DvdUnlocker;
 pub use freemkv::FreemkvUnlocker;
 pub use ld::LdUnlocker;

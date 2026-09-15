@@ -8,6 +8,11 @@
 mod error;
 mod handshake;
 
+/// Keypair-validity check for a stored AACS 1.0 host cert (`priv·G ==
+/// cert_pub_key`). Exposed for the key service, which must refuse to serve a
+/// cert whose stored private key doesn't match its certificate.
+pub use handshake::aacs1_keypair_matches;
+
 use aes::Aes128;
 use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
 
@@ -170,6 +175,26 @@ mod tests {
             .expect("the cert route unlocks the drive");
         assert_eq!(out.vid, Some([0x5Au8; 16]));
         assert!(out.bus_key.is_some());
+    }
+
+    // The `read_data_key_dropped` path: auth + VID succeed but the drive serves
+    // no bus key (non-transport). `unlock` still reports Unlocked (unlocked via
+    // the cert) with `vid: Some` but `bus_key: None` — surfaced, not hidden.
+    #[test]
+    fn unlock_without_a_served_read_data_key_yields_vid_but_no_bus_key() {
+        let mut t = handshake::tests::DriveEmu::new();
+        t.serve_zero_data_keys = true; // GOOD status, all-zero key block
+        let id = id();
+        let ctx = UnlockCtx::new(&id, DiscKind::Aacs);
+        let out = AacsUnlocker::new(vec![host_cert()])
+            .unlock(&mut t, &ctx)
+            .expect("auth + VID succeed even when the bus key is refused")
+            .expect("the cert route still unlocks the drive");
+        assert_eq!(out.vid, Some([0x5Au8; 16]), "the VID was learned");
+        assert!(
+            out.bus_key.is_none(),
+            "no read_data_key served ⇒ bus_key: None (reported, not faked)"
+        );
     }
 
     fn host_cert() -> crate::HostCert {

@@ -63,6 +63,18 @@ fn check_status(cdb: &[u8], r: &crate::scsi::ScsiResult) -> Result<()> {
     })
 }
 
+/// The 6-byte AACS Host ID of a host certificate, as lowercase hex, for
+/// diagnostics only. It lives at `cert[4..10]` (after the 4-byte type/length
+/// header, before the reserved bytes and the public key at `[12..]`). Returns
+/// `"unknown"` for a short cert. Logs the cert's IDENTITY only — NEVER any
+/// private-key or public-key bytes.
+fn cert_host_id_hex(cert: &[u8]) -> String {
+    if cert.len() < 10 {
+        return "unknown".to_string();
+    }
+    cert[4..10].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // Release an AGID (REPORT KEY format 0x3F). A drive has only four, so avoid
 // leaving one held between attempts. Best-effort: a release failure isn't a
 // failure of the operation that's already failing.
@@ -664,6 +676,34 @@ fn cert_pub_key(cert: &[u8]) -> ([u8; 20], [u8; 20]) {
     (x, y)
 }
 
+/// True iff the stored host private key matches the certificate's public key on
+/// the AACS 1.0 curve (`private_key · G == cert_pub_key(cert)`). A genuine,
+/// LA-signed cert can still be paired in a keydb with the WRONG private key,
+/// which can never establish a bus key ("KEY NOT ESTABLISHED"): this is what
+/// distinguishes a DEAD pairing from a live one. Returns `false` (never panics)
+/// on a short cert, a private key outside `[1, n)`, or a point at infinity.
+/// Reuses the live handshake's own curve math, so "valid here" == "authenticates".
+pub fn aacs1_keypair_matches(private_key: &[u8; 20], cert: &[u8]) -> bool {
+    if cert.len() < 52 {
+        return false;
+    }
+    let p = BigUint::from_bytes_be(&EC_P);
+    let a = BigUint::from_bytes_be(&EC_A);
+    let n = BigUint::from_bytes_be(&EC_N);
+    let d = BigUint::from_bytes_be(private_key);
+    // A real scalar is in [1, n): 0 and >= n never produce a usable public point.
+    if d.is_zero() || d >= n {
+        return false;
+    }
+    let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+    let q = ec_mul(&d, &g, &a, &p);
+    if q.infinity {
+        return false;
+    }
+    let (cx, cy) = cert_pub_key(cert);
+    q.x == BigUint::from_bytes_be(&cx) && q.y == BigUint::from_bytes_be(&cy)
+}
+
 // ── Bus key derivation (ECDH) ───────────────────────────────────────────────
 
 /// Compute bus key via ECDH: bus_key = low 128 bits of (host_priv × drive_key_point).x
@@ -1000,6 +1040,20 @@ fn aacs_authenticate_with_agid(
 
     let (host_sig_r, host_sig_s) = ecdsa_sign(host_priv_key, &sign_data);
 
+    // Self-verify guard (libaacs parity): our OWN signature must verify against
+    // our host cert's public key before we ship it, else the cert's private key
+    // is mispaired with its certificate — fail fast (see Error::AacsHostSignVerify).
+    let (host_pub_x, host_pub_y) = cert_pub_key(host_cert);
+    if !ecdsa_verify(
+        &host_pub_x,
+        &host_pub_y,
+        &host_sig_r,
+        &host_sig_s,
+        &sign_data,
+    ) {
+        return Err(Error::AacsHostSignVerify);
+    }
+
     // Step 8: Send host key point + signature (SEND KEY format 0x02)
     let mut send_buf = [0u8; 84];
     send_buf[1] = 0x52;
@@ -1173,6 +1227,20 @@ fn aacs2_authenticate_p256_with_agid(
 
     let (host_sig_r, host_sig_s) = ecdsa_sign_p256(host_priv_key, &sign_data);
 
+    // Self-verify guard (libaacs parity): the P-256 twin of the AACS 1.0 guard
+    // — a host cert whose private key is mispaired with its certificate is
+    // caught host-side rather than shipped as an unverifiable signature.
+    let (host_pub_x, host_pub_y) = cert_pub_key_p256(host_cert);
+    if !ecdsa_verify_p256(
+        &host_pub_x,
+        &host_pub_y,
+        &host_sig_r,
+        &host_sig_s,
+        &sign_data,
+    ) {
+        return Err(Error::AacsHostSignVerify);
+    }
+
     // Step 8: Send host key point + signature (P-256: 64+64 = 128 bytes payload)
     let mut send_buf = vec![0u8; 132];
     send_buf[1] = 0x82; // data length
@@ -1318,10 +1386,41 @@ pub fn run_cert_handshake(
     const MAX_CERT_ATTEMPTS: usize = 3;
     const PER_CERT_BACKOFF_MS: u64 = 1000;
     let mut last_err_code: Option<u16> = None;
-    for (idx, hc) in host_certs.iter().take(MAX_CERT_ATTEMPTS).enumerate() {
-        if idx > 0 {
+    // The wedge guard caps attempts that TOUCH the drive; the free up-front
+    // skip below does not consume it, so bad keydb entries at the front of the
+    // list can't exhaust the cap before a VALID cert further down is tried.
+    let mut drive_attempts = 0usize;
+    for (idx, hc) in host_certs.iter().enumerate() {
+        // Up-front host-side validity gate (no drive round-trip): a stored key
+        // that fails priv·G == cert pubkey can only earn "KEY NOT ESTABLISHED",
+        // so skip it — unless the cert also carries v2 creds the attempt can try.
+        let host_id = cert_host_id_hex(&hc.certificate);
+        let v1_paired = aacs1_keypair_matches(&hc.private_key, &hc.certificate);
+        let has_v2 = hc.private_key_v2.is_some() && hc.certificate_v2.is_some();
+        if !v1_paired && !has_v2 {
+            tracing::info!(
+                target: "freemkv::disc",
+                phase = "cert_skip_dead_pairing",
+                cert_index = idx,
+                host_id = %host_id,
+                "skipping host cert: its stored private key does not match its \
+                 certificate public key (dead keydb pairing); no drive round-trip"
+            );
+            continue;
+        }
+        if drive_attempts >= MAX_CERT_ATTEMPTS {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "cert_attempt_cap_reached",
+                max_attempts = MAX_CERT_ATTEMPTS,
+                "reached the cert-attempt wedge-guard cap; not trying more certs"
+            );
+            break;
+        }
+        if drive_attempts > 0 {
             std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
         }
+        drive_attempts += 1;
         // Cert-agnostic AKE selection: try AACS 1.0 first (also works for
         // 2.0 drives via backward compat); fall back to P-256 only on a
         // cert-level 1.0 rejection with v2 creds available (docs/aacs-handshake.md).
@@ -1437,7 +1536,7 @@ pub fn run_cert_handshake(
         target: "freemkv::disc",
         phase = "vid_cert_rejected",
         host_cert_count,
-        tried = host_cert_count.min(MAX_CERT_ATTEMPTS),
+        tried = drive_attempts,
         last_error_code = last_err_code,
         "The drive rejected the AACS host certificate, so no Volume ID was obtained."
     );
@@ -1451,19 +1550,144 @@ pub(crate) mod tests {
     use super::*;
     use crate::scsi::mock::{MockTransport, Reply};
 
+    /// Offline self-test of every host cert in a keydb: does its AACS-LA
+    /// signature verify (the exact `verify_cert` check the DRIVE performs at
+    /// SEND KEY 0x01), and does the paired private key match the cert public
+    /// key? Env-gated on `FREEMKV_KEYDB` so CI skips it; run locally with e.g.
+    /// `FREEMKV_KEYDB=~/Downloads/keydb.cfg cargo test la_sig_selftest -- --nocapture`.
+    /// This answers "are the certs valid (drive is the problem)?" with no drive.
+    #[test]
+    fn keydb_host_certs_la_sig_selftest() {
+        let Ok(path) = std::env::var("FREEMKV_KEYDB") else {
+            eprintln!("FREEMKV_KEYDB unset — skipping offline keydb self-test");
+            return;
+        };
+        let text = std::fs::read_to_string(&path).expect("read keydb");
+        let unhex = |s: &str| -> Vec<u8> {
+            let s = s.trim();
+            let s = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
+            let s: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            (0..s.len() / 2)
+                .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+                .collect()
+        };
+        let mut n = 0;
+        let (mut sig_ok, mut pair_ok) = (0, 0);
+        for line in text.lines() {
+            let l = line.trim_start();
+            if l.starts_with("| HC2") || !l.starts_with("| HC") {
+                continue;
+            }
+            let Some(pk) = l
+                .split("HOST_PRIV_KEY")
+                .nth(1)
+                .map(|s| unhex(s.split('|').next().unwrap_or("")))
+            else {
+                continue;
+            };
+            let Some(cert) = l.split("HOST_CERT").nth(1).map(|s| {
+                unhex(
+                    s.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .split('|')
+                        .next()
+                        .unwrap_or(""),
+                )
+            }) else {
+                continue;
+            };
+            if pk.len() != 20 || cert.len() < 92 {
+                continue;
+            }
+            let cert = &cert[..92];
+            let hcid: String = cert[4..10].iter().map(|b| format!("{b:02x}")).collect();
+            let vc = verify_cert(cert);
+            let mut pk20 = [0u8; 20];
+            pk20.copy_from_slice(&pk);
+            let km = aacs1_keypair_matches(&pk20, cert);
+            eprintln!("hcid={hcid} la_sig_verifies={vc} keypair_matches={km}");
+            n += 1;
+            sig_ok += vc as usize;
+            pair_ok += km as usize;
+        }
+        eprintln!("=== {n} certs: la_sig_ok={sig_ok} keypair_ok={pair_ok} ===");
+        assert!(n > 0, "no host certs parsed from {path}");
+    }
+
     // ── Transport-contract tests ── before these, every test here was pure
     // math: nothing drove the handshake fns through a transport that could
     // return `Err`/CHECK CONDITION, letting zero-filled buffers pass as data.
 
     /// A host cert good enough to reach the SCSI steps (the crypto is exercised
     /// by the math tests; these tests are about the transport contract).
+    ///
+    /// The private key and the certificate's embedded public key are a genuine
+    /// matching pair (priv·G placed at the AACS-1.0 offsets 12/32), so the
+    /// step-7 self-verify guard accepts it — a mispaired fixture would now be
+    /// rejected before the SCSI steps under test are reached. See
+    /// [`mispaired_host_cert`] for the deliberately-broken counterpart.
     pub(crate) fn dummy_cert() -> crate::HostCert {
+        let (private_key, px, py) = generate_host_key_pair();
+        let mut certificate = vec![0u8; 92];
+        certificate[0] = 0x02; // AACS 1.0 host cert type
+        certificate[12..32].copy_from_slice(&px);
+        certificate[32..52].copy_from_slice(&py);
         crate::HostCert {
-            private_key: [0x11u8; 20],
-            certificate: vec![0u8; 92],
+            private_key,
+            certificate,
             private_key_v2: None,
             certificate_v2: None,
         }
+    }
+
+    /// A host cert whose private key does NOT match its certificate's public
+    /// key — the exact shape of the corrupt `ffff80000210` keydb entry (its
+    /// stored `pk` is a duplicate of another entry's, so `priv·G` yields the
+    /// wrong public key). Used to prove the step-7 self-verify guard fires.
+    pub(crate) fn mispaired_host_cert() -> crate::HostCert {
+        // Two independent keypairs: certificate carries keypair A's public key,
+        // private_key is keypair B's secret. priv_B·G != pub_A.
+        let (_priv_a, ax, ay) = generate_host_key_pair();
+        let (priv_b, _bx, _by) = generate_host_key_pair();
+        let mut certificate = vec![0u8; 92];
+        certificate[0] = 0x02;
+        certificate[12..32].copy_from_slice(&ax);
+        certificate[32..52].copy_from_slice(&ay);
+        crate::HostCert {
+            private_key: priv_b,
+            certificate,
+            private_key_v2: None,
+            certificate_v2: None,
+        }
+    }
+
+    /// A well-paired cert passes `aacs1_keypair_matches`; the mispaired one (the
+    /// `ffff80000210` shape) fails it. This is the exact primitive the key
+    /// service's host-cert health gate uses to mark a cert DEAD.
+    #[test]
+    fn keypair_matches_accepts_a_matched_pair_and_rejects_a_mispaired_one() {
+        let good = dummy_cert();
+        assert!(
+            aacs1_keypair_matches(&good.private_key, &good.certificate),
+            "priv·G must equal the cert's public key for a genuine pairing"
+        );
+
+        let bad = mispaired_host_cert();
+        assert!(
+            !aacs1_keypair_matches(&bad.private_key, &bad.certificate),
+            "a private key that isn't the cert's must be rejected"
+        );
+
+        // Degenerate inputs never panic and are never "valid".
+        assert!(!aacs1_keypair_matches(&[0u8; 20], &good.certificate));
+        assert!(!aacs1_keypair_matches(
+            &good.private_key,
+            &good.certificate[..40]
+        ));
     }
 
     /// Catches deleting the `status` check in `scsi_read`: per the transport
@@ -1662,6 +1886,39 @@ pub(crate) mod tests {
         assert_eq!(auth.read_data_key, Some(rdk));
     }
 
+    // BK→RDK derivation: the Read/Write Data Keys handed to the caller MUST be
+    // exactly AES-128-ECB-decrypt(bus_key, enc_key). Plants a known bus_key +
+    // wrapped keys and pins the exact unwrap (not just "a key was stored").
+    #[test]
+    fn read_data_keys_unwraps_rdk_by_ecb_decrypt_under_the_bus_key() {
+        let bus_key = [0x42u8; 16];
+        let enc_rdk = [0x7Bu8; 16];
+        let enc_wdk = [0x7Cu8; 16];
+        let mut resp = vec![0u8; 36];
+        resp[4..20].copy_from_slice(&enc_rdk);
+        resp[20..36].copy_from_slice(&enc_wdk);
+        let mut t = MockTransport::always(Reply::good(resp));
+        let mut auth = AacsAuth {
+            bus_key,
+            agid: 0,
+            volume_id: None,
+            read_data_key: None,
+            drive_cert: [0u8; 92],
+        };
+        let (rdk, wdk) = read_data_keys(&mut t, &mut auth).expect("decrypts");
+        assert_eq!(
+            rdk,
+            crate::aacs::aes_ecb_decrypt(&bus_key, &enc_rdk),
+            "read_data_key must be AES-ECB-decrypt(bus_key, enc_rdk)"
+        );
+        assert_eq!(
+            wdk,
+            crate::aacs::aes_ecb_decrypt(&bus_key, &enc_wdk),
+            "write_data_key must be AES-ECB-decrypt(bus_key, enc_wdk)"
+        );
+        assert_eq!(auth.read_data_key, Some(rdk), "the rdk must be recorded");
+    }
+
     // Defect-D1: a cert type byte that's neither 0x01 nor 0x11 must be
     // REJECTED at the cert-type gate, not fall through to trust the drive's
     // own unverified key. `AacsCertVerify` pins it happens before any key is trusted.
@@ -1703,22 +1960,56 @@ pub(crate) mod tests {
         drive_y: [u8; 20],
         vid: [u8; 16],
         bus_key: Option<[u8; 16]>,
+        /// The nonce the drive issues at step 5, which the host must sign at
+        /// step 7 (over `drive_nonce || host_key_point_x || host_key_point_y`).
+        drive_nonce: [u8; 20],
+        /// When set, the drive verifies the host's step-8 signature against
+        /// this host-cert public key over the EXACT step-7 layout, and records
+        /// the result in `host_sig_ok` — pinning the production signed-data
+        /// layout the way a real drive checks it.
+        pub(crate) host_cert_pub: Option<([u8; 20], [u8; 20])>,
+        /// Result of the step-8 host-signature check (`None` until SEND KEY
+        /// format 0x02 arrives, and only when `host_cert_pub` is set).
+        pub(crate) host_sig_ok: Option<bool>,
         /// When set, format-0x84 (read-data-keys) is served a genuine non-zero
         /// response instead of the default dead-bus behaviour, letting
         /// `run_cert_handshake` run all the way to its `Ok` return.
         pub(crate) serve_data_keys: bool,
+        /// When set, format-0x84 is served an all-ZERO (but GOOD-status)
+        /// response: a non-transport `AacsDataKey` failure, so `run_cert_handshake`
+        /// returns `Ok` with `read_data_key: None` + `read_data_key_err: Some` —
+        /// the "auth+VID OK, drive served no bus key" path.
+        pub(crate) serve_zero_data_keys: bool,
+        /// Every 92-byte host cert the host shipped at SEND KEY format 0x01
+        /// (step 4), in order. Lets a test assert a locally-skipped cert never
+        /// reached the drive at all (no wasted round-trip).
+        pub(crate) certs_sent: Vec<Vec<u8>>,
+        /// Reject this many initial SEND KEY format-0x01 cert-sends with a
+        /// CHECK CONDITION / 6F/00 (AACS copy-protection key-exchange failure —
+        /// the shape of an HRL revocation), then behave normally. Models a
+        /// drive that revokes a structurally-valid host cert.
+        pub(crate) revoke_cert_sends: usize,
     }
 
     impl DriveEmu {
         pub(crate) fn new() -> Self {
             let (drive_priv, drive_x, drive_y) = generate_host_key_pair();
+            let mut drive_nonce = [0u8; 20];
+            use rand::Rng;
+            rand::rng().fill_bytes(&mut drive_nonce);
             DriveEmu {
                 drive_priv,
                 drive_x,
                 drive_y,
                 vid: [0x5Au8; 16],
                 bus_key: None,
+                drive_nonce,
+                host_cert_pub: None,
+                host_sig_ok: None,
                 serve_data_keys: false,
+                serve_zero_data_keys: false,
+                certs_sent: Vec::new(),
+                revoke_cert_sends: 0,
             }
         }
     }
@@ -1747,6 +2038,7 @@ pub(crate) mod tests {
                     0x01 => {
                         // drive cert + nonce; type 0x11 → cert + step-6 verify skipped
                         let mut r = vec![0u8; 116];
+                        r[4..24].copy_from_slice(&self.drive_nonce);
                         r[24] = 0x11;
                         ok(r, data)
                     }
@@ -1760,6 +2052,23 @@ pub(crate) mod tests {
                     _ => ok(vec![0u8; 2], data),
                 },
                 crate::scsi::SCSI_SEND_KEY => {
+                    if cdb[10] & 0x3F == 0x01 {
+                        // Step 4: host cert + nonce. Record the cert bytes so a
+                        // test can prove a locally-skipped cert never got here.
+                        self.certs_sent.push(data[24..116].to_vec());
+                        if self.certs_sent.len() <= self.revoke_cert_sends {
+                            // Revoke this cert: CHECK CONDITION / 6F/00.
+                            let mut sense = [0u8; 32];
+                            sense[2] = 0x05; // ILLEGAL REQUEST
+                            sense[12] = 0x6F; // copy-protection key-exchange failure
+                            sense[13] = 0x00;
+                            return Ok(crate::scsi::ScsiResult {
+                                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                                bytes_transferred: 0,
+                                sense,
+                            });
+                        }
+                    }
                     if cdb[10] & 0x3F == 0x02 {
                         // host key point arrives in the ToDevice buffer; derive
                         // the shared bus key from the drive side (drive_priv ×
@@ -1769,6 +2078,21 @@ pub(crate) mod tests {
                         hx.copy_from_slice(&data[4..24]);
                         hy.copy_from_slice(&data[24..44]);
                         self.bus_key = compute_bus_key(&self.drive_priv, &hx, &hy);
+
+                        // If asked to, verify the host's signature exactly as a
+                        // real drive would: over drive_nonce || host_x || host_y
+                        // (the step-7 layout), using the host cert public key.
+                        if let Some((hpx, hpy)) = self.host_cert_pub {
+                            let mut sr = [0u8; 20];
+                            let mut ss = [0u8; 20];
+                            sr.copy_from_slice(&data[44..64]);
+                            ss.copy_from_slice(&data[64..84]);
+                            let mut signed = [0u8; 60];
+                            signed[..20].copy_from_slice(&self.drive_nonce);
+                            signed[20..40].copy_from_slice(&hx);
+                            signed[40..60].copy_from_slice(&hy);
+                            self.host_sig_ok = Some(ecdsa_verify(&hpx, &hpy, &sr, &ss, &signed));
+                        }
                     }
                     ok(vec![], data)
                 }
@@ -1784,7 +2108,11 @@ pub(crate) mod tests {
                     // format 0x84 read-data-keys: the bus dies here, unless
                     // the test opted into a full success path.
                     _ => {
-                        if self.serve_data_keys {
+                        if self.serve_zero_data_keys {
+                            // GOOD status, all-zero block: read_data_keys rejects
+                            // it (AacsDataKey, non-transport) → Ok with no bus key.
+                            ok(vec![0u8; 36], data)
+                        } else if self.serve_data_keys {
                             let mut r = vec![0u8; 36];
                             r[4..20].copy_from_slice(&[0x7Bu8; 16]); // enc read data key
                             r[20..36].copy_from_slice(&[0x7Cu8; 16]); // enc write data key
@@ -2715,19 +3043,16 @@ pub(crate) mod tests {
         let (la_priv, la_x, la_y) = generate_host_key_pair_p256();
         let (drive_lt_priv, drive_lt_x, drive_lt_y) = generate_host_key_pair_p256();
         let cert = p256_synth_cert(0x11, &drive_lt_x, &drive_lt_y, &la_priv);
-        let (host_priv, _hx, _hy) = generate_host_key_pair_p256();
+        let (host_priv, host_x, host_y) = generate_host_key_pair_p256();
+        // The host cert must embed the host's own public key so the step-7
+        // self-verify guard passes (the drive emulator ignores the host cert's
+        // signature, so any LA key is fine to sign it).
+        let host_cert = p256_synth_cert(0x11, &host_x, &host_y, &la_priv);
 
         let mut emu = DriveEmuP256::new(drive_lt_priv, cert);
-        let auth = aacs2_authenticate_p256_with_anchor(
-            &mut emu,
-            &host_priv,
-            // host cert is only echoed on the wire; a 132-byte placeholder is
-            // enough — the drive emulator does not verify the HOST cert.
-            &[0x11u8; 132],
-            &la_x,
-            &la_y,
-        )
-        .expect("a genuine LA-signed 2.0 cert must complete the AKE");
+        let auth =
+            aacs2_authenticate_p256_with_anchor(&mut emu, &host_priv, &host_cert, &la_x, &la_y)
+                .expect("a genuine LA-signed 2.0 cert must complete the AKE");
         assert_ne!(auth.bus_key, [0u8; 16], "a bus key must be derived");
         assert_eq!(
             Some(auth.bus_key),
@@ -2786,12 +3111,15 @@ pub(crate) mod tests {
         let (la_priv, la_x, la_y) = generate_host_key_pair_p256();
         let (drive_lt_priv, drive_lt_x, drive_lt_y) = generate_host_key_pair_p256();
         let cert = p256_synth_cert(0x11, &drive_lt_x, &drive_lt_y, &la_priv);
-        let (host_priv, _hx, _hy) = generate_host_key_pair_p256();
+        let (host_priv, host_x, host_y) = generate_host_key_pair_p256();
+        // Host cert embeds the host pubkey so the step-7 self-verify guard
+        // passes and the AKE reaches the step-9 off-curve rejection under test.
+        let host_cert = p256_synth_cert(0x11, &host_x, &host_y, &la_priv);
 
         let mut emu = DriveEmuP256::new(drive_lt_priv, cert);
         emu.off_curve_point = true;
         let err =
-            aacs2_authenticate_p256_with_anchor(&mut emu, &host_priv, &[0x11u8; 132], &la_x, &la_y)
+            aacs2_authenticate_p256_with_anchor(&mut emu, &host_priv, &host_cert, &la_x, &la_y)
                 .expect_err("an off-curve drive key point must abort the ECDH");
         assert!(
             matches!(err, Error::AacsKeyVerify),
@@ -3109,5 +3437,449 @@ pub(crate) mod tests {
         // let cert = hex_to_bytes(REAL_2_0_DRIVE_CERT_HEX);
         // assert!(verify_cert_p256(&cert, &AACS2_LA_PUB_X, &AACS2_LA_PUB_Y));
         unimplemented!("drop a genuine 2.0 cert fixture here");
+    }
+
+    // ── Host-signing self-verify: the class of bug the priv·G check exposes ──
+    // Targets the AKE host-signing surface (step 7). Pre-existing tests
+    // round-trip a FRESH keypair (self-consistent), so can't catch a mispairing.
+
+    /// A helper that returns `(priv·G).x‖.y` as the AACS-1.0 20-byte pair, so
+    /// tests can assert the base-point plumbing (`ec_mul` over `EC_G`) against
+    /// an independently-extracted cert public key. Cross-checks libaacs, which
+    /// derives the host public key the same way (`crypto_create_host_key_pair`).
+    fn priv_times_g_v1(priv_key: &[u8; 20]) -> ([u8; 20], [u8; 20]) {
+        let p = BigUint::from_bytes_be(&EC_P);
+        let a = BigUint::from_bytes_be(&EC_A);
+        let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+        let d = BigUint::from_bytes_be(priv_key);
+        let q = ec_mul(&d, &g, &a, &p);
+        let mut x = [0u8; 20];
+        let mut y = [0u8; 20];
+        x.copy_from_slice(&to_bytes_be_padded(&q.x, 20));
+        y.copy_from_slice(&to_bytes_be_padded(&q.y, 20));
+        (x, y)
+    }
+
+    /// For an internally-consistent host cert (`dummy_cert`), `priv·G` MUST
+    /// equal the public key extracted at the AACS-1.0 offsets 12/32 — the exact
+    /// check that separates "cert_pub_key offset wrong / wrong base point" from
+    /// "signing algorithm wrong". Synthetic twin of the real-cert check in
+    /// `real_host_certs_priv_times_g_and_self_verify`.
+    #[test]
+    fn priv_times_g_equals_cert_pub_key_for_a_consistent_cert() {
+        let hc = dummy_cert();
+        let priv_key = hc.private_key;
+        let (qx, qy) = priv_times_g_v1(&priv_key);
+        let (cx, cy) = cert_pub_key(&hc.certificate);
+        assert_eq!(qx, cx, "priv·G x must equal cert pub_x at offset 12");
+        assert_eq!(qy, cy, "priv·G y must equal cert pub_y at offset 32");
+    }
+
+    /// The FIX-TARGET property in primitive form: a signature made with a host
+    /// cert's private key MUST verify against the SAME cert's public key over
+    /// arbitrary 60-byte step-7 data — the exact "sign with cert priv, verify
+    /// with cert_pub_key(cert)" path that hardware exercises.
+    #[test]
+    fn ecdsa_sign_self_verifies_against_own_cert_pubkey_60_bytes() {
+        let hc = dummy_cert();
+        let (cx, cy) = cert_pub_key(&hc.certificate);
+        let data = [0xA5u8; 60];
+        let (r, s) = ecdsa_sign(&hc.private_key, &data);
+        assert!(
+            ecdsa_verify(&cx, &cy, &r, &s, &data),
+            "a signature by the cert's private key must self-verify against its pubkey"
+        );
+    }
+
+    /// The REPRODUCTION (no hardware, no secrets): a signature by a private key
+    /// that does NOT match the certificate's public key fails to self-verify —
+    /// exactly the `ffff80000210` mispaired-keydb failure mode, which the step-7
+    /// guard turns into a precise host-side error.
+    #[test]
+    fn ecdsa_sign_fails_to_self_verify_against_a_mismatched_cert_pubkey() {
+        let hc = mispaired_host_cert();
+        let (cx, cy) = cert_pub_key(&hc.certificate);
+        let data = [0xA5u8; 60];
+        let (r, s) = ecdsa_sign(&hc.private_key, &data);
+        assert!(
+            !ecdsa_verify(&cx, &cy, &r, &s, &data),
+            "a signature by a mismatched private key must NOT verify against the cert pubkey"
+        );
+        // …and priv·G must NOT equal the cert's public key, either.
+        let (qx, qy) = priv_times_g_v1(&hc.private_key);
+        assert!(
+            qx != cx || qy != cy,
+            "a mispaired cert must have priv·G != cert pubkey"
+        );
+    }
+
+    /// The step-7 self-verify GUARD, end-to-end over the 1.0 AKE: a mispaired
+    /// host cert must abort with `AacsHostSignVerify` at step 7 — BEFORE the
+    /// doomed signature is ever sent to the drive (SEND KEY format 0x02).
+    #[test]
+    fn host_sign_guard_rejects_a_mispaired_host_cert() {
+        let mut emu = DriveEmu::new();
+        let hc = mispaired_host_cert();
+        let err = aacs_authenticate(&mut emu, &hc.private_key, &hc.certificate)
+            .expect_err("a mispaired host cert must be rejected at the self-verify guard");
+        assert!(
+            matches!(err, Error::AacsHostSignVerify),
+            "must fail at the step-7 self-verify guard; got {err:?}"
+        );
+        // The guard fires BEFORE step 8, so the drive never saw a key point:
+        // the bus key was never derived on the drive side.
+        assert!(
+            emu.host_sig_ok.is_none() || emu.host_sig_ok == Some(false),
+            "the doomed signature must not have been shipped"
+        );
+    }
+
+    // ── Cert-selection fallback: skip dead pairings, roll down to a valid one ──
+
+    /// Given `[mispaired, valid]`, the unlocker gates the mispaired cert out
+    /// HOST-SIDE (its priv·G != cert pubkey) with no drive round-trip, then
+    /// authenticates with the valid one. The mispaired cert must never have
+    /// been shipped at SEND KEY format 0x01.
+    #[test]
+    fn fallback_skips_locally_mispaired_cert_and_auths_with_the_next_valid_one() {
+        let mut emu = DriveEmu::new();
+        emu.serve_data_keys = true;
+        let good = dummy_cert();
+        let certs = vec![mispaired_host_cert(), good.clone()];
+        let ch = run_cert_handshake(&mut emu, &certs)
+            .expect("the mispaired cert is skipped locally; the valid one authenticates");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+        assert!(ch.read_data_key.is_some());
+        assert_eq!(
+            emu.certs_sent.len(),
+            1,
+            "only the VALID cert may reach the drive; the mispaired one is gated out"
+        );
+        assert_eq!(&emu.certs_sent[0][..], &good.certificate[..92]);
+    }
+
+    /// Given `[valid_revoked_by_drive, valid_accepted]` where BOTH pass the
+    /// host-side keypair gate, a drive-side 6F/00 (copy-protection key-exchange
+    /// failure — the HRL-revocation shape) on the first cert-send must roll
+    /// through to the second cert, which authenticates. Both certs are shipped:
+    /// revocation is only discoverable via a drive round-trip.
+    #[test]
+    fn fallback_rolls_past_a_drive_revoked_cert_to_the_next_accepted_one() {
+        let mut emu = DriveEmu::new();
+        emu.serve_data_keys = true;
+        emu.revoke_cert_sends = 1;
+        let first = dummy_cert();
+        let second = dummy_cert();
+        assert!(aacs1_keypair_matches(
+            &first.private_key,
+            &first.certificate
+        ));
+        assert!(aacs1_keypair_matches(
+            &second.private_key,
+            &second.certificate
+        ));
+        let ch = run_cert_handshake(&mut emu, &[first.clone(), second.clone()])
+            .expect("roll past the revoked cert and authenticate with the next");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+        assert_eq!(
+            emu.certs_sent.len(),
+            2,
+            "the revoked cert IS shipped (a round-trip reveals revocation), then the next"
+        );
+        assert_eq!(&emu.certs_sent[0][..], &first.certificate[..92]);
+        assert_eq!(&emu.certs_sent[1][..], &second.certificate[..92]);
+    }
+
+    /// A LONE mispaired cert must fail cleanly with `HandshakeRejected` and
+    /// WITHOUT any drive round-trip — the host-side gate fires before a single
+    /// CDB is issued. Uses the mock transport so a wasted SEND KEY 0x01 would
+    /// be recorded and caught.
+    #[test]
+    fn only_a_mispaired_cert_fails_without_any_drive_round_trip() {
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let err = run_cert_handshake(&mut t, &[mispaired_host_cert()])
+            .expect_err("a lone mispaired cert cannot authenticate");
+        assert!(matches!(err, crate::UnlockError::HandshakeRejected));
+        assert_eq!(
+            t.calls(),
+            0,
+            "no SCSI command may be issued for a locally-dead pairing"
+        );
+        assert!(
+            t.cdbs.iter().all(|c| c[0] != crate::scsi::SCSI_SEND_KEY),
+            "no SEND KEY cert-send round-trip for a locally-dead cert"
+        );
+    }
+
+    /// The single-valid-cert happy path is unchanged: exactly one cert is
+    /// shipped to the drive and the handshake succeeds (the up-front gate must
+    /// not skip a genuinely-valid cert).
+    #[test]
+    fn single_valid_cert_still_ships_exactly_one_cert_and_succeeds() {
+        let mut emu = DriveEmu::new();
+        emu.serve_data_keys = true;
+        let good = dummy_cert();
+        let ch = run_cert_handshake(&mut emu, std::slice::from_ref(&good))
+            .expect("a lone valid cert authenticates as before");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+        assert_eq!(emu.certs_sent.len(), 1);
+        assert_eq!(&emu.certs_sent[0][..], &good.certificate[..92]);
+    }
+
+    /// The positive counterpart, end-to-end: a consistent host cert passes the
+    /// step-7 guard AND the drive, verifying the host signature the way real
+    /// hardware does, confirms it against the EXACT step-7 layout
+    /// (`drive_nonce || host_key_point_x || host_key_point_y`). Pins the
+    /// production signed-data layout to libaacs's `crypto_aacs_sign` block.
+    #[test]
+    fn host_sign_guard_accepts_consistent_cert_and_drive_verifies_step7_layout() {
+        let hc = dummy_cert();
+        let (cx, cy) = cert_pub_key(&hc.certificate);
+        let mut emu = DriveEmu::new();
+        emu.host_cert_pub = Some((cx, cy));
+        let auth = aacs_authenticate(&mut emu, &hc.private_key, &hc.certificate)
+            .expect("a consistent host cert must complete the AKE through step 9");
+        assert_ne!(auth.bus_key, [0u8; 16], "a bus key must be derived");
+        assert_eq!(
+            emu.host_sig_ok,
+            Some(true),
+            "the drive must verify the host signature over drive_nonce||host_x||host_y"
+        );
+    }
+
+    /// Step-6 (DRIVE signature) verify, 1.0 primitive: the host verifies
+    /// `sign(host_nonce || drive_key_point)` against the drive cert's public
+    /// key. A valid signature verifies; tampering the data OR the signature
+    /// rejects — the exact acceptance/rejection the step-6 check performs.
+    #[test]
+    fn step6_drive_key_signature_valid_and_invalid() {
+        // Drive long-term keypair (stands in for the drive cert key).
+        let (drive_priv, drive_x, drive_y) = generate_host_key_pair();
+        // Ephemeral drive key point that gets signed.
+        let (_eph_priv, kx, ky) = generate_host_key_pair();
+        let host_nonce = [0x33u8; 20];
+
+        let mut signed = [0u8; 60];
+        signed[..20].copy_from_slice(&host_nonce);
+        signed[20..40].copy_from_slice(&kx);
+        signed[40..60].copy_from_slice(&ky);
+        let (r, s) = ecdsa_sign(&drive_priv, &signed);
+
+        assert!(
+            ecdsa_verify(&drive_x, &drive_y, &r, &s, &signed),
+            "a genuine drive key-point signature must verify"
+        );
+        // Tampered signed data → reject.
+        let mut bad = signed;
+        bad[59] ^= 0x01;
+        assert!(
+            !ecdsa_verify(&drive_x, &drive_y, &r, &s, &bad),
+            "a tampered signed region must be rejected"
+        );
+        // Tampered signature → reject.
+        let mut bad_s = s;
+        bad_s[19] ^= 0x01;
+        assert!(
+            !ecdsa_verify(&drive_x, &drive_y, &r, &bad_s, &signed),
+            "a tampered signature must be rejected"
+        );
+        // Wrong public key → reject.
+        let (_p2, wx, wy) = generate_host_key_pair();
+        assert!(
+            !ecdsa_verify(&wx, &wy, &r, &s, &signed),
+            "the wrong public key must be rejected"
+        );
+    }
+
+    /// `read_volume_id` ACCEPTS a correct MAC and returns the VID; and REJECTS
+    /// a wrong MAC with `AacsVidMac`. Exercises the function through the
+    /// transport (existing MAC tests are primitive-level or via run_cert_handshake).
+    #[test]
+    fn read_volume_id_accepts_correct_mac_and_rejects_wrong_mac() {
+        let bus_key = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ];
+        let vid = [
+            0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let mac = aes_cmac_16(&vid, &bus_key);
+
+        // Accept path.
+        let mut good = vec![0u8; 36];
+        good[4..20].copy_from_slice(&vid);
+        good[20..36].copy_from_slice(&mac);
+        let mut t = MockTransport::always(Reply::good(good));
+        let mut auth = AacsAuth {
+            bus_key,
+            agid: 0,
+            volume_id: None,
+            read_data_key: None,
+            drive_cert: [0u8; 92],
+        };
+        let got = read_volume_id(&mut t, &mut auth).expect("a correct MAC must be accepted");
+        assert_eq!(got, vid, "the VID must be returned verbatim");
+        assert_eq!(auth.volume_id, Some(vid), "the VID must be recorded");
+
+        // Reject path: a wrong MAC.
+        let mut bad = vec![0u8; 36];
+        bad[4..20].copy_from_slice(&vid);
+        bad[20..36].copy_from_slice(&mac);
+        bad[20] ^= 0x01; // corrupt one MAC byte
+        let mut t2 = MockTransport::always(Reply::good(bad));
+        let mut auth2 = AacsAuth {
+            bus_key,
+            agid: 0,
+            volume_id: None,
+            read_data_key: None,
+            drive_cert: [0u8; 92],
+        };
+        let e = read_volume_id(&mut t2, &mut auth2).expect_err("a wrong MAC must be rejected");
+        assert!(matches!(e, Error::AacsVidMac), "got {e:?}");
+        assert!(
+            auth2.volume_id.is_none(),
+            "no VID may be recorded on MAC failure"
+        );
+    }
+
+    // ── Real-keydb-driven suite (the priv·G check that root-caused the bug) ──
+
+    /// Load the real host certs from the local keydb JSON, or `None` when it is
+    /// absent (so these tests SKIP cleanly in CI). Private keys must NEVER be
+    /// committed to this repo (public github origin; the maintainers embed cert
+    /// PUBLIC keys only and precommit runs a secret-leak scanner), so the certs
+    /// are read at runtime from `$FREEMKV_KEYDB_JSON` (else `$HOME/Downloads`).
+    fn load_keydb_host_certs() -> Option<Vec<(Vec<u8>, [u8; 20])>> {
+        // Honour an override, else the canonical local path (built from $HOME
+        // at runtime so no developer path is hard-coded into the source).
+        let path = std::env::var("FREEMKV_KEYDB_JSON").ok().or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| format!("{h}/Downloads/keys.json"))
+        })?;
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+        let arr = json.get("host_certs")?.as_array()?;
+        let hexb = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        let mut out = Vec::new();
+        for c in arr {
+            let hc = hexb(c.get("hc")?.as_str()?);
+            let pk = hexb(c.get("pk")?.as_str()?);
+            if hc.len() == 92 && pk.len() == 20 {
+                let mut priv_key = [0u8; 20];
+                priv_key.copy_from_slice(&pk);
+                out.push((hc, priv_key));
+            }
+        }
+        Some(out)
+    }
+
+    /// For EVERY real host cert: it is a genuine LA-signed cert, and — for the
+    /// internally-consistent ones — `priv·G == cert_pub_key(cert)` AND a
+    /// signature by its private key self-verifies against its cert pubkey. Any
+    /// mispaired entry (priv·G != pubkey) is REPORTED, not silently tolerated.
+    #[test]
+    fn real_host_certs_priv_times_g_and_self_verify() {
+        let Some(certs) = load_keydb_host_certs() else {
+            eprintln!("skip: local keydb JSON not present (set FREEMKV_KEYDB_JSON to run)");
+            return;
+        };
+        assert!(!certs.is_empty(), "keydb must carry at least one host cert");
+
+        let mut consistent = 0usize;
+        let mut mispaired: Vec<String> = Vec::new();
+        for (i, (hc, priv_key)) in certs.iter().enumerate() {
+            // Every entry's certificate must carry a genuine LA signature.
+            assert!(verify_cert(hc), "cert {i}: LA signature must verify");
+
+            let (cx, cy) = cert_pub_key(hc);
+            let (qx, qy) = priv_times_g_v1(priv_key);
+            if qx == cx && qy == cy {
+                consistent += 1;
+                // The fix-target property: sign→self-verify MUST pass.
+                let data = [0x5Au8; 60];
+                let (r, s) = ecdsa_sign(priv_key, &data);
+                assert!(
+                    ecdsa_verify(&cx, &cy, &r, &s, &data),
+                    "cert {i}: a consistent keydb pair must sign→self-verify"
+                );
+            } else {
+                let hostid: String = hc[4..10].iter().map(|b| format!("{b:02x}")).collect();
+                mispaired.push(hostid);
+            }
+        }
+        assert!(
+            consistent >= 1,
+            "at least one internally-consistent real cert must exist"
+        );
+        if !mispaired.is_empty() {
+            eprintln!(
+                "note: {} keydb ent/ies are MISPAIRED (priv·G != cert pubkey): {mispaired:?} — \
+                 the step-7 self-verify guard correctly rejects these host-side",
+                mispaired.len()
+            );
+        }
+    }
+
+    /// The precise root-cause reproduction, keydb-driven: the `ffff80000210`
+    /// entry pairs a valid, LA-signed certificate with the WRONG private key —
+    /// a byte-for-byte duplicate of the `ffff000000ae` entry's key — so
+    /// `priv·G` yields the OTHER entry's public key and the step-7 self-verify
+    /// guard (correctly) rejects it. Documents that the bug is a corrupt keydb
+    /// entry, not a defect in `ecdsa_sign` / `cert_pub_key`.
+    #[test]
+    fn keydb_entry_ffff80000210_is_mispaired_with_a_duplicate_private_key() {
+        let Some(certs) = load_keydb_host_certs() else {
+            eprintln!("skip: local keydb JSON not present");
+            return;
+        };
+        let find = |hostid_hex: &str| -> Option<(Vec<u8>, [u8; 20])> {
+            certs.iter().find_map(|(hc, pk)| {
+                let hid: String = hc[4..10].iter().map(|b| format!("{b:02x}")).collect();
+                (hid == hostid_hex).then(|| (hc.clone(), *pk))
+            })
+        };
+        let (Some((cert210, pk210)), Some((_certae, pkae))) =
+            (find("ffff80000210"), find("ffff000000ae"))
+        else {
+            eprintln!("skip: expected keydb host ids not present in this keydb");
+            return;
+        };
+
+        // Its certificate is genuine (LA-signed) — the cert is NOT the problem.
+        assert!(
+            verify_cert(&cert210),
+            "the ffff80000210 cert is genuinely LA-signed"
+        );
+
+        // The stored private key is a byte-for-byte duplicate of another entry.
+        assert_eq!(
+            pk210, pkae,
+            "the ffff80000210 private key is a duplicate of the ffff000000ae key"
+        );
+
+        // Consequently priv·G != this cert's public key: the mispairing.
+        let (cx, cy) = cert_pub_key(&cert210);
+        let (qx, qy) = priv_times_g_v1(&pk210);
+        assert!(
+            qx != cx || qy != cy,
+            "priv·G must NOT equal the ffff80000210 cert public key (mispaired)"
+        );
+
+        // And a signature by the stored key fails to self-verify — precisely
+        // what the drive rejects as KEY NOT ESTABLISHED and what the guard now
+        // catches host-side.
+        let data = [0x5Au8; 60];
+        let (r, s) = ecdsa_sign(&pk210, &data);
+        assert!(
+            !ecdsa_verify(&cx, &cy, &r, &s, &data),
+            "the mispaired key must fail to self-verify against its cert pubkey"
+        );
     }
 }
