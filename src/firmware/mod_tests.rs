@@ -39,6 +39,7 @@ fn state_and_frame_constants_match_abi() {
     assert_eq!(STATE_ON, 0x01);
     assert_eq!(SPEED_MAX, 0x01);
     assert_eq!(HRL_WIPE_ONCE, 0x02);
+    assert_eq!(STATE_BD_DISABLE, 0x02);
     assert_eq!([REGION_BD_A, REGION_BD_B, REGION_BD_C], [0x2A, 0x2B, 0x2C]);
     assert_eq!(REGION_DVD_BASE, 0x10);
 }
@@ -348,7 +349,7 @@ fn typed_setters_issue_expected_set_cdbs() {
         fw.unlock_speed().unwrap();
     }
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
-    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bd, STATE_OFF));
+    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bd, STATE_BD_DISABLE));
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_ON));
     assert_eq!(m.cdbs[3], build_set_cdb(Feature::Hrl, HRL_WIPE_ONCE));
     assert_eq!(m.cdbs[4], build_set_cdb(Feature::Ake, STATE_ON));
