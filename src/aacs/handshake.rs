@@ -149,6 +149,18 @@ const AACS2_LA_PUB_Y: [u8; 32] = [
     0x0F, 0x68, 0x4A, 0x05, 0x96, 0xE9, 0xCE, 0x00, 0xC4, 0xD3, 0xFE, 0x6E, 0x24, 0x45, 0x4D, 0xD0,
 ];
 
+// EXPERIMENTAL gate for the native AACS 2.0 (P-256) AKE at the production API
+// boundary. The 2.0 cert byte offsets (`verify_cert_p256`, `cert_pub_key_p256`)
+// are PROVISIONAL — self-described unverified against a genuine captured 2.0
+// cert (see docs/aacs-handshake.md) — so running the real-anchor P-256 verify
+// could silently mis-verify. Keep DISABLED until a captured test vector confirms
+// the offsets (see the `#[ignore]`d
+// `real_aacs2_cert_verifies_under_the_published_la_anchor`). The AKE code and its
+// fall-through wiring stay fully exercised by tests through the anchor-
+// parametrised entry points; only the production `run_cert_handshake`
+// real-anchor attempt is gated. Flip to `true` once a real cert lands.
+const AACS2_P256_EXPERIMENTAL: bool = false;
+
 // AACS 1.0 LA (Licensing Administrator) public key on the 160-bit curve,
 // big-endian; validated on-curve and against a genuine LA-signed host cert
 // (the prior compiled-in value was OFF-CURVE, rejecting every real cert).
@@ -637,6 +649,13 @@ fn compute_bus_key_p256(
     let dkp = EcPoint::new(dx, dy);
 
     let shared = ec_mul(&d, &dkp, &a, &p);
+    // Defensive: a shared point at infinity has no usable x-coordinate (its
+    // stored x is 0), so it must never be reduced to a bus key. Cannot happen
+    // for d in [1, n) against an on-curve point in the prime-order subgroup, but
+    // guard rather than silently derive an all-zero-ish key.
+    if shared.infinity {
+        return None;
+    }
 
     // Bus key = lowest 128 bits of x-coordinate
     let x_bytes = to_bytes_be_padded(&shared.x, 32);
@@ -647,8 +666,20 @@ fn compute_bus_key_p256(
 
 // ── AACS certificate handling ───────────────────────────────────────────────
 
-/// Verify an AACS certificate (92 bytes) against the AACS LA public key.
+/// Verify an AACS certificate (92 bytes) against the production AACS 1.0 LA
+/// public key. Production verifies via [`verify_cert_with_anchor`] (the live
+/// path threads the real anchor there); this real-anchor convenience is
+/// exercised by the genuine-cert tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn verify_cert(cert: &[u8]) -> bool {
+    verify_cert_with_anchor(cert, &AACS_LA_PUB_X, &AACS_LA_PUB_Y)
+}
+
+/// `verify_cert` with the LA trust anchor as a parameter, so a drive-side test
+/// emulator can present a certificate signed by a self-generated test LA key
+/// (the production anchor's private half doesn't exist). Production threads
+/// `AACS_LA_PUB_X/Y` via [`verify_cert`].
+fn verify_cert_with_anchor(cert: &[u8], la_x: &[u8; 20], la_y: &[u8; 20]) -> bool {
     if cert.len() < 92 {
         return false;
     }
@@ -659,7 +690,7 @@ fn verify_cert(cert: &[u8]) -> bool {
     sig_r.copy_from_slice(&cert[52..72]);
     sig_s.copy_from_slice(&cert[72..92]);
 
-    ecdsa_verify(&AACS_LA_PUB_X, &AACS_LA_PUB_Y, &sig_r, &sig_s, &cert[..52])
+    ecdsa_verify(la_x, la_y, &sig_r, &sig_s, &cert[..52])
 }
 
 // Extract public key from certificate. Returns a zeroed key pair if `cert`
@@ -727,6 +758,11 @@ fn compute_bus_key(
     let dkp = EcPoint::new(dx, dy);
 
     let shared = ec_mul(&d, &dkp, &a, &p);
+    // Defensive: a shared point at infinity has no usable x-coordinate, so it
+    // must never be reduced to a bus key (mirrors compute_bus_key_p256).
+    if shared.infinity {
+        return None;
+    }
 
     // Bus key = lowest 128 bits (last 16 bytes) of x-coordinate
     let x_bytes = to_bytes_be_padded(&shared.x, 20);
@@ -746,11 +782,12 @@ fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
         let mut priv_bytes = [0u8; 32];
         use rand::Rng;
         rand::rng().fill_bytes(&mut priv_bytes);
-        // d == 0 (prob ~1/n) would yield the point at infinity / an
-        // all-zero key and degenerate the bus key — reject and retry,
+        // Rejection-sample d in [1, n): reducing raw RNG bytes mod n would bias
+        // d toward small values (n isn't a power of two), the same modulo bias
+        // the ECDSA nonce path rejects. Redraw any candidate that is 0 or >= n,
         // matching the AACS 1.0 sibling generate_host_key_pair.
-        let d = BigUint::from_bytes_be(&priv_bytes) % &n;
-        if d.is_zero() {
+        let d = BigUint::from_bytes_be(&priv_bytes);
+        if d.is_zero() || d >= n {
             continue;
         }
         let q = ec_mul(&d, &g, &a, &p_mod);
@@ -778,8 +815,11 @@ fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
         let mut priv_bytes = [0u8; 20];
         use rand::Rng;
         rand::rng().fill_bytes(&mut priv_bytes);
-        let d = BigUint::from_bytes_be(&priv_bytes) % &n;
-        if d.is_zero() {
+        // Rejection-sample d in [1, n): `raw % n` would bias d toward small
+        // values (n isn't a power of two), the same modulo bias the ECDSA nonce
+        // path rejects. Redraw any candidate that is 0 or >= n.
+        let d = BigUint::from_bytes_be(&priv_bytes);
+        if d.is_zero() || d >= n {
             continue;
         }
         let q = ec_mul(&d, &g, &a, &p_mod);
@@ -889,10 +929,6 @@ pub struct AacsAuth {
     pub volume_id: Option<[u8; 16]>,
     /// Read data key (16 bytes) — for AACS 2.0 bus decryption
     pub read_data_key: Option<[u8; 16]>,
-    /// Drive certificate (first 92 bytes of the drive's certificate;
-    /// an AACS 2.0 P-256 cert is 132 bytes and is truncated to fit this
-    /// fixed-size field — see [`aacs2_authenticate_p256`]).
-    pub drive_cert: [u8; 92],
 }
 
 // Manual Debug: bus_key, volume_id, and read_data_key are key material (the
@@ -905,19 +941,43 @@ impl std::fmt::Debug for AacsAuth {
             .field("agid", &self.agid)
             .field("volume_id", &self.volume_id.map(|_| "[redacted]"))
             .field("read_data_key", &self.read_data_key.map(|_| "[redacted]"))
-            .field("drive_cert", &self.drive_cert)
             .finish()
     }
 }
 
-/// Perform the full AACS authentication handshake.
+/// Perform the full AACS authentication handshake against the production AACS
+/// 1.0 LA anchor.
 ///
 /// Requires a host private key (20 bytes) and host certificate (92 bytes)
-/// from the KEYDB.cfg HC entry.
+/// from the KEYDB.cfg HC entry. The orchestration entry [`run_cert_handshake`]
+/// drives the live path via [`aacs_authenticate_with_anchor`]; this real-anchor
+/// convenience is exercised directly by the AKE tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn aacs_authenticate(
     session: &mut dyn ScsiTransport,
     host_priv_key: &[u8; 20],
     host_cert: &[u8],
+) -> Result<AacsAuth> {
+    aacs_authenticate_with_anchor(
+        session,
+        host_priv_key,
+        host_cert,
+        &AACS_LA_PUB_X,
+        &AACS_LA_PUB_Y,
+    )
+}
+
+/// [`aacs_authenticate`] with the AACS 1.0 LA trust anchor as a parameter, so a
+/// drive-side test emulator can present a certificate signed by a self-generated
+/// test LA key (the production anchor's private half doesn't exist). Production
+/// threads `AACS_LA_PUB_X/Y` via [`aacs_authenticate`]. Mirrors the P-256 twin
+/// [`aacs2_authenticate_p256_with_anchor`].
+fn aacs_authenticate_with_anchor(
+    session: &mut dyn ScsiTransport,
+    host_priv_key: &[u8; 20],
+    host_cert: &[u8],
+    la_x: &[u8; 20],
+    la_y: &[u8; 20],
 ) -> Result<AacsAuth> {
     if host_cert.len() < 92 {
         return Err(Error::AacsCertShort);
@@ -937,7 +997,7 @@ pub fn aacs_authenticate(
 
     // From here on we HOLD the AGID. Every failure below used to abandon it
     // (see [`release_agid`]); release it on the way out instead.
-    let r = aacs_authenticate_with_agid(session, agid, host_priv_key, host_cert);
+    let r = aacs_authenticate_with_agid(session, agid, host_priv_key, host_cert, la_x, la_y);
     if r.is_err() {
         release_agid(session, agid);
     }
@@ -952,6 +1012,8 @@ fn aacs_authenticate_with_agid(
     agid: u8,
     host_priv_key: &[u8; 20],
     host_cert: &[u8],
+    la_x: &[u8; 20],
+    la_y: &[u8; 20],
 ) -> Result<AacsAuth> {
     // Step 3: Generate host nonce and ephemeral key pair
     let mut host_nonce = [0u8; 20];
@@ -978,27 +1040,24 @@ fn aacs_authenticate_with_agid(
     drive_nonce.copy_from_slice(&response[4..24]);
     drive_cert.copy_from_slice(&response[24..116]);
 
-    // Verify drive certificate. `is_aacs20` tracks the 2.0 cert type so the
-    // step-6 key-signature verify below is skipped too (see there).
-    let is_aacs20 = drive_cert[0] == 0x11;
+    // Verify drive certificate against the LA anchor. Only a type-0x01 AACS 1.0
+    // cert is verifiable on this 1.0 path. A type-0x11 (AACS 2.0) cert must NOT
+    // be accepted here: doing so previously SKIPPED both this LA verification
+    // AND the step-6 drive-key-point signature verify, then still ran ECDH and
+    // returned Ok — an attacker-chosen-bus-key hole. Reject any non-0x01 type
+    // (0x11 included); `run_cert_handshake` routes a genuine 0x11 drive to the
+    // native P-256 AKE via the v2-cred fallback instead. See docs/aacs-handshake.md.
     if drive_cert[0] == 0x01 {
-        // AACS 1.0 certificate
-        if !verify_cert(&drive_cert) {
+        if !verify_cert_with_anchor(&drive_cert, la_x, la_y) {
             return Err(Error::AacsCertVerify);
         }
-    } else if is_aacs20 {
-        // AACS 2.0 cert — verify intentionally skipped: 2.0 drives accept
-        // AACS 1.0 host certs for backward compat, the P-256 LA key isn't
-        // always available, and 2.0 offsets differ from the 1.0 step-6 verify.
     } else {
-        // Unknown cert type — REJECT (see docs/aacs-handshake.md: a missing
-        // else here used to let an unverified cert's own key satisfy the
-        // step-6 signature check, an attacker-chosen-bus-key hole).
         tracing::warn!(
             target: "freemkv::disc",
-            phase = "aacs_cert_unknown_type",
+            phase = "aacs_cert_unsupported_type",
             cert_type = drive_cert[0],
-            "drive certificate carries an unrecognised type byte; rejecting"
+            "drive certificate is not a verifiable AACS 1.0 (type 0x01) cert on the \
+             1.0 path; rejecting (a genuine 0x11 drive is retried on the native P-256 path)"
         );
         return Err(Error::AacsCertVerify);
     }
@@ -1013,10 +1072,12 @@ fn aacs_authenticate_with_agid(
     drive_key_point.copy_from_slice(&response[4..44]);
     drive_key_sig.copy_from_slice(&response[44..84]);
 
-    // Verify sign(host_nonce || drive_key_point). Skipped for AACS 2.0 (0x11):
-    // `cert_pub_key` reads AACS-1.0 offsets, meaningless for a 2.0 cert.
-    // Mirrors the cert-verify skip above; ECDH still proceeds.
-    if !is_aacs20 {
+    // Verify sign(host_nonce || drive_key_point) against the (now LA-verified)
+    // drive cert's public key. Always runs: the only cert type that reaches here
+    // is the type-0x01 one verified above, so `cert_pub_key`'s AACS-1.0 offsets
+    // are correct. (Previously skipped for 0x11, which — paired with the skipped
+    // cert verify — let the drive choose the bus key.)
+    {
         let (drive_pub_x, drive_pub_y) = cert_pub_key(&drive_cert);
         let mut verify_data = [0u8; 60];
         verify_data[..20].copy_from_slice(&host_nonce);
@@ -1078,30 +1139,20 @@ fn aacs_authenticate_with_agid(
         agid,
         volume_id: None,
         read_data_key: None,
-        drive_cert,
     })
 }
 
-// Native AACS 2.0 handshake using P-256/SHA-256 against the real 2.0 LA
-// anchor; same SCSI protocol as the 1.0 AKE, larger payloads. Production
-// entry `run_cert_handshake` reaches when the host cert carries 2.0 creds.
-fn aacs2_authenticate_p256(
-    session: &mut dyn ScsiTransport,
-    host_priv_key: &[u8; 32],
-    host_cert: &[u8],
-) -> Result<AacsAuth> {
-    aacs2_authenticate_p256_with_anchor(
-        session,
-        host_priv_key,
-        host_cert,
-        &AACS2_LA_PUB_X,
-        &AACS2_LA_PUB_Y,
-    )
-}
-
-// `aacs2_authenticate_p256` with the LA trust anchor as a parameter, so
-// tests can exercise the full AKE under a test LA keypair (the real
-// anchor's private half doesn't exist). Production threads `AACS2_LA_PUB_X/Y`.
+// Native AACS 2.0 handshake using P-256/SHA-256 with the LA trust anchor as a
+// parameter, so tests can exercise the full AKE under a test LA keypair (the
+// real anchor's private half doesn't exist). Same SCSI protocol as the 1.0 AKE,
+// larger payloads.
+//
+// The production 2.0 cert offsets this consumes are PROVISIONAL/unverified
+// against a genuine captured 2.0 cert (see `verify_cert_p256` and
+// docs/aacs-handshake.md), so the production entry `run_cert_handshake` keeps
+// this path DISABLED behind `AACS2_P256_EXPERIMENTAL` — it must not be reached
+// with the real anchor until a captured test vector confirms the offsets, or it
+// could silently mis-verify. Tests reach it directly with a test anchor.
 fn aacs2_authenticate_p256_with_anchor(
     session: &mut dyn ScsiTransport,
     host_priv_key: &[u8; 32],
@@ -1261,11 +1312,6 @@ fn aacs2_authenticate_p256_with_agid(
         agid,
         volume_id: None,
         read_data_key: None,
-        drive_cert: {
-            let mut dc = [0u8; 92];
-            dc.copy_from_slice(&drive_cert[..92.min(drive_cert.len())]);
-            dc
-        },
     })
 }
 
@@ -1370,6 +1416,212 @@ pub fn run_cert_handshake(
     scsi: &mut dyn ScsiTransport,
     host_certs: &[crate::HostCert],
 ) -> std::result::Result<CertHandshake, crate::UnlockError> {
+    // Production threads the real LA anchors. The native P-256 (AACS 2.0) path
+    // is DISABLED at this boundary while its cert offsets are provisional (see
+    // `AACS2_P256_EXPERIMENTAL`), so it can't silently mis-verify a real disc.
+    run_cert_handshake_with_anchors(
+        scsi,
+        host_certs,
+        (&AACS_LA_PUB_X, &AACS_LA_PUB_Y),
+        (&AACS2_LA_PUB_X, &AACS2_LA_PUB_Y),
+        AACS2_P256_EXPERIMENTAL,
+    )
+}
+
+/// Why reading the VID + data keys for a completed auth did not yield a
+/// finished handshake.
+enum FinishErr {
+    /// Dead bus during the VID or data-key read — abort the whole handshake.
+    Transport,
+    /// Post-auth VID MAC failure: the auth completed but the drive's VID MAC did
+    /// not verify under the derived bus key. Eligible for a native P-256 retry
+    /// when the cert carries v2 creds — a backward-compat 2.0 drive that
+    /// completed the 1.0 AKE whose 1.0 bus key cannot authenticate the VID.
+    VidMac,
+    /// Any other non-transport VID read failure — terminal for this cert.
+    VidUnavailable,
+}
+
+/// Read the Volume ID + data keys for a completed auth and assemble the finished
+/// [`CertHandshake`]. Releases the AGID on EVERY exit — including the
+/// fully-successful one (previously leaked, slowly draining the drive's 4-AGID
+/// pool across discs), since nothing downstream needs the AGID once the VID and
+/// data keys are read. `idx` is for log correlation only.
+fn finish_auth(
+    scsi: &mut dyn ScsiTransport,
+    mut auth: AacsAuth,
+    idx: usize,
+) -> std::result::Result<CertHandshake, FinishErr> {
+    let volume_id = match read_volume_id(scsi, &mut auth) {
+        Ok(vid) => vid,
+        Err(e) => {
+            let transport = e.is_scsi_transport_failure();
+            let vid_mac = matches!(e, Error::AacsVidMac);
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "handshake_vid_read_failed",
+                cert_index = idx,
+                error_code = e.code(),
+                transport_failure = transport,
+                "auth ok but volume ID read failed"
+            );
+            // We authenticated, so we hold an AGID; release it before giving up
+            // rather than leaving the drive one short until the next attempt
+            // invalidates all four.
+            release_agid(scsi, auth.agid);
+            // A dead bus is NOT "the drive has no Volume ID" — that told the
+            // consumer to fall through and keep working a transport that is gone.
+            return Err(if transport {
+                FinishErr::Transport
+            } else if vid_mac {
+                FinishErr::VidMac
+            } else {
+                FinishErr::VidUnavailable
+            });
+        }
+    };
+    let (read_data_key, read_data_key_err) = match read_data_keys(scsi, &mut auth) {
+        Ok((rdk, _)) => (Some(rdk), None),
+        Err(e) => {
+            let transport = e.is_scsi_transport_failure();
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "handshake_read_data_key_failed",
+                cert_index = idx,
+                error_code = e.code(),
+                transport_failure = transport,
+                "auth + VID read OK, but the drive served no read_data_key (bus key); \
+                 a bus-encrypted disc stays undecryptable until it does"
+            );
+            // A dead bus here is NOT "no data key served" — left unclassified it
+            // returned a successful-looking unlock with read_data_key: None.
+            // Release AGID, abort like VID.
+            if transport {
+                release_agid(scsi, auth.agid);
+                return Err(FinishErr::Transport);
+            }
+            (None, Some(e.code()))
+        }
+    };
+    tracing::debug!(
+        target: "freemkv::disc",
+        phase = "handshake_ok",
+        cert_index = idx,
+        has_volume_id = volume_id != [0u8; 16],
+        has_read_data_key = read_data_key.is_some(),
+        "AACS bus-auth handshake complete"
+    );
+    // Release the AGID on the fully-successful path too: the VID and data keys
+    // are already read, so nothing downstream needs it, and holding it slowly
+    // leaks the drive's 4-AGID pool across discs.
+    release_agid(scsi, auth.agid);
+    Ok(CertHandshake {
+        volume_id,
+        read_data_key,
+        read_data_key_err,
+    })
+}
+
+/// The result of one cert's drive round-trip, dispatched by the loop below.
+enum CertOutcome {
+    Ok(CertHandshake),
+    /// Dead bus — abort the whole handshake.
+    Transport,
+    /// Auth completed but no usable VID — terminal.
+    VidUnavailable,
+    /// Drive returned ILLEGAL_REQUEST — wedge; bail with HandshakeRejected.
+    Wedge(crate::scsi::ScsiSense),
+    /// Cert-level rejection (non-transport, non-wedge) — record + try next cert.
+    Reject(u16),
+}
+
+/// A non-transport SCSI error becomes a wedge (ILLEGAL_REQUEST) or an ordinary
+/// cert rejection. Wedge sense comes from the structured `ScsiSense`, not
+/// `e.code()` (flat for every ScsiError).
+fn classify_cert_err(e: &Error) -> CertOutcome {
+    match e.scsi_sense() {
+        Some(sense) if sense.is_illegal_request() => CertOutcome::Wedge(sense),
+        _ => CertOutcome::Reject(e.code()),
+    }
+}
+
+/// One host cert's drive round-trip: AACS 1.0 AKE first (also the backward-compat
+/// path a 2.0 drive accepts), then the native P-256 (AACS 2.0) AKE when the cert
+/// carries usable v2 creds AND either the 1.0 AKE was cert-rejected OR it
+/// completed but its VID MAC failed (so a 0x11/backward-compat drive that fails
+/// the 1.0 VID MAC still reaches the P-256 path). `allow_p256` gates the 2.0 path
+/// off in production while its cert offsets are provisional.
+fn attempt_one_cert(
+    scsi: &mut dyn ScsiTransport,
+    hc: &crate::HostCert,
+    idx: usize,
+    la_v1: (&[u8; 20], &[u8; 20]),
+    la_v2: (&[u8; 32], &[u8; 32]),
+    allow_p256: bool,
+) -> CertOutcome {
+    let has_v2 = allow_p256 && hc.private_key_v2.is_some() && hc.certificate_v2.is_some();
+
+    match aacs_authenticate_with_anchor(scsi, &hc.private_key, &hc.certificate, la_v1.0, la_v1.1) {
+        Ok(auth) => match finish_auth(scsi, auth, idx) {
+            Ok(ch) => return CertOutcome::Ok(ch),
+            Err(FinishErr::Transport) => return CertOutcome::Transport,
+            // Post-auth VID/MAC failure with v2 creds available: fall through to
+            // the native P-256 AKE below instead of a terminal early return.
+            Err(FinishErr::VidMac) if has_v2 => {
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "aacs1_vid_mac_p256_fallback",
+                    cert_index = idx,
+                    "1.0 AKE completed but the VID MAC failed; retrying the native P-256 AKE"
+                );
+            }
+            Err(FinishErr::VidMac) | Err(FinishErr::VidUnavailable) => {
+                return CertOutcome::VidUnavailable;
+            }
+        },
+        Err(e) if e.is_scsi_transport_failure() => return CertOutcome::Transport,
+        Err(e) if has_v2 => {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "aacs1_reject_p256_fallback",
+                cert_index = idx,
+                error_code = e.code(),
+                "AACS 1.0 AKE rejected; falling through to the native P-256 AKE"
+            );
+        }
+        Err(e) => return classify_cert_err(&e),
+    }
+
+    // Native AACS 2.0 (P-256) AKE. Reached only when `has_v2` and the 1.0 path
+    // was either cert-rejected or completed with a failed VID MAC.
+    let (Some(k), Some(c)) = (hc.private_key_v2.as_ref(), hc.certificate_v2.as_deref()) else {
+        // `has_v2` guarantees both are Some; unreachable in practice.
+        return CertOutcome::VidUnavailable;
+    };
+    match aacs2_authenticate_p256_with_anchor(scsi, k, c, la_v2.0, la_v2.1) {
+        Ok(auth) => match finish_auth(scsi, auth, idx) {
+            Ok(ch) => CertOutcome::Ok(ch),
+            Err(FinishErr::Transport) => CertOutcome::Transport,
+            // A VID failure on the P-256 path is terminal for this cert.
+            Err(FinishErr::VidMac) | Err(FinishErr::VidUnavailable) => CertOutcome::VidUnavailable,
+        },
+        Err(e) if e.is_scsi_transport_failure() => CertOutcome::Transport,
+        Err(e) => classify_cert_err(&e),
+    }
+}
+
+/// [`run_cert_handshake`] with the LA trust anchors and the P-256-enable flag as
+/// parameters, so tests can drive the full 1.0 and 2.0 AKEs under self-generated
+/// test anchors (the production anchors' private halves don't exist) and exercise
+/// the P-256 fall-through that production keeps gated off. Production threads the
+/// real anchors + `AACS2_P256_EXPERIMENTAL` via [`run_cert_handshake`].
+pub(crate) fn run_cert_handshake_with_anchors(
+    scsi: &mut dyn ScsiTransport,
+    host_certs: &[crate::HostCert],
+    la_v1: (&[u8; 20], &[u8; 20]),
+    la_v2: (&[u8; 32], &[u8; 32]),
+    allow_p256: bool,
+) -> std::result::Result<CertHandshake, crate::UnlockError> {
     use crate::UnlockError;
 
     let host_cert_count = host_certs.len();
@@ -1421,116 +1673,49 @@ pub fn run_cert_handshake(
             std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
         }
         drive_attempts += 1;
-        // Cert-agnostic AKE selection: try AACS 1.0 first (also works for
-        // 2.0 drives via backward compat); fall back to P-256 only on a
-        // cert-level 1.0 rejection with v2 creds available (docs/aacs-handshake.md).
-        let attempt = match aacs_authenticate(scsi, &hc.private_key, &hc.certificate) {
-            Ok(auth) => Ok(auth),
-            Err(e) if e.is_scsi_transport_failure() => Err(e),
-            Err(e) => match (hc.private_key_v2.as_ref(), hc.certificate_v2.as_deref()) {
-                (Some(k), Some(c)) => aacs2_authenticate_p256(scsi, k, c),
-                _ => Err(e),
-            },
-        };
-        match attempt {
-            Ok(mut auth) => {
-                let volume_id = match read_volume_id(scsi, &mut auth) {
-                    Ok(vid) => vid,
-                    Err(e) => {
-                        let transport = e.is_scsi_transport_failure();
-                        tracing::warn!(
-                            target: "freemkv::disc",
-                            phase = "handshake_vid_read_failed",
-                            cert_index = idx,
-                            error_code = e.code(),
-                            transport_failure = transport,
-                            "auth ok but volume ID read failed"
-                        );
-                        // We authenticated, so we hold an AGID; release it
-                        // before giving up rather than leaving the drive one
-                        // short until the next attempt invalidates all four.
-                        release_agid(scsi, auth.agid);
-                        // A dead bus is NOT "the drive has no Volume ID" — that
-                        // told the consumer to fall through and keep working a
-                        // transport that is gone.
-                        return Err(if transport {
-                            UnlockError::Transport
-                        } else {
-                            UnlockError::VidUnavailable
-                        });
-                    }
-                };
-                let (read_data_key, read_data_key_err) = match read_data_keys(scsi, &mut auth) {
-                    Ok((rdk, _)) => (Some(rdk), None),
-                    Err(e) => {
-                        let transport = e.is_scsi_transport_failure();
-                        tracing::debug!(
-                            target: "freemkv::disc",
-                            phase = "handshake_read_data_key_failed",
-                            cert_index = idx,
-                            error_code = e.code(),
-                            transport_failure = transport,
-                            "auth + VID read OK, but the drive served no read_data_key (bus key); \
-                             a bus-encrypted disc stays undecryptable until it does"
-                        );
-                        // A dead bus here is NOT "no data key served" — left
-                        // unclassified it returned a successful-looking unlock
-                        // with read_data_key: None. Release AGID, abort like VID.
-                        if transport {
-                            release_agid(scsi, auth.agid);
-                            return Err(UnlockError::Transport);
-                        }
-                        (None, Some(e.code()))
-                    }
-                };
-                tracing::debug!(
+        match attempt_one_cert(scsi, hc, idx, la_v1, la_v2, allow_p256) {
+            CertOutcome::Ok(ch) => return Ok(ch),
+            CertOutcome::Transport => {
+                tracing::warn!(
                     target: "freemkv::disc",
-                    phase = "handshake_ok",
+                    phase = "handshake_transport_fault",
                     cert_index = idx,
-                    has_volume_id = volume_id != [0u8; 16],
-                    has_read_data_key = read_data_key.is_some(),
-                    "AACS bus-auth handshake complete"
+                    "transport fault during AACS auth; aborting"
                 );
-                return Ok(CertHandshake {
-                    volume_id,
-                    read_data_key,
-                    read_data_key_err,
-                });
+                return Err(UnlockError::Transport);
             }
-            Err(e) => {
-                last_err_code = Some(e.code());
-                // A transport fault must ABORT, not roll on to the next cert:
-                // it has no sense, so `unwrap_or(false)` below would otherwise
-                // fall through to `continue` and misreport it as a cert problem.
-                if e.is_scsi_transport_failure() {
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "handshake_transport_fault",
-                        cert_index = idx,
-                        error_code = e.code(),
-                        "transport fault during AACS auth; aborting"
-                    );
-                    return Err(UnlockError::Transport);
-                }
-                // Wedge sense comes from structured ScsiSense, not `e.code()`
-                // (flat for every ScsiError). On ILLEGAL_REQUEST, bail now
-                // rather than worsen the wedge by trying more certs.
-                let sense = e.scsi_sense();
-                if sense.map(|s| s.is_illegal_request()).unwrap_or(false) {
-                    tracing::warn!(
-                        target: "freemkv::disc",
-                        phase = "handshake_wedge_detected",
-                        cert_index = idx,
-                        sense_key = sense.map(|s| s.sense_key),
-                        asc = sense.map(|s| s.asc),
-                        ascq = sense.map(|s| s.ascq),
-                        "drive returned ILLEGAL_REQUEST during auth; bailing out to avoid wedge"
-                    );
-                    return Err(UnlockError::HandshakeRejected);
-                }
+            CertOutcome::VidUnavailable => return Err(UnlockError::VidUnavailable),
+            CertOutcome::Wedge(sense) => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "handshake_wedge_detected",
+                    cert_index = idx,
+                    sense_key = sense.sense_key,
+                    asc = sense.asc,
+                    ascq = sense.ascq,
+                    "drive returned ILLEGAL_REQUEST during auth; bailing out to avoid wedge"
+                );
+                return Err(UnlockError::HandshakeRejected);
+            }
+            CertOutcome::Reject(code) => {
+                last_err_code = Some(code);
                 continue;
             }
         }
+    }
+    // No cert ever reached the drive (every cert skipped as a dead pairing, or
+    // the list was empty): this is a keydb/host-cert problem, not a drive
+    // rejection — report it as such rather than the less accurate
+    // HandshakeRejected the drive never actually issued.
+    if drive_attempts == 0 {
+        tracing::info!(
+            target: "freemkv::disc",
+            phase = "no_usable_host_cert",
+            host_cert_count,
+            "no host certificate was usable (all skipped as dead keydb pairings); \
+             no drive round-trip was made"
+        );
+        return Err(UnlockError::NoUsableHostCert);
     }
     tracing::info!(
         target: "freemkv::disc",
@@ -1794,29 +1979,36 @@ pub(crate) mod tests {
         assert_eq!(t.calls(), 10, "must have actually issued a second attempt");
     }
 
-    // Script a full, successful AACS 1.0 mutual auth against the mock. Drive
-    // presents a type-0x11 cert (accepted unverified per backward-compat) and
-    // a generator-point drive key so ECDH succeeds. `tail` runs after auth.
-    fn authenticated_script(tail: Vec<Reply>) -> Vec<Reply> {
-        let mut cert_resp = vec![0u8; 116];
-        cert_resp[24] = 0x11; // drive cert type 0x11 → verification skipped
-        let mut key_resp = vec![0u8; 84];
-        key_resp[4..24].copy_from_slice(&EC_GX);
-        key_resp[24..44].copy_from_slice(&EC_GY);
+    /// Build a synthetic 92-byte AACS 1.0 drive/host certificate carrying
+    /// `(pub_x, pub_y)` at the 12/32 offsets, signed by the test LA private key
+    /// over cert[..52] (SHA-1), with `type_byte` at offset 0. The AACS-1.0 twin
+    /// of [`p256_synth_cert`], so a drive emulator can present a genuinely
+    /// LA-verifiable cert under a self-generated test anchor.
+    fn v1_synth_cert(
+        type_byte: u8,
+        pub_x: &[u8; 20],
+        pub_y: &[u8; 20],
+        la_priv: &[u8; 20],
+    ) -> Vec<u8> {
+        let mut cert = vec![0u8; 92];
+        cert[0] = type_byte;
+        cert[12..32].copy_from_slice(pub_x);
+        cert[32..52].copy_from_slice(pub_y);
+        let (r, s) = ecdsa_sign(la_priv, &cert[..52]);
+        cert[52..72].copy_from_slice(&r);
+        cert[72..92].copy_from_slice(&s);
+        cert
+    }
 
-        let mut s = vec![
-            Reply::good(vec![0u8; 2]), // AGID invalidate ×4
-            Reply::good(vec![0u8; 2]),
-            Reply::good(vec![0u8; 2]),
-            Reply::good(vec![0u8; 2]),
-            Reply::good(vec![0u8; 8]), // AGID alloc → agid 0
-            Reply::good(vec![]),       // SEND KEY: host cert + nonce
-            Reply::good(cert_resp),    // REPORT KEY: drive cert + nonce
-            Reply::good(key_resp),     // REPORT KEY: drive key point + sig
-            Reply::good(vec![]),       // SEND KEY: host key point + sig
-        ];
-        s.extend(tail);
-        s
+    // Convenience: drive the 1.0 orchestration under a DriveEmu's self-generated
+    // test LA anchor (production verifies against the real anchor, which the emu
+    // cannot sign for). P-256 stays disabled (unused v2 anchor placeholder).
+    fn run_handshake_v1(
+        emu: &mut DriveEmu,
+        certs: &[crate::HostCert],
+    ) -> std::result::Result<CertHandshake, crate::UnlockError> {
+        let (lax, lay) = (emu.la_x, emu.la_y);
+        run_cert_handshake_with_anchors(emu, certs, (&lax, &lay), (&[0u8; 32], &[0u8; 32]), false)
     }
 
     // Defect-9: auth SUCCEEDED, then the bus died during the VID read. Must
@@ -1824,23 +2016,20 @@ pub(crate) mod tests {
     // carry on with a dead transport) — catches dropping that branch.
     #[test]
     fn transport_fault_reading_the_volume_id_is_transport_not_vid_unavailable() {
-        let mut t = MockTransport::scripted(
-            authenticated_script(vec![Reply::TransportFault]),
-            Reply::TransportFault,
-        );
-        let err = run_cert_handshake(&mut t, &[dummy_cert()]).expect_err("dead bus on VID read");
+        let mut t = DriveEmu::new();
+        t.fault_on_vid_read = true;
+        let err = run_handshake_v1(&mut t, &[dummy_cert()]).expect_err("dead bus on VID read");
         assert_eq!(err, crate::UnlockError::Transport);
     }
 
     // Counterpart: a bad-MAC VID read really is VidUnavailable — the defect-9
-    // fix must not turn every VID failure into a transport error.
+    // fix must not turn every VID failure into a transport error (and, with no
+    // v2 creds, there is no P-256 path to fall through to).
     #[test]
     fn bad_volume_id_mac_is_still_vid_unavailable() {
-        let mut t = MockTransport::scripted(
-            authenticated_script(vec![Reply::good(vec![0xAAu8; 36])]),
-            Reply::good(vec![0u8; 36]),
-        );
-        let err = run_cert_handshake(&mut t, &[dummy_cert()]).expect_err("bad MAC");
+        let mut t = DriveEmu::new();
+        t.bad_vid_mac = true;
+        let err = run_handshake_v1(&mut t, &[dummy_cert()]).expect_err("bad MAC");
         assert_eq!(err, crate::UnlockError::VidUnavailable);
 
         // Defect 18: the AGID we authenticated with must be released on the way
@@ -1861,7 +2050,6 @@ pub(crate) mod tests {
             agid: 0,
             volume_id: None,
             read_data_key: None,
-            drive_cert: [0u8; 92],
         };
         let e = read_data_keys(&mut t, &mut auth).expect_err("zeros are not keys");
         assert_eq!(e.code(), Error::AacsDataKey.code());
@@ -1880,7 +2068,6 @@ pub(crate) mod tests {
             agid: 0,
             volume_id: None,
             read_data_key: None,
-            drive_cert: [0u8; 92],
         };
         let (rdk, _wdk) = read_data_keys(&mut t, &mut auth).expect("decrypts");
         assert_eq!(auth.read_data_key, Some(rdk));
@@ -1903,7 +2090,6 @@ pub(crate) mod tests {
             agid: 0,
             volume_id: None,
             read_data_key: None,
-            drive_cert: [0u8; 92],
         };
         let (rdk, wdk) = read_data_keys(&mut t, &mut auth).expect("decrypts");
         assert_eq!(
@@ -1951,18 +2137,71 @@ pub(crate) mod tests {
         );
     }
 
-    // Plays the DRIVE side of an AACS 1.0 handshake well enough for auth +
-    // VID read to SUCCEED, then dies on read-data-keys. Derives the same bus
-    // key as the host (ECDH is symmetric) so its VID MAC actually verifies.
+    // Fix 1: on the AACS 1.0 path a type-0x11 (AACS 2.0) drive cert must be
+    // REJECTED at the cert gate — not accepted unverified (which used to skip
+    // BOTH the LA cert verify AND the step-6 drive-key signature, then still run
+    // ECDH: an attacker-chosen-bus-key hole). The orchestrator routes a genuine
+    // 0x11 drive to the native P-256 path instead (see the HybridDrive test).
+    #[test]
+    fn type_0x11_drive_cert_is_rejected_on_the_1_0_path() {
+        let mut cert_resp = vec![0u8; 116];
+        cert_resp[24] = 0x11; // AACS 2.0 cert type on the 1.0 AKE
+        // A generator-point drive key that WOULD ECDH-derive a bus key if the
+        // (now-removed) 0x11 skip let step 6 through unverified.
+        let mut key_resp = vec![0u8; 84];
+        key_resp[4..24].copy_from_slice(&EC_GX);
+        key_resp[24..44].copy_from_slice(&EC_GY);
+        let script = vec![
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 2]),
+            Reply::good(vec![0u8; 8]), // AGID alloc → agid 0
+            Reply::good(vec![]),       // SEND KEY host cert
+            Reply::good(cert_resp),    // REPORT KEY drive cert (type 0x11)
+            Reply::good(key_resp),     // REPORT KEY drive key point (must NOT be trusted)
+        ];
+        let mut t = MockTransport::scripted(script, Reply::good(vec![0u8; 2]));
+        let hc = dummy_cert();
+        let err = aacs_authenticate(&mut t, &hc.private_key, &hc.certificate)
+            .expect_err("a 0x11 cert must be rejected on the 1.0 path, never accepted unverified");
+        assert!(
+            matches!(err, Error::AacsCertVerify),
+            "a 0x11 cert must be rejected at the cert gate (AacsCertVerify); got {err:?}"
+        );
+    }
+
+    // Plays the DRIVE side of a genuine AACS 1.0 handshake: presents a type-0x01
+    // drive cert signed by its own self-generated test LA key (`la_x`/`la_y`),
+    // signs the step-6 drive key point with the cert's long-term key, and derives
+    // the same bus key as the host (ECDH is symmetric) so its VID MAC verifies.
+    // Auth + VID read SUCCEED; by default it then dies on read-data-keys.
     pub(crate) struct DriveEmu {
-        drive_priv: [u8; 20],
-        drive_x: [u8; 20],
-        drive_y: [u8; 20],
+        /// Self-generated AACS 1.0 LA test anchor public half. A test threads
+        /// `la_x`/`la_y` into `run_cert_handshake_with_anchors` (production can't
+        /// sign for the real anchor); the private half signs `cert` once, in
+        /// `new`, and is not retained.
+        pub(crate) la_x: [u8; 20],
+        pub(crate) la_y: [u8; 20],
+        /// Drive long-term (certificate) keypair: its public half is embedded in
+        /// `cert`, and it signs the step-6 drive key point.
+        lt_priv: [u8; 20],
+        /// The 92-byte type-0x01 drive certificate (LA-signed, embeds the
+        /// long-term public key).
+        cert: Vec<u8>,
+        /// Ephemeral ECDH keypair — the "drive key point" the host multiplies
+        /// against, and the drive's own half of the shared bus key.
+        eph_priv: [u8; 20],
+        eph_x: [u8; 20],
+        eph_y: [u8; 20],
         vid: [u8; 16],
         bus_key: Option<[u8; 16]>,
         /// The nonce the drive issues at step 5, which the host must sign at
         /// step 7 (over `drive_nonce || host_key_point_x || host_key_point_y`).
         drive_nonce: [u8; 20],
+        /// The host nonce captured at step 4 (SEND KEY 0x01), which the drive
+        /// signs at step 6 (over `host_nonce || drive_key_point`).
+        host_nonce: [u8; 20],
         /// When set, the drive verifies the host's step-8 signature against
         /// this host-cert public key over the EXACT step-7 layout, and records
         /// the result in `host_sig_ok` — pinning the production signed-data
@@ -1980,6 +2219,11 @@ pub(crate) mod tests {
         /// returns `Ok` with `read_data_key: None` + `read_data_key_err: Some` —
         /// the "auth+VID OK, drive served no bus key" path.
         pub(crate) serve_zero_data_keys: bool,
+        /// When set, the VID read (format 0x80) faults the bus (transport error).
+        pub(crate) fault_on_vid_read: bool,
+        /// When set, the VID read returns a GOOD-status VID with a CORRUPTED MAC
+        /// (Error::AacsVidMac), for the post-auth VID/MAC-failure paths.
+        pub(crate) bad_vid_mac: bool,
         /// Every 92-byte host cert the host shipped at SEND KEY format 0x01
         /// (step 4), in order. Lets a test assert a locally-skipped cert never
         /// reached the drive at all (no wasted round-trip).
@@ -1989,27 +2233,40 @@ pub(crate) mod tests {
         /// the shape of an HRL revocation), then behave normally. Models a
         /// drive that revokes a structurally-valid host cert.
         pub(crate) revoke_cert_sends: usize,
+        /// Every CDB issued, in order (lets a test assert the AGID was released).
+        pub(crate) cdbs: Vec<Vec<u8>>,
     }
 
     impl DriveEmu {
         pub(crate) fn new() -> Self {
-            let (drive_priv, drive_x, drive_y) = generate_host_key_pair();
+            let (la_priv, la_x, la_y) = generate_host_key_pair();
+            let (lt_priv, lt_x, lt_y) = generate_host_key_pair();
+            let (eph_priv, eph_x, eph_y) = generate_host_key_pair();
+            let cert = v1_synth_cert(0x01, &lt_x, &lt_y, &la_priv);
             let mut drive_nonce = [0u8; 20];
             use rand::Rng;
             rand::rng().fill_bytes(&mut drive_nonce);
             DriveEmu {
-                drive_priv,
-                drive_x,
-                drive_y,
+                la_x,
+                la_y,
+                lt_priv,
+                cert,
+                eph_priv,
+                eph_x,
+                eph_y,
                 vid: [0x5Au8; 16],
                 bus_key: None,
                 drive_nonce,
+                host_nonce: [0u8; 20],
                 host_cert_pub: None,
                 host_sig_ok: None,
                 serve_data_keys: false,
                 serve_zero_data_keys: false,
+                fault_on_vid_read: false,
+                bad_vid_mac: false,
                 certs_sent: Vec::new(),
                 revoke_cert_sends: 0,
+                cdbs: Vec::new(),
             }
         }
     }
@@ -2022,6 +2279,7 @@ pub(crate) mod tests {
             data: &mut [u8],
             _timeout_ms: u32,
         ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            self.cdbs.push(cdb.to_vec());
             let ok = |payload: Vec<u8>, data: &mut [u8]| {
                 let n = payload.len().min(data.len());
                 data[..n].copy_from_slice(&payload[..n]);
@@ -2036,25 +2294,36 @@ pub(crate) mod tests {
                     0x3F => ok(vec![0u8; 2], data), // invalidate
                     0x00 => ok(vec![0u8; 8], data), // AGID alloc → agid 0
                     0x01 => {
-                        // drive cert + nonce; type 0x11 → cert + step-6 verify skipped
+                        // drive cert (type 0x01, LA-signed) + nonce.
                         let mut r = vec![0u8; 116];
                         r[4..24].copy_from_slice(&self.drive_nonce);
-                        r[24] = 0x11;
+                        r[24..116].copy_from_slice(&self.cert);
                         ok(r, data)
                     }
                     0x02 => {
-                        // drive key point: x[4..24], y[24..44], sig[44..84] (skipped)
+                        // drive key point x[4..24], y[24..44] + a signature over
+                        // host_nonce||x||y by the LONG-TERM cert key (verified
+                        // host-side against cert_pub_key(drive_cert)).
+                        let mut signed = [0u8; 60];
+                        signed[..20].copy_from_slice(&self.host_nonce);
+                        signed[20..40].copy_from_slice(&self.eph_x);
+                        signed[40..60].copy_from_slice(&self.eph_y);
+                        let (sr, ss) = ecdsa_sign(&self.lt_priv, &signed);
                         let mut r = vec![0u8; 84];
-                        r[4..24].copy_from_slice(&self.drive_x);
-                        r[24..44].copy_from_slice(&self.drive_y);
+                        r[4..24].copy_from_slice(&self.eph_x);
+                        r[24..44].copy_from_slice(&self.eph_y);
+                        r[44..64].copy_from_slice(&sr);
+                        r[64..84].copy_from_slice(&ss);
                         ok(r, data)
                     }
                     _ => ok(vec![0u8; 2], data),
                 },
                 crate::scsi::SCSI_SEND_KEY => {
                     if cdb[10] & 0x3F == 0x01 {
-                        // Step 4: host cert + nonce. Record the cert bytes so a
+                        // Step 4: host cert + nonce. Capture the host nonce (the
+                        // drive signs it at step 6) and record the cert bytes so a
                         // test can prove a locally-skipped cert never got here.
+                        self.host_nonce.copy_from_slice(&data[4..24]);
                         self.certs_sent.push(data[24..116].to_vec());
                         if self.certs_sent.len() <= self.revoke_cert_sends {
                             // Revoke this cert: CHECK CONDITION / 6F/00.
@@ -2071,13 +2340,13 @@ pub(crate) mod tests {
                     }
                     if cdb[10] & 0x3F == 0x02 {
                         // host key point arrives in the ToDevice buffer; derive
-                        // the shared bus key from the drive side (drive_priv ×
+                        // the shared bus key from the drive side (eph_priv ×
                         // host_point) — equals host_priv × drive_point.
                         let mut hx = [0u8; 20];
                         let mut hy = [0u8; 20];
                         hx.copy_from_slice(&data[4..24]);
                         hy.copy_from_slice(&data[24..44]);
-                        self.bus_key = compute_bus_key(&self.drive_priv, &hx, &hy);
+                        self.bus_key = compute_bus_key(&self.eph_priv, &hx, &hy);
 
                         // If asked to, verify the host's signature exactly as a
                         // real drive would: over drive_nonce || host_x || host_y
@@ -2098,8 +2367,17 @@ pub(crate) mod tests {
                 }
                 crate::scsi::SCSI_READ_DISC_STRUCTURE => match cdb[7] {
                     0x80 => {
+                        if self.fault_on_vid_read {
+                            return Err(crate::scsi::ScsiError {
+                                status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                                sense: None,
+                            });
+                        }
                         let bus = self.bus_key.expect("bus key derived at step 8");
-                        let mac = aes_cmac_16(&self.vid, &bus);
+                        let mut mac = aes_cmac_16(&self.vid, &bus);
+                        if self.bad_vid_mac {
+                            mac[0] ^= 0xFF; // corrupt the MAC → Error::AacsVidMac
+                        }
                         let mut r = vec![0u8; 36];
                         r[4..20].copy_from_slice(&self.vid);
                         r[20..36].copy_from_slice(&mac);
@@ -2136,7 +2414,7 @@ pub(crate) mod tests {
     #[test]
     fn transport_fault_reading_data_keys_is_transport_not_success() {
         let mut t = DriveEmu::new();
-        let err = run_cert_handshake(&mut t, &[dummy_cert()])
+        let err = run_handshake_v1(&mut t, &[dummy_cert()])
             .expect_err("dead bus on the read-data-keys command");
         assert_eq!(err, crate::UnlockError::Transport);
     }
@@ -2501,6 +2779,42 @@ pub(crate) mod tests {
             compute_bus_key_p256(&host_priv, &P256_GX, &bad_y).is_none(),
             "off-curve P-256 point must be rejected"
         );
+    }
+
+    // Fix 6: a shared point at infinity must never be reduced to a bus key. With
+    // host_priv == n (the group order), n·G == O, so the ECDH result is the point
+    // at infinity — the on-curve guard passes (G is on-curve) but the infinity
+    // guard must return None rather than derive an all-zero-ish key.
+    #[test]
+    fn compute_bus_key_rejects_a_shared_point_at_infinity() {
+        assert!(
+            compute_bus_key(&EC_N, &EC_GX, &EC_GY).is_none(),
+            "n·G is the point at infinity and must yield no bus key (AACS 1.0)"
+        );
+        assert!(
+            compute_bus_key_p256(&P256_N, &P256_GX, &P256_GY).is_none(),
+            "n·G is the point at infinity and must yield no bus key (P-256)"
+        );
+    }
+
+    // Fix 8: when NO host cert reaches the drive (empty list, or every cert
+    // skipped as a dead pairing), the outcome is NoUsableHostCert — a keydb/
+    // host-cert problem — not the HandshakeRejected a drive would have to issue.
+    #[test]
+    fn no_usable_host_cert_when_no_cert_reaches_the_drive() {
+        // Empty list: never touches the drive.
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let err = run_cert_handshake(&mut t, &[]).expect_err("no certs at all");
+        assert_eq!(err, crate::UnlockError::NoUsableHostCert);
+        assert_eq!(t.calls(), 0, "an empty cert list issues no SCSI command");
+
+        // A list of only dead pairings is likewise NoUsableHostCert (all skipped
+        // host-side, no drive round-trip).
+        let mut t2 = MockTransport::always(Reply::illegal_request());
+        let err2 = run_cert_handshake(&mut t2, &[mispaired_host_cert(), mispaired_host_cert()])
+            .expect_err("only dead pairings");
+        assert_eq!(err2, crate::UnlockError::NoUsableHostCert);
+        assert_eq!(t2.calls(), 0, "dead pairings issue no SCSI command");
     }
 
     // `test_verify_host_cert_from_keydb` was removed (env-gated, inert, asserted
@@ -3288,7 +3602,6 @@ pub(crate) mod tests {
             agid: 2,
             volume_id: Some([0x22u8; 16]),
             read_data_key: Some([0x33u8; 16]),
-            drive_cert: [0u8; 92],
         };
         let s = format!("{auth:?}");
         assert!(
@@ -3363,16 +3676,37 @@ pub(crate) mod tests {
         assert!(matches!(err, Error::AacsCertVerify));
     }
 
-    // ── Round-2 coverage: AACS 2.0 (P-256) wiring ── `aacs2_authenticate_p256`
-    // (the thin wrapper threading the REAL production LA anchor) had no
-    // direct test; a dead bus on the first step proves it forwards correctly.
+    // ── Round-2 coverage: AACS 2.0 (P-256) wiring ── the native AKE entry
+    // must forward a dead bus on the first step unchanged (so the orchestrator
+    // can classify it as a transport abort rather than a cert rejection).
     #[test]
     fn aacs2_authenticate_p256_wrapper_propagates_transport_fault() {
         let mut t = MockTransport::always(Reply::TransportFault);
         let (host_priv, _hx, _hy) = generate_host_key_pair_p256();
-        let err =
-            aacs2_authenticate_p256(&mut t, &host_priv, &[0x11u8; 132]).expect_err("dead bus");
+        let err = aacs2_authenticate_p256_with_anchor(
+            &mut t,
+            &host_priv,
+            &[0x11u8; 132],
+            &AACS2_LA_PUB_X,
+            &AACS2_LA_PUB_Y,
+        )
+        .expect_err("dead bus");
         assert!(err.is_scsi_transport_failure());
+    }
+
+    // Fix 3: the production P-256 (AACS 2.0) path is gated OFF while its cert
+    // offsets are provisional, so it can't silently mis-verify a real disc.
+    // Pin the gate constant; flipping it on requires a captured 2.0 test vector.
+    #[test]
+    fn aacs2_p256_is_experimental_and_disabled_in_production() {
+        // black_box so clippy doesn't fold the const into a constant assertion:
+        // this is a deliberate regression guard on the production default.
+        let enabled = std::hint::black_box(AACS2_P256_EXPERIMENTAL);
+        assert!(
+            !enabled,
+            "the native AACS 2.0 P-256 path must stay disabled until a captured \
+             cert vector confirms the provisional offsets"
+        );
     }
 
     /// `aacs2_authenticate_p256_with_anchor` rejects a host cert shorter than
@@ -3417,7 +3751,7 @@ pub(crate) mod tests {
     fn run_cert_handshake_succeeds_end_to_end() {
         let mut t = DriveEmu::new();
         t.serve_data_keys = true;
-        let ch = run_cert_handshake(&mut t, &[dummy_cert()])
+        let ch = run_handshake_v1(&mut t, &[dummy_cert()])
             .expect("auth + VID + data-key reads all succeed");
         assert_eq!(ch.volume_id, [0x5Au8; 16]);
         assert!(
@@ -3425,6 +3759,253 @@ pub(crate) mod tests {
             "a served data-key block must decrypt"
         );
         assert!(ch.read_data_key_err.is_none());
+
+        // Fix 4: the AGID must be released on the fully-SUCCESSFUL path too (it
+        // used to leak, slowly draining the drive's 4-AGID pool across discs).
+        // The last CDB is a REPORT KEY (0xA4) with format 0x3F in byte 10.
+        let last = t.cdbs.last().expect("commands were issued");
+        assert_eq!(last[0], crate::scsi::SCSI_REPORT_KEY);
+        assert_eq!(
+            last[10] & 0x3F,
+            0x3F,
+            "AGID must be released after the final data-key read"
+        );
+    }
+
+    // Plays a backward-compat 2.0 drive that ALSO speaks the AACS 1.0 AKE: it
+    // completes the 1.0 handshake (genuine type-0x01 cert, signed step 6) but its
+    // 1.0-derived bus key CANNOT authenticate the VID (bad MAC), then serves a
+    // full native P-256 (AACS 2.0) AKE. Phase is keyed off the SCSI payload
+    // length (v1 = 116/84, v2 = 156/132). Proves fix 2: a post-auth 1.0 VID/MAC
+    // failure with v2 creds present falls through to the P-256 path.
+    struct HybridDrive {
+        // AACS 1.0 material.
+        la1_x: [u8; 20],
+        la1_y: [u8; 20],
+        lt1_priv: [u8; 20],
+        cert1: Vec<u8>,
+        eph1_priv: [u8; 20],
+        eph1_x: [u8; 20],
+        eph1_y: [u8; 20],
+        host_nonce1: [u8; 20],
+        bus1: Option<[u8; 16]>,
+        // AACS 2.0 (P-256) material.
+        la2_x: [u8; 32],
+        la2_y: [u8; 32],
+        lt2_priv: [u8; 32],
+        cert2: Vec<u8>,
+        eph2_priv: [u8; 32],
+        eph2_x: [u8; 32],
+        eph2_y: [u8; 32],
+        host_nonce2: [u8; 20],
+        bus2: Option<[u8; 16]>,
+        drive_nonce: [u8; 20],
+        vid: [u8; 16],
+        /// Set once the host begins the native P-256 AKE (a 156-byte host cert
+        /// send arrives) — the assertion that the fallback was actually reached.
+        reached_p256: bool,
+    }
+
+    impl HybridDrive {
+        fn new() -> Self {
+            let (la1_priv, la1_x, la1_y) = generate_host_key_pair();
+            let (lt1_priv, lt1_x, lt1_y) = generate_host_key_pair();
+            let (eph1_priv, eph1_x, eph1_y) = generate_host_key_pair();
+            let cert1 = v1_synth_cert(0x01, &lt1_x, &lt1_y, &la1_priv);
+
+            let (la2_priv, la2_x, la2_y) = generate_host_key_pair_p256();
+            let (lt2_priv, lt2_x, lt2_y) = generate_host_key_pair_p256();
+            let (eph2_priv, eph2_x, eph2_y) = generate_host_key_pair_p256();
+            let cert2 = p256_synth_cert(0x11, &lt2_x, &lt2_y, &la2_priv);
+
+            let mut drive_nonce = [0u8; 20];
+            use rand::Rng;
+            rand::rng().fill_bytes(&mut drive_nonce);
+            HybridDrive {
+                la1_x,
+                la1_y,
+                lt1_priv,
+                cert1,
+                eph1_priv,
+                eph1_x,
+                eph1_y,
+                host_nonce1: [0u8; 20],
+                bus1: None,
+                la2_x,
+                la2_y,
+                lt2_priv,
+                cert2,
+                eph2_priv,
+                eph2_x,
+                eph2_y,
+                host_nonce2: [0u8; 20],
+                bus2: None,
+                drive_nonce,
+                vid: [0x5Au8; 16],
+                reached_p256: false,
+            }
+        }
+    }
+
+    impl ScsiTransport for HybridDrive {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            let ok = |payload: Vec<u8>, data: &mut [u8]| {
+                let n = payload.len().min(data.len());
+                data[..n].copy_from_slice(&payload[..n]);
+                Ok(crate::scsi::ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            };
+            let len = ((cdb[8] as usize) << 8) | cdb[9] as usize;
+            match cdb[0] {
+                crate::scsi::SCSI_REPORT_KEY => match cdb[10] & 0x3F {
+                    0x3F => ok(vec![0u8; 2], data),
+                    0x00 => ok(vec![0u8; 8], data),
+                    0x01 if len >= 156 => {
+                        // v2 drive cert (156): 4 hdr + 20 nonce + 132 cert.
+                        let mut r = vec![0u8; 156];
+                        r[4..24].copy_from_slice(&self.drive_nonce);
+                        r[24..156].copy_from_slice(&self.cert2);
+                        ok(r, data)
+                    }
+                    0x01 => {
+                        // v1 drive cert (116).
+                        let mut r = vec![0u8; 116];
+                        r[4..24].copy_from_slice(&self.drive_nonce);
+                        r[24..116].copy_from_slice(&self.cert1);
+                        ok(r, data)
+                    }
+                    0x02 if len >= 132 => {
+                        // v2 drive key point + P-256 signature by lt2.
+                        let mut signed = Vec::with_capacity(84);
+                        signed.extend_from_slice(&self.host_nonce2);
+                        signed.extend_from_slice(&self.eph2_x);
+                        signed.extend_from_slice(&self.eph2_y);
+                        let (sr, ss) = ecdsa_sign_p256(&self.lt2_priv, &signed);
+                        let mut r = vec![0u8; 132];
+                        r[4..36].copy_from_slice(&self.eph2_x);
+                        r[36..68].copy_from_slice(&self.eph2_y);
+                        r[68..100].copy_from_slice(&sr);
+                        r[100..132].copy_from_slice(&ss);
+                        ok(r, data)
+                    }
+                    0x02 => {
+                        // v1 drive key point + signature by lt1.
+                        let mut signed = [0u8; 60];
+                        signed[..20].copy_from_slice(&self.host_nonce1);
+                        signed[20..40].copy_from_slice(&self.eph1_x);
+                        signed[40..60].copy_from_slice(&self.eph1_y);
+                        let (sr, ss) = ecdsa_sign(&self.lt1_priv, &signed);
+                        let mut r = vec![0u8; 84];
+                        r[4..24].copy_from_slice(&self.eph1_x);
+                        r[24..44].copy_from_slice(&self.eph1_y);
+                        r[44..64].copy_from_slice(&sr);
+                        r[64..84].copy_from_slice(&ss);
+                        ok(r, data)
+                    }
+                    _ => ok(vec![0u8; 2], data),
+                },
+                crate::scsi::SCSI_SEND_KEY => {
+                    match cdb[10] & 0x3F {
+                        0x01 if len >= 156 => {
+                            self.reached_p256 = true;
+                            self.host_nonce2.copy_from_slice(&data[4..24]);
+                        }
+                        0x01 => self.host_nonce1.copy_from_slice(&data[4..24]),
+                        0x02 if len >= 132 => {
+                            let mut hx = [0u8; 32];
+                            let mut hy = [0u8; 32];
+                            hx.copy_from_slice(&data[4..36]);
+                            hy.copy_from_slice(&data[36..68]);
+                            self.bus2 = compute_bus_key_p256(&self.eph2_priv, &hx, &hy);
+                        }
+                        0x02 => {
+                            let mut hx = [0u8; 20];
+                            let mut hy = [0u8; 20];
+                            hx.copy_from_slice(&data[4..24]);
+                            hy.copy_from_slice(&data[24..44]);
+                            self.bus1 = compute_bus_key(&self.eph1_priv, &hx, &hy);
+                        }
+                        _ => {}
+                    }
+                    ok(vec![], data)
+                }
+                crate::scsi::SCSI_READ_DISC_STRUCTURE => match cdb[7] {
+                    0x80 => {
+                        // v2 VID authenticates (good MAC under bus2); the v1 VID
+                        // does NOT (corrupted MAC under bus1) → the fallback.
+                        let (bus, good) = match self.bus2 {
+                            Some(b) => (b, true),
+                            None => (self.bus1.expect("v1 bus key derived"), false),
+                        };
+                        let mut mac = aes_cmac_16(&self.vid, &bus);
+                        if !good {
+                            mac[0] ^= 0xFF;
+                        }
+                        let mut r = vec![0u8; 36];
+                        r[4..20].copy_from_slice(&self.vid);
+                        r[20..36].copy_from_slice(&mac);
+                        ok(r, data)
+                    }
+                    _ => {
+                        let mut r = vec![0u8; 36];
+                        r[4..20].copy_from_slice(&[0x7Bu8; 16]);
+                        r[20..36].copy_from_slice(&[0x7Cu8; 16]);
+                        ok(r, data)
+                    }
+                },
+                _ => ok(vec![0u8; 2], data),
+            }
+        }
+    }
+
+    // Fix 2: a backward-compat 2.0 drive completes the AACS 1.0 AKE but its
+    // 1.0 VID MAC fails; with v2 creds present, the handshake must fall through
+    // to the native P-256 AKE (not terminate with VidUnavailable) and complete.
+    #[test]
+    fn vid_mac_failure_on_the_1_0_path_falls_through_to_p256() {
+        let mut drive = HybridDrive::new();
+        let (l1x, l1y) = (drive.la1_x, drive.la1_y);
+        let (l2x, l2y) = (drive.la2_x, drive.la2_y);
+
+        // Host cert: a self-consistent v1 pair PLUS v2 creds (a 0x11 host cert
+        // embedding the host's own P-256 pubkey so the step-7 self-verify passes;
+        // its LA signer is irrelevant — neither side checks the host cert sig).
+        let v1 = dummy_cert();
+        let (hv2_priv, hv2_x, hv2_y) = generate_host_key_pair_p256();
+        let (throwaway_la, _, _) = generate_host_key_pair_p256();
+        let host_cert = crate::HostCert {
+            private_key: v1.private_key,
+            certificate: v1.certificate,
+            private_key_v2: Some(hv2_priv),
+            certificate_v2: Some(p256_synth_cert(0x11, &hv2_x, &hv2_y, &throwaway_la)),
+        };
+
+        let ch = run_cert_handshake_with_anchors(
+            &mut drive,
+            std::slice::from_ref(&host_cert),
+            (&l1x, &l1y),
+            (&l2x, &l2y),
+            true, // P-256 enabled (the test seam; production keeps it gated)
+        )
+        .expect("the 1.0 VID MAC fails, so the native P-256 AKE must complete");
+        assert_eq!(ch.volume_id, [0x5Au8; 16], "the P-256 VID must be returned");
+        assert!(
+            ch.read_data_key.is_some(),
+            "the P-256 path served a bus key"
+        );
+        assert!(
+            drive.reached_p256,
+            "the native P-256 AKE must have been reached after the 1.0 VID MAC failure"
+        );
     }
 
     // SLOT for a REAL AACS 2.0 host certificate (a side agent is sourcing
@@ -3519,9 +4100,11 @@ pub(crate) mod tests {
     #[test]
     fn host_sign_guard_rejects_a_mispaired_host_cert() {
         let mut emu = DriveEmu::new();
+        let (lax, lay) = (emu.la_x, emu.la_y);
         let hc = mispaired_host_cert();
-        let err = aacs_authenticate(&mut emu, &hc.private_key, &hc.certificate)
-            .expect_err("a mispaired host cert must be rejected at the self-verify guard");
+        let err =
+            aacs_authenticate_with_anchor(&mut emu, &hc.private_key, &hc.certificate, &lax, &lay)
+                .expect_err("a mispaired host cert must be rejected at the self-verify guard");
         assert!(
             matches!(err, Error::AacsHostSignVerify),
             "must fail at the step-7 self-verify guard; got {err:?}"
@@ -3546,7 +4129,7 @@ pub(crate) mod tests {
         emu.serve_data_keys = true;
         let good = dummy_cert();
         let certs = vec![mispaired_host_cert(), good.clone()];
-        let ch = run_cert_handshake(&mut emu, &certs)
+        let ch = run_handshake_v1(&mut emu, &certs)
             .expect("the mispaired cert is skipped locally; the valid one authenticates");
         assert_eq!(ch.volume_id, [0x5Au8; 16]);
         assert!(ch.read_data_key.is_some());
@@ -3578,7 +4161,7 @@ pub(crate) mod tests {
             &second.private_key,
             &second.certificate
         ));
-        let ch = run_cert_handshake(&mut emu, &[first.clone(), second.clone()])
+        let ch = run_handshake_v1(&mut emu, &[first.clone(), second.clone()])
             .expect("roll past the revoked cert and authenticate with the next");
         assert_eq!(ch.volume_id, [0x5Au8; 16]);
         assert_eq!(
@@ -3590,16 +4173,17 @@ pub(crate) mod tests {
         assert_eq!(&emu.certs_sent[1][..], &second.certificate[..92]);
     }
 
-    /// A LONE mispaired cert must fail cleanly with `HandshakeRejected` and
-    /// WITHOUT any drive round-trip — the host-side gate fires before a single
-    /// CDB is issued. Uses the mock transport so a wasted SEND KEY 0x01 would
-    /// be recorded and caught.
+    /// A LONE mispaired cert must fail cleanly WITHOUT any drive round-trip —
+    /// the host-side gate fires before a single CDB is issued. Because no cert
+    /// ever reached the drive, the outcome is `NoUsableHostCert` (a keydb/
+    /// host-cert problem), not the `HandshakeRejected` a drive would have to
+    /// issue. Uses the mock transport so a wasted SEND KEY 0x01 would be caught.
     #[test]
     fn only_a_mispaired_cert_fails_without_any_drive_round_trip() {
         let mut t = MockTransport::always(Reply::illegal_request());
         let err = run_cert_handshake(&mut t, &[mispaired_host_cert()])
             .expect_err("a lone mispaired cert cannot authenticate");
-        assert!(matches!(err, crate::UnlockError::HandshakeRejected));
+        assert!(matches!(err, crate::UnlockError::NoUsableHostCert));
         assert_eq!(
             t.calls(),
             0,
@@ -3619,7 +4203,7 @@ pub(crate) mod tests {
         let mut emu = DriveEmu::new();
         emu.serve_data_keys = true;
         let good = dummy_cert();
-        let ch = run_cert_handshake(&mut emu, std::slice::from_ref(&good))
+        let ch = run_handshake_v1(&mut emu, std::slice::from_ref(&good))
             .expect("a lone valid cert authenticates as before");
         assert_eq!(ch.volume_id, [0x5Au8; 16]);
         assert_eq!(emu.certs_sent.len(), 1);
@@ -3637,8 +4221,10 @@ pub(crate) mod tests {
         let (cx, cy) = cert_pub_key(&hc.certificate);
         let mut emu = DriveEmu::new();
         emu.host_cert_pub = Some((cx, cy));
-        let auth = aacs_authenticate(&mut emu, &hc.private_key, &hc.certificate)
-            .expect("a consistent host cert must complete the AKE through step 9");
+        let (lax, lay) = (emu.la_x, emu.la_y);
+        let auth =
+            aacs_authenticate_with_anchor(&mut emu, &hc.private_key, &hc.certificate, &lax, &lay)
+                .expect("a consistent host cert must complete the AKE through step 9");
         assert_ne!(auth.bus_key, [0u8; 16], "a bus key must be derived");
         assert_eq!(
             emu.host_sig_ok,
@@ -3716,7 +4302,6 @@ pub(crate) mod tests {
             agid: 0,
             volume_id: None,
             read_data_key: None,
-            drive_cert: [0u8; 92],
         };
         let got = read_volume_id(&mut t, &mut auth).expect("a correct MAC must be accepted");
         assert_eq!(got, vid, "the VID must be returned verbatim");
@@ -3733,7 +4318,6 @@ pub(crate) mod tests {
             agid: 0,
             volume_id: None,
             read_data_key: None,
-            drive_cert: [0u8; 92],
         };
         let e = read_volume_id(&mut t2, &mut auth2).expect_err("a wrong MAC must be rejected");
         assert!(matches!(e, Error::AacsVidMac), "got {e:?}");
