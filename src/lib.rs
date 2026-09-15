@@ -74,15 +74,21 @@ pub enum DiscKind {
 
 /// A host certificate for the AACS cert handshake (raw; the consumer collects
 /// these from its key sources and passes them in).
-#[derive(Clone)]
+// `ZeroizeOnDrop` wipes the two host PRIVATE keys when a `HostCert` is dropped
+// so they don't linger in freed heap/stack. The certificates are public key
+// material (they travel to the drive in the clear), so they are `#[zeroize(skip)]`
+// — nothing secret to wipe, and it keeps the EC/ABI-facing cert bytes untouched.
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct HostCert {
     /// AACS 1.0 host private key (20 bytes).
     pub private_key: [u8; 20],
     /// AACS 1.0 host certificate (92 bytes).
+    #[zeroize(skip)]
     pub certificate: Vec<u8>,
     /// AACS 2.0 host private key (P-256, 32 bytes). `None` for AACS 1.0 only.
     pub private_key_v2: Option<[u8; 32]>,
     /// AACS 2.0 host certificate (type 0x11). `None` for AACS 1.0 only.
+    #[zeroize(skip)]
     pub certificate_v2: Option<Vec<u8>>,
 }
 
