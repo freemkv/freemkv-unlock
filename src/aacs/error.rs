@@ -20,6 +20,12 @@ pub enum Error {
     AacsKeyRead,
     AacsKeyRejected,
     AacsKeyVerify,
+    /// Our OWN just-produced host signature failed to verify against our host
+    /// certificate's public key (libaacs-style self-verify guard). This means
+    /// the loaded host cert's private key does not match its certificate — a
+    /// mispaired keydb entry — so shipping the signature would only earn an
+    /// opaque "KEY NOT ESTABLISHED" from the drive. Fail fast, host-side.
+    AacsHostSignVerify,
     AacsNoKeys,
     AacsVidMac,
     AacsVidRead,
@@ -58,6 +64,7 @@ impl Error {
             Error::AacsKeyRead => 7007,
             Error::AacsKeyRejected => 7008,
             Error::AacsKeyVerify => 7009,
+            Error::AacsHostSignVerify => 7016,
             Error::AacsNoKeys => 7010,
             Error::AacsVidMac => 7011,
             Error::AacsVidRead => 7012,
@@ -101,7 +108,7 @@ impl From<crate::scsi::ScsiError> for Error {
 mod tests {
     use super::*;
 
-    /// Every variant has its own stable numeric code. Constructing all 16
+    /// Every variant has its own stable numeric code. Constructing all 17
     /// arms also exercises the `#[allow(dead_code)]` variants that the
     /// wired handshake path never builds.
     #[test]
@@ -115,6 +122,7 @@ mod tests {
         assert_eq!(Error::AacsKeyRead.code(), 7007);
         assert_eq!(Error::AacsKeyRejected.code(), 7008);
         assert_eq!(Error::AacsKeyVerify.code(), 7009);
+        assert_eq!(Error::AacsHostSignVerify.code(), 7016);
         assert_eq!(Error::AacsNoKeys.code(), 7010);
         assert_eq!(Error::AacsVidMac.code(), 7011);
         assert_eq!(Error::AacsVidRead.code(), 7012);
