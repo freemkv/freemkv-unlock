@@ -16,6 +16,7 @@ pub use handshake::aacs1_keypair_matches;
 use aes::Aes128;
 use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
 
+use crate::firmware::{ArmRecipe, FirmwareControl, FirmwareError};
 use crate::scsi::ScsiTransport;
 use crate::{DiscKind, HostCert, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
@@ -37,11 +38,70 @@ pub(crate) fn aes_ecb_decrypt(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
 /// libfreemkv.
 pub struct AacsUnlocker {
     host_certs: Vec<HostCert>,
+    /// Opt-in: a freemkv firmware recipe to ARM the drive with before the cert
+    /// AKE. `None` (the default) keeps behaviour byte-identical to a stock host
+    /// — the drive is never touched with a vendor command. See
+    /// [`AacsUnlocker::arm_before_unlock`].
+    arm: Option<ArmRecipe>,
 }
 
 impl AacsUnlocker {
     pub fn new(host_certs: Vec<HostCert>) -> Self {
-        AacsUnlocker { host_certs }
+        AacsUnlocker {
+            host_certs,
+            arm: None,
+        }
+    }
+
+    /// Opt IN to arming a freemkv-firmware drive with a named recipe *before*
+    /// the cert AKE (builder style). OFF by default, so the cert route's default
+    /// behaviour is unchanged and a non-freemkv / stock drive is never sent a
+    /// vendor command. When set, `unlock()` probes via
+    /// [`FirmwareControl::identity`] and applies `recipe` only on a match — e.g.
+    /// [`ArmRecipe::BypassBd`] (`Ake=null`) pre-authenticates the drive so cert
+    /// selection is moot; [`ArmRecipe::OemBd`] (`Hrl=skip`) accepts a revoked
+    /// cert. A non-freemkv drive or a refused recipe is left untouched.
+    pub fn arm_before_unlock(mut self, recipe: ArmRecipe) -> Self {
+        self.arm = Some(recipe);
+        self
+    }
+
+    /// If arming is opted-in, detect freemkv firmware and apply the recipe.
+    /// Best-effort: a non-freemkv drive or a refused recipe is a no-op; only a
+    /// dead bus (`FirmwareError::Transport`) aborts the whole unlock.
+    fn maybe_arm(&self, scsi: &mut dyn ScsiTransport) -> std::result::Result<(), UnlockError> {
+        let Some(recipe) = self.arm else {
+            return Ok(());
+        };
+        let mut fw = FirmwareControl::new(scsi);
+        match fw.identity() {
+            Ok(Some(id)) => {
+                tracing::debug!(
+                    target: "freemkv::disc",
+                    phase = "aacs_arm_freemkv_detected",
+                    version = id.version,
+                    recipe = ?recipe,
+                    "freemkv firmware detected; arming before the cert AKE"
+                );
+                match fw.arm(recipe) {
+                    Ok(()) => Ok(()),
+                    Err(FirmwareError::Transport) => Err(UnlockError::Transport),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "freemkv::disc",
+                            phase = "aacs_arm_recipe_refused",
+                            recipe = ?recipe,
+                            error = ?e,
+                            "firmware refused the arm recipe; proceeding with the plain cert AKE"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            Ok(None) => Ok(()), // not freemkv — leave the drive untouched
+            Err(FirmwareError::Transport) => Err(UnlockError::Transport),
+            Err(_) => Ok(()),
+        }
     }
 }
 
@@ -65,6 +125,9 @@ impl Unlocker for AacsUnlocker {
             // falls through to a VID-less / keysource path.
             return Ok(None);
         }
+        // Opt-in: arm a freemkv-firmware drive before the AKE (no-op by default,
+        // and on non-freemkv drives). Only a dead bus aborts here.
+        self.maybe_arm(scsi)?;
         crate::fallthrough(
             handshake::run_cert_handshake(scsi, &self.host_certs).map(|h| {
                 // A UHD disc whose bus-key fetch the drive refused (non-transport)
@@ -199,6 +262,109 @@ mod tests {
 
     fn host_cert() -> crate::HostCert {
         handshake::tests::dummy_cert()
+    }
+
+    // ── Opt-in arm-before-unlock ──────────────────────────────────────────────
+
+    /// The default (no arm opted-in) NEVER touches the transport for arming.
+    #[test]
+    fn no_arm_by_default_does_not_probe_firmware() {
+        struct PanicTransport;
+        impl ScsiTransport for PanicTransport {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: crate::scsi::DataDirection,
+                _data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+                panic!("default AacsUnlocker must not issue a firmware knock");
+            }
+        }
+        let u = AacsUnlocker::new(vec![host_cert()]);
+        assert!(u.arm.is_none());
+        u.maybe_arm(&mut PanicTransport).expect("no-op");
+    }
+
+    /// Opting in on a NON-freemkv drive probes once (IDENTITY) and then leaves
+    /// the drive untouched — no recipe SETs are sent.
+    #[test]
+    fn arm_on_non_freemkv_drive_is_a_noop_after_the_probe() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let u = AacsUnlocker::new(vec![host_cert()]).arm_before_unlock(ArmRecipe::BypassBd);
+        u.maybe_arm(&mut t).expect("no-op on non-freemkv");
+        // Exactly one CDB: the IDENTITY probe. No recipe SETs followed.
+        assert_eq!(t.cdbs.len(), 1);
+        assert_eq!(t.cdbs[0][4], crate::firmware::Verb::Identity as u8);
+    }
+
+    /// A dead bus on the arm probe aborts the whole unlock.
+    #[test]
+    fn arm_probe_transport_fault_aborts() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut t = MockTransport::always(Reply::TransportFault);
+        let u = AacsUnlocker::new(vec![host_cert()]).arm_before_unlock(ArmRecipe::BypassBd);
+        assert_eq!(u.maybe_arm(&mut t).unwrap_err(), UnlockError::Transport);
+    }
+
+    /// Opting in on a freemkv drive applies the recipe: BypassBd sends
+    /// Set(Ake, on) and verifies it, BEFORE the handshake would run.
+    #[test]
+    fn arm_on_freemkv_drive_applies_the_recipe() {
+        use crate::firmware::{
+            ALL_FEATURES, CDB_FEATURE, CDB_STATE, CDB_VERB, Feature, RESP_MAGIC, STATE_ON,
+            STATE_PASSTHROUGH, Verb, build_set_cdb,
+        };
+        // A minimal freemkv drive: IDENTITY→magic, SET updates state, GET reads it.
+        struct FwDrive {
+            ake: u8,
+            cdbs: Vec<Vec<u8>>,
+        }
+        impl ScsiTransport for FwDrive {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: crate::scsi::DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+                self.cdbs.push(cdb.to_vec());
+                let mut n = 0;
+                if cdb[CDB_VERB] == Verb::Identity as u8 {
+                    let mut resp = RESP_MAGIC.to_vec();
+                    resp.push(0x01);
+                    resp.extend(std::iter::repeat_n(STATE_PASSTHROUGH, ALL_FEATURES.len()));
+                    n = resp.len().min(data.len());
+                    data[..n].copy_from_slice(&resp[..n]);
+                } else if cdb[CDB_VERB] == Verb::Set as u8 && cdb[CDB_FEATURE] == Feature::Ake as u8
+                {
+                    self.ake = cdb[CDB_STATE];
+                } else if cdb[CDB_VERB] == Verb::Get as u8
+                    && cdb[CDB_FEATURE] == Feature::Ake as u8
+                    && !data.is_empty()
+                {
+                    data[0] = self.ake;
+                    n = 1;
+                }
+                Ok(crate::scsi::ScsiResult {
+                    status: 0,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let mut t = FwDrive {
+            ake: STATE_PASSTHROUGH,
+            cdbs: Vec::new(),
+        };
+        let u = AacsUnlocker::new(vec![host_cert()]).arm_before_unlock(ArmRecipe::BypassBd);
+        u.maybe_arm(&mut t).expect("armed");
+        assert_eq!(t.ake, STATE_ON, "the recipe nulled the AKE");
+        // IDENTITY, then Set(Ake,on), then a verifying Get(Ake).
+        assert_eq!(t.cdbs[0][CDB_VERB], Verb::Identity as u8);
+        assert_eq!(t.cdbs[1], build_set_cdb(Feature::Ake, STATE_ON));
+        assert_eq!(t.cdbs[2][CDB_VERB], Verb::Get as u8);
     }
 
     /// With no host certs there is nothing to authenticate with → `Ok(false)`,

@@ -11,6 +11,11 @@
 
 pub mod scsi;
 
+// `firmware` is the ergonomic, typed mirror of the freemkv vendor-command ABI
+// (`freemkv-fw/src/abi.rs`) + the `FirmwareControl` driver. Public so host
+// tooling (freemkv-drivetest) can arm/inspect a freemkv drive directly.
+pub mod firmware;
+
 mod aacs;
 mod css;
 // Shared best-effort AACS Volume ID read, used by every route that opens the
@@ -38,6 +43,11 @@ pub use aacs::AacsUnlocker;
 // cert_pub_key`), for the key service's host-cert health gate.
 pub use aacs::aacs1_keypair_matches;
 pub use css::DvdUnlocker;
+// The ergonomic firmware-control surface (typed grammar + recipes).
+pub use firmware::{
+    ArmRecipe, BdRegion, Feature, FeatureStates, FirmwareControl, FirmwareError, FirmwareIdentity,
+    Verb,
+};
 pub use freemkv::FreemkvUnlocker;
 pub use ld::LdUnlocker;
 pub use renesas::Renesas;
