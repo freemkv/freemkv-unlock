@@ -13,6 +13,7 @@ use crate::scsi::{DataDirection, ScsiTransport};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use sha1::{Digest, Sha1};
+use zeroize::Zeroizing;
 
 // Map a SCSI-layer error onto a cert/key-specific code, unless it's a
 // transport-layer wedge (replug/power-cycle) — else the operator gets sent
@@ -657,8 +658,10 @@ fn compute_bus_key_p256(
         return None;
     }
 
-    // Bus key = lowest 128 bits of x-coordinate
-    let x_bytes = to_bytes_be_padded(&shared.x, 32);
+    // Bus key = lowest 128 bits of x-coordinate. The shared x is secret; wipe the
+    // byte buffer on drop. LIMITATION: `d` and `shared.x` are `BigUint`s whose
+    // heap limbs zeroize cannot reach (see the AACS 1.0 sibling) — best-effort.
+    let x_bytes = Zeroizing::new(to_bytes_be_padded(&shared.x, 32));
     let mut bus_key = [0u8; 16];
     bus_key.copy_from_slice(&x_bytes[16..32]);
     Some(bus_key)
@@ -764,8 +767,12 @@ fn compute_bus_key(
         return None;
     }
 
-    // Bus key = lowest 128 bits (last 16 bytes) of x-coordinate
-    let x_bytes = to_bytes_be_padded(&shared.x, 20);
+    // Bus key = lowest 128 bits (last 16 bytes) of x-coordinate. The full shared
+    // x is a secret; wipe the byte buffer on drop. LIMITATION: the `BigUint`s `d`
+    // (private scalar) and `shared.x` hold secret bytes on heap limbs that
+    // `zeroize` cannot reach (num-bigint exposes no clear/Zeroize) — a known
+    // best-effort residual until num-bigint offers zeroization.
+    let x_bytes = Zeroizing::new(to_bytes_be_padded(&shared.x, 20));
     let mut bus_key = [0u8; 16];
     bus_key.copy_from_slice(&x_bytes[4..20]); // last 16 of 20
     Some(bus_key)
@@ -779,14 +786,15 @@ fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
     let g = EcPoint::from_bytes(&P256_GX, &P256_GY);
 
     let (d, q) = loop {
-        let mut priv_bytes = [0u8; 32];
+        // Raw private-scalar bytes are secret; wipe the buffer on drop each draw.
+        let mut priv_bytes = Zeroizing::new([0u8; 32]);
         use rand::Rng;
-        rand::rng().fill_bytes(&mut priv_bytes);
+        rand::rng().fill_bytes(priv_bytes.as_mut_slice());
         // Rejection-sample d in [1, n): reducing raw RNG bytes mod n would bias
         // d toward small values (n isn't a power of two), the same modulo bias
         // the ECDSA nonce path rejects. Redraw any candidate that is 0 or >= n,
         // matching the AACS 1.0 sibling generate_host_key_pair.
-        let d = BigUint::from_bytes_be(&priv_bytes);
+        let d = BigUint::from_bytes_be(priv_bytes.as_slice());
         if d.is_zero() || d >= n {
             continue;
         }
@@ -794,10 +802,13 @@ fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
         break (d, q);
     };
 
+    // The private scalar is returned to the caller (who wraps it in `Zeroizing`);
+    // wipe the intermediate byte buffer here. LIMITATION: `d` is a `BigUint` whose
+    // heap limbs zeroize cannot reach — a best-effort residual (see compute_bus_key).
     let mut key = [0u8; 32];
     let mut pub_x = [0u8; 32];
     let mut pub_y = [0u8; 32];
-    key.copy_from_slice(&to_bytes_be_padded(&d, 32));
+    key.copy_from_slice(&Zeroizing::new(to_bytes_be_padded(&d, 32)));
     pub_x.copy_from_slice(&to_bytes_be_padded(&q.x, 32));
     pub_y.copy_from_slice(&to_bytes_be_padded(&q.y, 32));
 
@@ -812,13 +823,14 @@ fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
     let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
 
     let (d, q) = loop {
-        let mut priv_bytes = [0u8; 20];
+        // Raw private-scalar bytes are secret; wipe the buffer on drop each draw.
+        let mut priv_bytes = Zeroizing::new([0u8; 20]);
         use rand::Rng;
-        rand::rng().fill_bytes(&mut priv_bytes);
+        rand::rng().fill_bytes(priv_bytes.as_mut_slice());
         // Rejection-sample d in [1, n): `raw % n` would bias d toward small
         // values (n isn't a power of two), the same modulo bias the ECDSA nonce
         // path rejects. Redraw any candidate that is 0 or >= n.
-        let d = BigUint::from_bytes_be(&priv_bytes);
+        let d = BigUint::from_bytes_be(priv_bytes.as_slice());
         if d.is_zero() || d >= n {
             continue;
         }
@@ -826,7 +838,10 @@ fn generate_host_key_pair() -> ([u8; 20], [u8; 20], [u8; 20]) {
         break (d, q);
     };
 
-    let d_bytes = to_bytes_be_padded(&d, 20);
+    // The private scalar is returned to the caller (who wraps it in `Zeroizing`);
+    // wipe the intermediate byte buffer. LIMITATION: `d` is a `BigUint` whose heap
+    // limbs zeroize cannot reach — a best-effort residual (see compute_bus_key).
+    let d_bytes = Zeroizing::new(to_bytes_be_padded(&d, 20));
     let qx = to_bytes_be_padded(&q.x, 20);
     let qy = to_bytes_be_padded(&q.y, 20);
 
@@ -920,10 +935,15 @@ fn cdb_report_disc_structure(agid: u8, format: u8, len: u16) -> [u8; 12] {
 /// `Debug` is implemented manually so the session key material
 /// (`bus_key`, `volume_id`, `read_data_key`) is never rendered into logs
 /// or `dbg!` output — only its presence is reported.
+// `ZeroizeOnDrop` wipes the derived session secrets (`bus_key`, `volume_id`,
+// `read_data_key`) when the auth is dropped — defence in depth atop the redacting
+// `Debug`. `agid` is a non-secret session handle, so it is `#[zeroize(skip)]`.
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct AacsAuth {
     /// Bus key (16 bytes) — derived from ECDH
     pub bus_key: [u8; 16],
     /// AGID used for this session
+    #[zeroize(skip)]
     pub agid: u8,
     /// Volume ID (16 bytes) — read after auth
     pub volume_id: Option<[u8; 16]>,
@@ -1020,6 +1040,9 @@ fn aacs_authenticate_with_agid(
     use rand::Rng;
     rand::rng().fill_bytes(&mut host_nonce);
     let (host_key, host_key_point_x, host_key_point_y) = generate_host_key_pair();
+    // The ephemeral ECDH private scalar is a session secret; wipe it on drop.
+    // (The public key point x/y travel to the drive in the clear — not secret.)
+    let host_key = Zeroizing::new(host_key);
 
     // Step 4: Send host certificate + nonce (SEND KEY format 0x01)
     let mut send_buf = [0u8; 116];
@@ -1201,6 +1224,8 @@ fn aacs2_authenticate_p256_with_agid(
     use rand::Rng;
     rand::rng().fill_bytes(&mut host_nonce);
     let (host_eph_key, host_eph_pub_x, host_eph_pub_y) = generate_host_key_pair_p256();
+    // Ephemeral P-256 ECDH private scalar — session secret; wipe it on drop.
+    let host_eph_key = Zeroizing::new(host_eph_key);
 
     // Step 4: Send AACS 2.0 host certificate + nonce
     // AACS 2.0: cert is 132 bytes, total payload = 4 + 20 + 132 = 156
@@ -1386,9 +1411,14 @@ pub fn read_data_keys(
 /// AACS 2.x bus key (`read_data_key`) when the drive served one, and — when the
 /// bus-key read was attempted and FAILED — its numeric error code (so the
 /// downstream bus-key gate can log WHY the bus key is missing).
+// `ZeroizeOnDrop` wipes the finished handshake's secrets (`volume_id` feeds VUK
+// derivation; `read_data_key` IS the bus key) — the same material the redacting
+// `Debug` hides. `read_data_key_err` is a non-secret diagnostic code (skipped).
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct CertHandshake {
     pub volume_id: [u8; 16],
     pub read_data_key: Option<[u8; 16]>,
+    #[zeroize(skip)]
     pub read_data_key_err: Option<u16>,
 }
 
@@ -1648,7 +1678,13 @@ pub(crate) fn run_cert_handshake_with_anchors(
         // so skip it — unless the cert also carries v2 creds the attempt can try.
         let host_id = cert_host_id_hex(&hc.certificate);
         let v1_paired = aacs1_keypair_matches(&hc.private_key, &hc.certificate);
-        let has_v2 = hc.private_key_v2.is_some() && hc.certificate_v2.is_some();
+        // Mirror `attempt_one_cert`'s `has_v2` gate exactly: in production
+        // (`allow_p256 = false`) the v2 path is never attempted, so a cert whose
+        // v1 pairing is dead offers nothing the drive round-trip could use and
+        // must be skipped up front — otherwise it reaches the drive, fails the
+        // step-7 self-verify, and burns a `MAX_CERT_ATTEMPTS` slot that a later
+        // valid cert needs.
+        let has_v2 = allow_p256 && hc.private_key_v2.is_some() && hc.certificate_v2.is_some();
         if !v1_paired && !has_v2 {
             tracing::info!(
                 target: "freemkv::disc",
@@ -3984,7 +4020,7 @@ pub(crate) mod tests {
         let (throwaway_la, _, _) = generate_host_key_pair_p256();
         let host_cert = crate::HostCert {
             private_key: v1.private_key,
-            certificate: v1.certificate,
+            certificate: v1.certificate.clone(),
             private_key_v2: Some(hv2_priv),
             certificate_v2: Some(p256_synth_cert(0x11, &hv2_x, &hv2_y, &throwaway_la)),
         };
@@ -4207,6 +4243,41 @@ pub(crate) mod tests {
             .expect("a lone valid cert authenticates as before");
         assert_eq!(ch.volume_id, [0x5Au8; 16]);
         assert_eq!(emu.certs_sent.len(), 1);
+        assert_eq!(&emu.certs_sent[0][..], &good.certificate[..92]);
+    }
+
+    /// A dead-v1 pairing that ALSO carries v2 creds must be skipped up front in
+    /// production (`allow_p256 = false`) exactly like a plain dead pairing — the
+    /// up-front `has_v2` gate must honor `allow_p256` the way `attempt_one_cert`
+    /// does. Otherwise each such cert reaches the drive, fails the step-7
+    /// self-verify, and burns a `MAX_CERT_ATTEMPTS` slot: `[dead+v2 ×3, valid]`
+    /// exhausts the cap and the valid cert is never tried. With the gate fixed,
+    /// none of the three dead certs ships a byte and the valid one authenticates.
+    #[test]
+    fn dead_v1_with_v2_creds_is_skipped_up_front_when_p256_disabled() {
+        let mut emu = DriveEmu::new();
+        emu.serve_data_keys = true;
+        // A dead v1 pairing whose cert also advertises v2 creds. Under
+        // `allow_p256 = false` the v2 path can never run, so this cert offers the
+        // drive nothing and must be gated out host-side.
+        let dead_with_v2 = || {
+            let mut hc = mispaired_host_cert();
+            hc.private_key_v2 = Some([0x11u8; 32]);
+            hc.certificate_v2 = Some(vec![0x11u8; 92]);
+            hc
+        };
+        let good = dummy_cert();
+        let certs = vec![dead_with_v2(), dead_with_v2(), dead_with_v2(), good.clone()];
+        let ch = run_handshake_v1(&mut emu, &certs)
+            .expect("the dead+v2 certs are skipped up front; the valid one authenticates");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+        assert!(ch.read_data_key.is_some());
+        assert_eq!(
+            emu.certs_sent.len(),
+            1,
+            "only the VALID cert may reach the drive; the dead+v2 certs are gated \
+             out up front and must not consume the MAX_CERT_ATTEMPTS cap"
+        );
         assert_eq!(&emu.certs_sent[0][..], &good.certificate[..92]);
     }
 
