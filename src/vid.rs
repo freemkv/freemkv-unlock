@@ -45,7 +45,7 @@ fn is_dead_bus(e: &crate::scsi::ScsiError) -> bool {
 /// is unlocked). `Ok(Some(vid))` on a well-formed non-zero VID; `Ok(None)` for
 /// any "no VID" outcome (rejected / short / all-zero); `Err(Transport)` only on
 /// a dead bus.
-pub(crate) fn read_aacs_vid(
+pub fn read_aacs_vid(
     scsi: &mut dyn ScsiTransport,
 ) -> std::result::Result<Option<[u8; 16]>, UnlockError> {
     let cdb = build_vid_cdb();

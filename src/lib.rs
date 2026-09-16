@@ -21,6 +21,10 @@ mod css;
 // Shared best-effort AACS Volume ID read, used by every route that opens the
 // drive to raw reads (freemkv / MT1959 / Renesas). See `vid`.
 mod vid;
+// The bare best-effort AACS Volume ID read (`0xAD` fmt `0x80`) — public so a
+// harness armed `Ake=null` can read the VID with NO cert AKE and prove no
+// SEND KEY crossed the bus.
+pub use vid::read_aacs_vid;
 // `ld` is public only for its drive-profile catalog + (under `emulation`) the
 // handshake wire format bdemu needs; the unlocker impl stays `pub(crate)`.
 // See docs/module-visibility.md — module visibility rationale.
