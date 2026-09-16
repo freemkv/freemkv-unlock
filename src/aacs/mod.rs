@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn arm_on_freemkv_drive_applies_the_recipe() {
         use crate::firmware::{
-            ALL_FEATURES, CDB_FEATURE, CDB_STATE, CDB_VERB, Feature, RESP_MAGIC, STATE_ON,
+            ALL_FEATURES, CDB_FEATURE, CDB_STATE, CDB_VERB, Feature, RESP_MAGIC, STATE_OFF,
             STATE_PASSTHROUGH, Verb, build_set_cdb,
         };
         // A minimal freemkv drive: IDENTITY→magic, SET updates state, GET reads it.
@@ -402,10 +402,10 @@ mod tests {
         };
         let u = AacsUnlocker::new(vec![host_cert()]).arm_before_unlock(ArmRecipe::BypassBd);
         u.maybe_arm(&mut t).expect("armed");
-        assert_eq!(t.ake, STATE_ON, "the recipe nulled the AKE");
-        // IDENTITY, then Set(Ake,on), then a verifying Get(Ake).
+        assert_eq!(t.ake, STATE_OFF, "the recipe nulled the AKE (Ake=off)");
+        // IDENTITY, then Set(Ake,off), then a verifying Get(Ake).
         assert_eq!(t.cdbs[0][CDB_VERB], Verb::Identity as u8);
-        assert_eq!(t.cdbs[1], build_set_cdb(Feature::Ake, STATE_ON));
+        assert_eq!(t.cdbs[1], build_set_cdb(Feature::Ake, STATE_OFF));
         assert_eq!(t.cdbs[2][CDB_VERB], Verb::Get as u8);
     }
 
