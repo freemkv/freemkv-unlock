@@ -117,29 +117,15 @@ fn region_state_bytes() {
 // ── Identity / states parsing ────────────────────────────────────────────────
 
 #[test]
-fn identity_parse_reads_version_and_table() {
+fn identity_parse_reads_version_banner() {
+    // The firmware answers IDENTITY with the ASCII banner `freemkv <ver>`,
+    // NUL-padded — there is no binary state table.
     let mut payload = Vec::new();
     payload.extend_from_slice(RESP_MAGIC);
-    payload.push(0x17); // version
-    // table in ALL_FEATURES order: Speed, Region, Uhd, Bd, Hrl, Ake, Bus
-    payload.extend_from_slice(&[
-        SPEED_MAX,
-        STATE_ON,
-        STATE_ON,
-        STATE_PASSTHROUGH,
-        STATE_ON,
-        STATE_OFF,
-        STATE_ON,
-    ]);
+    payload.extend_from_slice(b" 0.7.1\0");
+    payload.resize(64, 0); // NUL-pad to the allocation window
     let id = FirmwareIdentity::parse(&payload).expect("has magic");
-    assert_eq!(id.version, 0x17);
-    assert_eq!(id.states.speed, SPEED_MAX);
-    assert_eq!(id.states.region, STATE_ON);
-    assert_eq!(id.states.uhd, STATE_ON);
-    assert_eq!(id.states.bd, STATE_PASSTHROUGH);
-    assert_eq!(id.states.hrl, STATE_ON);
-    assert_eq!(id.states.ake, STATE_OFF);
-    assert_eq!(id.states.bus, STATE_ON);
+    assert_eq!(id.version, "0.7.1");
 }
 
 #[test]
@@ -147,23 +133,17 @@ fn identity_parse_none_without_magic() {
     assert!(FirmwareIdentity::parse(&[0u8; 64]).is_none());
 }
 
-#[test]
-fn identity_parse_short_table_defaults_to_passthrough() {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(RESP_MAGIC);
-    payload.push(0x01);
-    // no table bytes at all
-    let id = FirmwareIdentity::parse(&payload).expect("has magic");
-    assert_eq!(id.states, FeatureStates::all_passthrough());
-}
-
 // ── A stateful firmware mock ─────────────────────────────────────────────────
 
-/// A mock freemkv drive: answers IDENTITY with magic+version+table, GET with the
-/// requested feature's state, applies SET, and RESET → all-passthrough. Records
-/// every CDB so tests can assert the exact command order.
+/// A mock freemkv drive: answers IDENTITY with the `freemkv <ver>` banner, GET
+/// with the requested feature's state, applies SET, and RESET → all-passthrough.
+/// Records every CDB so tests can assert the exact command order.
+///
+/// It also models the real hardware constraint: any vendor verb executed with
+/// [`DataDirection::None`] (no data-in phase) is REJECTED with a non-zero
+/// status, exactly as the drive's READ BUFFER hijack aborts a no-data verb.
 struct FwMock {
-    version: u8,
+    version: &'static str,
     states: FeatureStates,
     is_freemkv: bool,
     cdbs: Vec<Vec<u8>>,
@@ -172,7 +152,7 @@ struct FwMock {
 impl FwMock {
     fn new() -> Self {
         FwMock {
-            version: 0x42,
+            version: "0.6.6",
             states: FeatureStates::all_passthrough(),
             is_freemkv: true,
             cdbs: Vec::new(),
@@ -194,21 +174,31 @@ impl ScsiTransport for FwMock {
     fn execute(
         &mut self,
         cdb: &[u8],
-        _dir: DataDirection,
+        dir: DataDirection,
         data: &mut [u8],
         _timeout_ms: u32,
     ) -> ScsiTResult<ScsiResult> {
         self.cdbs.push(cdb.to_vec());
+        // Model the hardware: a vendor verb with no data-in phase is aborted.
+        // This is what makes the old `exec_none` SET/RESET path a test failure.
+        let is_vendor = cdb[CDB_OPCODE] == READ_BUFFER_OPCODE && cdb[CDB_MODE] == KNOCK_MODE;
+        if is_vendor && matches!(dir, DataDirection::None) {
+            return Ok(ScsiResult {
+                status: 0x02, // CHECK CONDITION — rejected
+                bytes_transferred: 0,
+                sense: [0u8; 32],
+            });
+        }
         let mut transferred = 0usize;
         match cdb[CDB_VERB] {
             v if v == Verb::Identity as u8 => {
                 if self.is_freemkv {
+                    // The `freemkv <ver>` banner, NUL-terminated.
                     let mut resp = Vec::new();
                     resp.extend_from_slice(RESP_MAGIC);
-                    resp.push(self.version);
-                    for f in ALL_FEATURES {
-                        resp.push(self.states.get(f));
-                    }
+                    resp.push(b' ');
+                    resp.extend_from_slice(self.version.as_bytes());
+                    resp.push(0);
                     let n = resp.len().min(data.len());
                     data[..n].copy_from_slice(&resp[..n]);
                     transferred = n;
@@ -257,8 +247,9 @@ fn identity_detects_freemkv_and_issues_identity_cdb() {
     {
         let mut fw = FirmwareControl::new(&mut m);
         let id = fw.identity().expect("no fault").expect("is freemkv");
-        assert_eq!(id.version, 0x42);
-        assert_eq!(id.states.ake, STATE_ON);
+        assert_eq!(id.version, "0.6.6");
+        // States no longer ride in IDENTITY — read them via GET.
+        assert_eq!(fw.get(Feature::Ake).expect("get"), STATE_ON);
         assert!(fw.is_freemkv().expect("no fault"));
     }
     assert_eq!(m.cdbs[0], build_identity_cdb(MEMREAD_LEN as u16));
