@@ -30,8 +30,9 @@
 //! into `cdb[5..9]` and always returns a fixed [`MEMREAD_LEN`]-byte window.
 //!
 //! Every feature defaults to [`STATE_PASSTHROUGH`] (firmware does not touch the
-//! subsystem → byte-identical to OEM); [`Verb::Reset`] returns every feature to
-//! passthrough.
+//! subsystem → byte-identical to OEM); [`Verb::Reset`] with [`RESET_TO_OEM`]
+//! returns every feature to passthrough, while [`RESET_TO_FLASH`] reloads the last
+//! [`Verb::Save`]d config block.
 
 use crate::scsi::{DataDirection, ScsiTransport};
 
@@ -87,25 +88,39 @@ pub const STATE_OFF: u8 = 0x00;
 /// Feature state: explicit **on / enabled** (`0x01`).
 pub const STATE_ON: u8 = 0x01;
 
-/// [`Feature::Speed`] state: uncapped / maximum read speed (full riplock lift).
-/// Any other non-passthrough value is treated as an explicit speed-cap byte.
-pub const SPEED_MAX: u8 = 0x01;
+/// [`Feature::Speed`] state: speed control OFF — the read-speed cap is lifted and
+/// the drive runs uncapped at maximum throughput. This is the [`STATE_OFF`]
+/// (`0x00`) leg of Speed: "off" is the *limiter* being off, i.e. maximum speed.
+/// `0x01..=0xFE` are explicit caps and `0xFF` is the OEM ramp.
+pub const SPEED_MAX: u8 = 0x00;
 
-/// [`Feature::Bd`] state: force-refuse BD (AACS 1.0) discs (`0x02`). A distinct
-/// sentinel — NOT [`STATE_OFF`] (`0x00`, the SRAM boot value) — so an unarmed image
-/// leaves BD engaged (OEM). Mirrors the firmware ABI `STATE_BD_DISABLE`.
-pub const STATE_BD_DISABLE: u8 = 0x02;
+/// [`Feature::Region`] state: force BD region A (`0x0A`). See [`BdRegion`]. BD
+/// regions A/B/C share the low-nibble block with the DVD `0x0N` scheme
+/// ([`REGION_DVD_BASE`]) and [`REGION_FREE`] (`0x0F`).
+pub const REGION_BD_A: u8 = 0x0A;
+/// [`Feature::Region`] state: force BD region B (`0x0B`).
+pub const REGION_BD_B: u8 = 0x0B;
+/// [`Feature::Region`] state: force BD region C (`0x0C`).
+pub const REGION_BD_C: u8 = 0x0C;
 
-/// [`Feature::Region`] state: force BD region A (`0x2A`). See [`BdRegion`].
-pub const REGION_BD_A: u8 = 0x2A;
-/// [`Feature::Region`] state: force BD region B (`0x2B`).
-pub const REGION_BD_B: u8 = 0x2B;
-/// [`Feature::Region`] state: force BD region C (`0x2C`).
-pub const REGION_BD_C: u8 = 0x2C;
+/// [`Feature::Region`] state base for "force DVD region N": `REGION_DVD_BASE + N`,
+/// so regions 1..=8 are `0x01..=0x08`. `0x00` itself is region-locked (nothing
+/// plays).
+pub const REGION_DVD_BASE: u8 = 0x00;
 
-/// [`Feature::Region`] state base for "force DVD region N": `0x10 + N`, so
-/// regions 1..=8 are `0x11..=0x18`.
-pub const REGION_DVD_BASE: u8 = 0x10;
+/// [`Feature::Region`] state: region-free — any disc plays regardless of its
+/// region code. Sits in the region low-nibble block above the DVD (`0x01..=0x08`)
+/// and BD (`0x0A..=0x0C`) values.
+pub const REGION_FREE: u8 = 0x0F;
+
+/// [`Verb::Reset`] mode (rides in the state slot `cdb[6]`): reload the saved flash
+/// config block into the RAM feature-state table, discarding un-saved RAM changes
+/// — the non-destructive "revert to last SAVE".
+pub const RESET_TO_FLASH: u8 = 0x00;
+
+/// [`Verb::Reset`] mode (rides in the state slot `cdb[6]`): force every feature to
+/// [`STATE_PASSTHROUGH`] (OEM behaviour everywhere), regardless of the saved config.
+pub const RESET_TO_OEM: u8 = 0xFF;
 
 /// The verb selector in `cdb[4]`. These numeric values ARE the wire protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,11 +132,20 @@ pub enum Verb {
     Set = 0x02,
     /// Read one feature's (`cdb[5]`) current state back in the data-in payload.
     Get = 0x03,
-    /// Restore every feature to [`STATE_PASSTHROUGH`].
+    /// Restore the RAM feature-state table. The mode rides in `cdb[6]` (the state
+    /// slot): [`RESET_TO_FLASH`] (`0x00`) reloads the saved flash config block back
+    /// into RAM (discarding un-saved changes), [`RESET_TO_OEM`] (`0xFF`) forces every
+    /// feature to [`STATE_PASSTHROUGH`] (out-of-the-box behaviour). Ignores feature.
     Reset = 0x04,
     /// Diagnostic RAM peek: [`MEMREAD_LEN`] bytes at the 32-bit address in
     /// `cdb[5..9]` (big-endian).
     DumpAll = 0x09,
+    /// Persist the whole RAM feature-state table to the flash config block. This is
+    /// the ONLY verb that writes the config to flash: [`Verb::Set`] and
+    /// [`Verb::Reset`] touch RAM only, so a host's changes stay volatile until a
+    /// `Save` commits them (and survive a power cycle only once saved). Ignores
+    /// feature/state.
+    Save = 0x0B,
 }
 
 /// The feature selector in `cdb[5]` for [`Verb::Set`] / [`Verb::Get`]. These
@@ -129,24 +153,43 @@ pub enum Verb {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Feature {
-    /// Read-speed / riplock ceiling. `0x01` = max; other = explicit cap byte.
+    /// Read-speed / riplock ceiling. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM ramp;
+    /// [`STATE_OFF`] (`0x00`) = speed control off, i.e. the cap is lifted and the
+    /// drive runs uncapped at maximum throughput (see [`SPEED_MAX`]); `0x01..=0xFE`
+    /// = an explicit speed cap (the byte IS the cap, lower is slower). Note the OFF
+    /// direction: "off" means the *limiter* is off, so OFF is the fastest state.
     Speed = 0x01,
-    /// Region (RPC) control. [`STATE_ON`] = region-free; `0x11..=0x18` = force
-    /// DVD region 1..8; [`REGION_BD_A`]/`_B`/`_C` = force BD region A/B/C.
+    /// Region (RPC) control. [`STATE_PASSTHROUGH`] (`0xFF`) = drive's own region
+    /// logic; [`STATE_OFF`] (`0x00`) = region-locked (nothing plays);
+    /// [`REGION_DVD_BASE`]` + N` (`0x01..=0x08`) = force DVD region 1..8;
+    /// [`REGION_BD_A`]/`_B`/`_C` (`0x0A`/`0x0B`/`0x0C`) = force BD region A/B/C;
+    /// [`REGION_FREE`] (`0x0F`) = region-free (any disc plays).
     Region = 0x02,
-    /// UHD (AACS 2.0) capability gate. [`STATE_ON`] = force enabled; [`STATE_OFF`]
-    /// is a reserved/OEM no-op (only the enable direction is emitted).
+    /// UHD (AACS 2.0) capability gate. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (as
+    /// shipped); [`STATE_OFF`] (`0x00`) = No (refuse UHD discs); [`STATE_ON`]
+    /// (`0x01`) = Yes (accept UHD — the mode gate is neutralized so the drive
+    /// engages UHD discs). On the byte-extraction classifier (e.g. BU40N) the No
+    /// (OFF) leg currently reads back but behaves == OEM (boot-safe no-op, pending
+    /// deeper RE) — do NOT treat OFF as a proven UHD disable there.
     Uhd = 0x03,
-    /// Blu-ray (AACS 1.0) capability gate. [`STATE_BD_DISABLE`] (`0x02`) =
-    /// force-refuse BD discs; passthrough/`0x00` boot/[`STATE_ON`] = OEM (engaged —
-    /// the enable direction is a no-op, OEM already engages BD).
+    /// Blu-ray (AACS 1.0) capability gate. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (BD
+    /// engaged as shipped); [`STATE_OFF`] (`0x00`) = No (force-refuse BD discs — the
+    /// drive raises its own `6F` refusal sense); [`STATE_ON`] (`0x01`) = Yes (accept
+    /// BD — an enable direction, not a no-op).
     Bd = 0x04,
-    /// Host Revocation List handling. [`STATE_ON`] = skip lookup (revoked certs
-    /// accepted, non-destructive).
+    /// Host Revocation List handling on the cert path. [`STATE_PASSTHROUGH`]
+    /// (`0xFF`) = OEM enforce; [`STATE_OFF`] (`0x00`) = off (skip the HRL lookup —
+    /// revoked certs accepted, non-destructive, the unlock direction); [`STATE_ON`]
+    /// (`0x01`) = on (enforce the HRL).
     Hrl = 0x05,
-    /// Drive-host AKE. [`STATE_ON`] = null (drive acts pre-authenticated).
+    /// Drive-host AKE. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM real handshake;
+    /// [`STATE_OFF`] (`0x00`) = off (null/bypass — the drive acts pre-authenticated,
+    /// the unlock direction); [`STATE_ON`] (`0x01`) = on (require the real handshake).
     Ake = 0x06,
-    /// In-transit AACS bus encryption. [`STATE_ON`] = off (content de-bussed).
+    /// In-transit AACS bus encryption. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (bus
+    /// encryption on); [`STATE_OFF`] (`0x00`) = off (de-bussed — content returned
+    /// with no bus encryption, the unlock direction); [`STATE_ON`] (`0x01`) = on
+    /// (bus encryption).
     Bus = 0x07,
 }
 
@@ -165,11 +208,11 @@ pub const ALL_FEATURES: [Feature; 7] = [
 /// A Blu-ray region for [`FirmwareControl::force_region_bd`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BdRegion {
-    /// Region A (`0x2A`).
+    /// Region A (`0x0A`).
     A,
-    /// Region B (`0x2B`).
+    /// Region B (`0x0B`).
     B,
-    /// Region C (`0x2C`).
+    /// Region C (`0x0C`).
     C,
 }
 
@@ -223,10 +266,20 @@ pub fn build_get_cdb(feature: Feature) -> [u8; CDB_LEN] {
     build_cdb(Verb::Get, Some(feature), None, MIN_ALLOC_LEN)
 }
 
-/// Build a `RESET` CDB (all features → passthrough). Floors its data-in at
-/// [`MIN_ALLOC_LEN`] for the same HW min-transfer reason as [`build_set_cdb`].
-pub fn build_reset_cdb() -> [u8; CDB_LEN] {
-    build_cdb(Verb::Reset, None, None, MIN_ALLOC_LEN)
+/// Build a `RESET` CDB. `mode` rides in the state slot (`cdb[6]`):
+/// [`RESET_TO_FLASH`] (`0x00`) reloads the saved flash config into RAM,
+/// [`RESET_TO_OEM`] (`0xFF`) forces every feature to passthrough. Floors its
+/// data-in at [`MIN_ALLOC_LEN`] for the same HW min-transfer reason as
+/// [`build_set_cdb`].
+pub fn build_reset_cdb(mode: u8) -> [u8; CDB_LEN] {
+    build_cdb(Verb::Reset, None, Some(mode), MIN_ALLOC_LEN)
+}
+
+/// Build a `SAVE` CDB (persist the RAM feature-state table to the flash config
+/// block — the only verb that writes config to flash). Floors its data-in at
+/// [`MIN_ALLOC_LEN`] for the same HW min-transfer reason as [`build_reset_cdb`].
+pub fn build_save_cdb() -> [u8; CDB_LEN] {
+    build_cdb(Verb::Save, None, None, MIN_ALLOC_LEN)
 }
 
 /// Build an `IDENTITY` CDB. `alloc_len` sizes the magic+version+state reply.
@@ -476,10 +529,29 @@ impl<'a> FirmwareControl<'a> {
         self.exec_in(&cdb).map(|_| ())
     }
 
-    /// Restore every feature to [`STATE_PASSTHROUGH`] (RESET). Data-in phase for
-    /// the same reason as [`set`](Self::set) — a no-data RESET is aborted.
+    /// Restore every feature to [`STATE_PASSTHROUGH`] (RESET with
+    /// [`RESET_TO_OEM`]). Data-in phase for the same reason as [`set`](Self::set) —
+    /// a no-data RESET is aborted.
     pub fn reset(&mut self) -> Result<()> {
-        let cdb = build_reset_cdb();
+        let cdb = build_reset_cdb(RESET_TO_OEM);
+        self.exec_in(&cdb).map(|_| ())
+    }
+
+    /// Reload the saved flash config block back into the RAM feature-state table
+    /// (RESET with [`RESET_TO_FLASH`]), discarding any un-saved RAM changes — the
+    /// non-destructive "revert to last SAVE". Data-in phase for the same reason as
+    /// [`reset`](Self::reset).
+    pub fn reset_to_flash(&mut self) -> Result<()> {
+        let cdb = build_reset_cdb(RESET_TO_FLASH);
+        self.exec_in(&cdb).map(|_| ())
+    }
+
+    /// Persist the whole RAM feature-state table to the flash config block (SAVE)
+    /// — the only verb that writes config to flash, so a host's SET changes survive
+    /// a power cycle only once saved. Data-in phase for the same reason as
+    /// [`reset`](Self::reset).
+    pub fn save(&mut self) -> Result<()> {
+        let cdb = build_save_cdb();
         self.exec_in(&cdb).map(|_| ())
     }
 
@@ -531,27 +603,32 @@ impl<'a> FirmwareControl<'a> {
     pub fn enable_bd(&mut self) -> Result<()> {
         self.set(Feature::Bd, STATE_ON)
     }
-    /// Force the Blu-ray capability gate off (drive refuses BD discs). Sends
-    /// [`STATE_BD_DISABLE`] (`0x02`) — a distinct sentinel, NOT `0x00` (the SRAM boot
-    /// value) — so an unarmed image stays OEM-behaviour-identical (BD engaged).
+    /// Force the Blu-ray capability gate off (drive refuses BD discs). Sends the
+    /// uniform [`STATE_OFF`] (`0x00`) — an unarmed image boots to [`STATE_PASSTHROUGH`]
+    /// (`0xFF`, OEM) via the firmware power-on hook, so `0x00` no longer collides
+    /// with the boot value (the retired `0x02` sentinel is gone).
     pub fn disable_bd(&mut self) -> Result<()> {
-        self.set(Feature::Bd, STATE_BD_DISABLE)
+        self.set(Feature::Bd, STATE_OFF)
     }
-    /// Skip the HRL lookup (revoked certs accepted; non-destructive).
+    /// Skip the HRL lookup (revoked certs accepted; non-destructive). The unlock
+    /// direction is now [`STATE_OFF`] (`0x00` = HRL enforcement off).
     pub fn skip_hrl(&mut self) -> Result<()> {
-        self.set(Feature::Hrl, STATE_ON)
+        self.set(Feature::Hrl, STATE_OFF)
     }
-    /// Null the drive-host AKE (drive acts pre-authenticated).
+    /// Null the drive-host AKE (drive acts pre-authenticated). The unlock direction
+    /// is now [`STATE_OFF`] (`0x00` = handshake off/bypassed).
     pub fn null_ake(&mut self) -> Result<()> {
-        self.set(Feature::Ake, STATE_ON)
+        self.set(Feature::Ake, STATE_OFF)
     }
-    /// Turn AACS in-transit bus encryption off (content returned de-bussed).
+    /// Turn AACS in-transit bus encryption off (content returned de-bussed). The
+    /// unlock direction is now [`STATE_OFF`] (`0x00` = bus encryption off).
     pub fn bus_off(&mut self) -> Result<()> {
-        self.set(Feature::Bus, STATE_ON)
+        self.set(Feature::Bus, STATE_OFF)
     }
-    /// Region-free (RPC-1).
+    /// Region-free (RPC-1). Sends [`REGION_FREE`] (`0x0F`) — under the migrated
+    /// region scheme `0x01` now means "force DVD region 1", not region-free.
     pub fn region_free(&mut self) -> Result<()> {
-        self.set(Feature::Region, STATE_ON)
+        self.set(Feature::Region, REGION_FREE)
     }
     /// Force a specific Blu-ray region.
     pub fn force_region_bd(&mut self, region: BdRegion) -> Result<()> {
@@ -580,7 +657,7 @@ impl<'a> FirmwareControl<'a> {
     /// host-cert handshake and returns bus-encrypted content, so the host
     /// performs the AKE and de-busses. Rips: BD with an otherwise-revoked cert.
     pub fn arm_oem_bd(&mut self) -> Result<()> {
-        self.set_verify(Feature::Hrl, STATE_ON)
+        self.set_verify(Feature::Hrl, STATE_OFF)
     }
 
     /// **arm_oem_uhd** — OEM-style UHD (AACS 2.0) rip with a REAL AKE.
@@ -590,8 +667,8 @@ impl<'a> FirmwareControl<'a> {
     /// The host still runs the real AKE. Rips: UHD via the OEM cert path.
     pub fn arm_oem_uhd(&mut self) -> Result<()> {
         self.set_verify(Feature::Uhd, STATE_ON)?;
-        self.set_verify(Feature::Hrl, STATE_ON)?;
-        self.set_verify(Feature::Bus, STATE_ON)
+        self.set_verify(Feature::Hrl, STATE_OFF)?;
+        self.set_verify(Feature::Bus, STATE_OFF)
     }
 
     /// **arm_bypass_bd** — full-bypass Blu-ray rip (NO host cert needed).
@@ -599,7 +676,7 @@ impl<'a> FirmwareControl<'a> {
     /// Sets: `Ake = null` (drive acts pre-authenticated, so a bare VID read
     /// returns the volume ID with no cert and no AKE). Rips: BD with no cert.
     pub fn arm_bypass_bd(&mut self) -> Result<()> {
-        self.set_verify(Feature::Ake, STATE_ON)
+        self.set_verify(Feature::Ake, STATE_OFF)
     }
 
     /// **arm_bypass_uhd** — full-bypass UHD rip (NO host cert needed).
@@ -608,8 +685,8 @@ impl<'a> FirmwareControl<'a> {
     /// handshake), `Bus = off` (content de-bussed). Rips: UHD with no cert.
     pub fn arm_bypass_uhd(&mut self) -> Result<()> {
         self.set_verify(Feature::Uhd, STATE_ON)?;
-        self.set_verify(Feature::Ake, STATE_ON)?;
-        self.set_verify(Feature::Bus, STATE_ON)
+        self.set_verify(Feature::Ake, STATE_OFF)?;
+        self.set_verify(Feature::Bus, STATE_OFF)
     }
 
     /// **arm_stealth_oem** — return the drive to byte-for-byte OEM behaviour.

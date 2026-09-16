@@ -13,6 +13,7 @@ fn verb_values_match_abi() {
     assert_eq!(Verb::Get as u8, 0x03);
     assert_eq!(Verb::Reset as u8, 0x04);
     assert_eq!(Verb::DumpAll as u8, 0x09);
+    assert_eq!(Verb::Save as u8, 0x0B);
 }
 
 #[test]
@@ -38,10 +39,12 @@ fn state_and_frame_constants_match_abi() {
     assert_eq!(STATE_PASSTHROUGH, 0xFF);
     assert_eq!(STATE_OFF, 0x00);
     assert_eq!(STATE_ON, 0x01);
-    assert_eq!(SPEED_MAX, 0x01);
-    assert_eq!(STATE_BD_DISABLE, 0x02);
-    assert_eq!([REGION_BD_A, REGION_BD_B, REGION_BD_C], [0x2A, 0x2B, 0x2C]);
-    assert_eq!(REGION_DVD_BASE, 0x10);
+    assert_eq!(SPEED_MAX, 0x00);
+    assert_eq!([REGION_BD_A, REGION_BD_B, REGION_BD_C], [0x0A, 0x0B, 0x0C]);
+    assert_eq!(REGION_DVD_BASE, 0x00);
+    assert_eq!(REGION_FREE, 0x0F);
+    assert_eq!(RESET_TO_FLASH, 0x00);
+    assert_eq!(RESET_TO_OEM, 0xFF);
 }
 
 // ── CDB builders ─────────────────────────────────────────────────────────────
@@ -76,15 +79,26 @@ fn vendor_commands_floor_alloc_len_at_min_for_hw() {
         |cdb: &[u8; CDB_LEN]| u16::from_be_bytes([cdb[CDB_ALLOC_LEN], cdb[CDB_ALLOC_LEN + 1]]);
     assert_eq!(alloc(&build_set_cdb(Feature::Ake, STATE_ON)), MIN_ALLOC_LEN);
     assert_eq!(alloc(&build_get_cdb(Feature::Ake)), MIN_ALLOC_LEN);
-    assert_eq!(alloc(&build_reset_cdb()), MIN_ALLOC_LEN);
+    assert_eq!(alloc(&build_reset_cdb(RESET_TO_OEM)), MIN_ALLOC_LEN);
+    assert_eq!(alloc(&build_save_cdb()), MIN_ALLOC_LEN);
 }
 
 #[test]
 fn build_reset_and_identity_cdb_exact_bytes() {
-    // RESET floors its data-in at MIN_ALLOC_LEN (0x0040) for the same HW reason.
+    // RESET carries its mode in the state slot (cdb[6]) and floors its data-in at
+    // MIN_ALLOC_LEN (0x0040) for the same HW reason: to-OEM = 0xFF, to-flash = 0x00.
     assert_eq!(
-        build_reset_cdb(),
+        build_reset_cdb(RESET_TO_OEM),
+        [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x00, 0xFF, 0x00, 0x40, 0x00]
+    );
+    assert_eq!(
+        build_reset_cdb(RESET_TO_FLASH),
         [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x00, 0x00, 0x00, 0x40, 0x00]
+    );
+    // SAVE takes no feature/state and floors its data-in at MIN_ALLOC_LEN.
+    assert_eq!(
+        build_save_cdb(),
+        [0x3C, 0x0E, 0xC0, 0xDE, 0x0B, 0x00, 0x00, 0x00, 0x40, 0x00]
     );
     // IDENTITY with a 64-byte allocation (0x0040 big-endian at cdb[7..9]).
     assert_eq!(
@@ -109,9 +123,9 @@ fn build_memread_cdb_packs_address_big_endian_at_5_to_9() {
 
 #[test]
 fn region_state_bytes() {
-    assert_eq!(BdRegion::A.state(), 0x2A);
-    assert_eq!(BdRegion::B.state(), 0x2B);
-    assert_eq!(BdRegion::C.state(), 0x2C);
+    assert_eq!(BdRegion::A.state(), 0x0A);
+    assert_eq!(BdRegion::B.state(), 0x0B);
+    assert_eq!(BdRegion::C.state(), 0x0C);
 }
 
 // ── Identity / states parsing ────────────────────────────────────────────────
@@ -145,6 +159,9 @@ fn identity_parse_none_without_magic() {
 struct FwMock {
     version: &'static str,
     states: FeatureStates,
+    /// The saved flash config block: SAVE snapshots `states` into it, RESET
+    /// with RESET_TO_FLASH reloads it, RESET_TO_OEM forces all-passthrough.
+    saved: FeatureStates,
     is_freemkv: bool,
     cdbs: Vec<Vec<u8>>,
 }
@@ -154,6 +171,7 @@ impl FwMock {
         FwMock {
             version: "0.6.6",
             states: FeatureStates::all_passthrough(),
+            saved: FeatureStates::all_passthrough(),
             is_freemkv: true,
             cdbs: Vec::new(),
         }
@@ -220,7 +238,16 @@ impl ScsiTransport for FwMock {
                 self.states.set(f, cdb[CDB_STATE]);
             }
             v if v == Verb::Reset as u8 => {
-                self.states = FeatureStates::all_passthrough();
+                // The mode rides in the state slot (cdb[6]): to-OEM forces
+                // all-passthrough, to-flash reloads the saved config block.
+                self.states = if cdb[CDB_STATE] == RESET_TO_FLASH {
+                    self.saved
+                } else {
+                    FeatureStates::all_passthrough()
+                };
+            }
+            v if v == Verb::Save as u8 => {
+                self.saved = self.states;
             }
             v if v == Verb::DumpAll as u8 => {
                 for (i, b) in data.iter_mut().enumerate() {
@@ -301,8 +328,39 @@ fn reset_sends_reset_cdb_and_clears_state() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.reset().expect("reset");
     }
-    assert_eq!(m.cdbs[0], build_reset_cdb());
+    assert_eq!(m.cdbs[0], build_reset_cdb(RESET_TO_OEM));
     assert_eq!(m.states, FeatureStates::all_passthrough());
+}
+
+#[test]
+fn save_then_reset_to_flash_restores_the_saved_value() {
+    // SET a feature, SAVE it, force all-passthrough with RESET(to-OEM), then
+    // RESET(to-flash) must reload the saved value (not passthrough).
+    let mut m = FwMock::new();
+    {
+        let mut fw = FirmwareControl::new(&mut m);
+        fw.set(Feature::Bus, STATE_OFF).expect("set");
+        fw.save().expect("save");
+        fw.reset().expect("reset to OEM");
+        assert_eq!(fw.get(Feature::Bus).expect("get"), STATE_PASSTHROUGH);
+        fw.reset_to_flash().expect("reset to flash");
+        assert_eq!(fw.get(Feature::Bus).expect("get"), STATE_OFF);
+    }
+    // The verbs issued, in order: SET, SAVE, RESET, GET, RESET, GET.
+    assert_eq!(
+        m.verbs(),
+        vec![
+            Verb::Set as u8,
+            Verb::Save as u8,
+            Verb::Reset as u8,
+            Verb::Get as u8,
+            Verb::Reset as u8,
+            Verb::Get as u8,
+        ]
+    );
+    assert_eq!(m.cdbs[1], build_save_cdb());
+    assert_eq!(m.cdbs[2], build_reset_cdb(RESET_TO_OEM));
+    assert_eq!(m.cdbs[4], build_reset_cdb(RESET_TO_FLASH));
 }
 
 #[test]
@@ -355,13 +413,16 @@ fn typed_setters_issue_expected_set_cdbs() {
         fw.unlock_speed().unwrap();
     }
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
-    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bd, STATE_BD_DISABLE));
-    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_ON));
-    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Ake, STATE_ON));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_ON));
-    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, STATE_ON));
+    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bd, STATE_OFF));
+    // The HRL/AKE/BUS unlock direction is now STATE_OFF (0x00), not STATE_ON.
+    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
+    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Ake, STATE_OFF));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_OFF));
+    // Region-free is REGION_FREE (0x0F) — 0x01 now forces DVD region 1.
+    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, REGION_FREE));
     assert_eq!(m.cdbs[6], build_set_cdb(Feature::Region, REGION_BD_B));
-    assert_eq!(m.cdbs[7], build_set_cdb(Feature::Region, 0x12));
+    // force_region_dvd(2) = REGION_DVD_BASE + 2 = 0x02 under the new base.
+    assert_eq!(m.cdbs[7], build_set_cdb(Feature::Region, 0x02));
     assert_eq!(m.cdbs[8], build_set_cdb(Feature::Speed, SPEED_MAX));
 }
 
@@ -382,10 +443,10 @@ fn arm_oem_bd_sets_and_verifies_hrl_skip() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_oem_bd().expect("armed");
     }
-    // SET Hrl=ON, then GET Hrl to verify.
-    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Hrl, STATE_ON));
+    // SET Hrl=OFF (the migrated skip direction), then GET Hrl to verify.
+    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Hrl, STATE_OFF));
     assert_eq!(m.cdbs[1], build_get_cdb(Feature::Hrl));
-    assert_eq!(m.states.hrl, STATE_ON);
+    assert_eq!(m.states.hrl, STATE_OFF);
 }
 
 #[test]
@@ -403,11 +464,11 @@ fn arm_oem_uhd_sets_uhd_hrl_bus_each_verified() {
         "each set is verified by a get"
     );
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
-    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_ON));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_ON));
+    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_OFF));
     assert_eq!(m.states.uhd, STATE_ON);
-    assert_eq!(m.states.hrl, STATE_ON);
-    assert_eq!(m.states.bus, STATE_ON);
+    assert_eq!(m.states.hrl, STATE_OFF);
+    assert_eq!(m.states.bus, STATE_OFF);
 }
 
 #[test]
@@ -417,9 +478,9 @@ fn arm_bypass_bd_nulls_ake() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_bypass_bd().expect("armed");
     }
-    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Ake, STATE_ON));
+    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Ake, STATE_OFF));
     assert_eq!(m.cdbs[1], build_get_cdb(Feature::Ake));
-    assert_eq!(m.states.ake, STATE_ON);
+    assert_eq!(m.states.ake, STATE_OFF);
 }
 
 #[test]
@@ -430,11 +491,11 @@ fn arm_bypass_uhd_sets_uhd_ake_bus() {
         fw.arm_bypass_uhd().expect("armed");
     }
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
-    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Ake, STATE_ON));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_ON));
+    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Ake, STATE_OFF));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_OFF));
     assert_eq!(m.states.uhd, STATE_ON);
-    assert_eq!(m.states.ake, STATE_ON);
-    assert_eq!(m.states.bus, STATE_ON);
+    assert_eq!(m.states.ake, STATE_OFF);
+    assert_eq!(m.states.bus, STATE_OFF);
 }
 
 #[test]
@@ -446,7 +507,7 @@ fn arm_stealth_oem_resets_then_verifies_all_passthrough() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_stealth_oem().expect("disarmed");
     }
-    assert_eq!(m.cdbs[0], build_reset_cdb());
+    assert_eq!(m.cdbs[0], build_reset_cdb(RESET_TO_OEM));
     // then a GET of every feature
     assert_eq!(m.cdbs.len(), 1 + ALL_FEATURES.len());
     assert!(m.cdbs[1..].iter().all(|c| c[CDB_VERB] == Verb::Get as u8));
@@ -460,7 +521,7 @@ fn arm_by_recipe_enum_dispatches() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm(ArmRecipe::BypassBd).expect("armed");
     }
-    assert_eq!(m.states.ake, STATE_ON);
+    assert_eq!(m.states.ake, STATE_OFF);
 }
 
 #[test]
@@ -495,7 +556,7 @@ fn set_verify_reports_mismatch() {
         err,
         FirmwareError::VerifyFailed {
             feature: Feature::Ake,
-            wanted: STATE_ON,
+            wanted: STATE_OFF,
             got: STATE_PASSTHROUGH,
         }
     );

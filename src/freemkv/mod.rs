@@ -10,14 +10,16 @@
 //! only sequences the vendor commands into an unlock; it reuses the firmware
 //! module's CDB builders so the wire framing never drifts.
 //!
-//! Unlock mapping onto the grammar: region-free = `Set(Region, on)`, riplock
-//! lift = `Set(Speed, max)`, the load-bearing transport unlock = `Set(Ake, null)`
-//! (drive acts pre-authenticated → a bare `0xAD` returns the VID with no cert
-//! and no AKE), and the trailing bus-off = `Set(Bus, off)` (content de-bussed).
+//! Unlock mapping onto the grammar: region-free = `Set(Region, free)`
+//! (`REGION_FREE`), riplock lift = `Set(Speed, max)` (`SPEED_MAX`), the
+//! load-bearing transport unlock = `Set(Ake, off)` (`STATE_OFF` — drive acts
+//! pre-authenticated → a bare `0xAD` returns the VID with no cert and no AKE), and
+//! the trailing bus-off = `Set(Bus, off)` (`STATE_OFF`, content de-bussed). Under
+//! the migrated spec the HRL/AKE/BUS unlock direction is `STATE_OFF`, not `0x01`.
 
 use crate::firmware::{
-    Feature, MEMREAD_LEN, RESP_MAGIC, SPEED_MAX, STATE_ON, build_identity_cdb, build_memread_cdb,
-    build_set_cdb,
+    Feature, MEMREAD_LEN, REGION_FREE, RESP_MAGIC, SPEED_MAX, STATE_OFF, build_identity_cdb,
+    build_memread_cdb, build_set_cdb,
 };
 use crate::scsi::{DataDirection, ScsiTransport};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
@@ -156,9 +158,9 @@ impl FreemkvUnlocker {
         }
     }
 
-    // Full freemkv unlock: IDENTITY (hard gate) → Set(Region,on) → Set(Speed,max)
-    // (best-effort) → Set(Ake,null) (LOAD-BEARING) → bare 0xAD VID (best-effort)
-    // → Set(Bus,off) (trailing, best-effort).
+    // Full freemkv unlock: IDENTITY (hard gate) → Set(Region,free) →
+    // Set(Speed,max) (best-effort) → Set(Ake,off) (LOAD-BEARING) → bare 0xAD VID
+    // (best-effort) → Set(Bus,off) (trailing, best-effort).
     fn full_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -186,12 +188,13 @@ impl FreemkvUnlocker {
             }
         };
         // Region-free + riplock lift (best-effort features).
-        best_effort(self.set(scsi, Feature::Region, STATE_ON), "region")?;
+        best_effort(self.set(scsi, Feature::Region, REGION_FREE), "region")?;
         best_effort(self.set(scsi, Feature::Speed, SPEED_MAX), "speed")?;
-        // Ake = null (LOAD-BEARING): drive acts pre-authenticated, so a bare
+        // Ake = off/null (LOAD-BEARING): drive acts pre-authenticated, so a bare
         // 0xAD returns the VID with no cert and no AKE. No fallback — a firmware
-        // that rejects it can't do the one-command unlock.
-        match self.set(scsi, Feature::Ake, STATE_ON) {
+        // that rejects it can't do the one-command unlock. The migrated spec puts
+        // the null/bypass direction on STATE_OFF (0x00), not 0x01.
+        match self.set(scsi, Feature::Ake, STATE_OFF) {
             Ok(()) => {}
             Err(UnlockError::Transport) => return Err(UnlockError::Transport),
             Err(_) => {
@@ -207,10 +210,10 @@ impl FreemkvUnlocker {
         // LD/Renesas routes). The null AKE already unlocked the drive, so a VID
         // miss must not discard it: only a dead bus propagates (`?`), else `None`.
         let vid = crate::vid::read_aacs_vid(scsi)?;
-        // Trailing Set(Bus, off): remove in-transit bus encryption. FULLY
-        // best-effort — inert without the lever, and a failure here never
-        // discards an already-obtained unlock.
-        if let Err(e) = self.set(scsi, Feature::Bus, STATE_ON) {
+        // Trailing Set(Bus, off): remove in-transit bus encryption (STATE_OFF is
+        // the de-bussed direction). FULLY best-effort — inert without the lever,
+        // and a failure here never discards an already-obtained unlock.
+        if let Err(e) = self.set(scsi, Feature::Bus, STATE_OFF) {
             tracing::debug!(
                 target: "freemkv::disc",
                 phase = "freemkv_bus_off_unavailable",
@@ -222,7 +225,7 @@ impl FreemkvUnlocker {
             target: "freemkv::disc",
             phase = "freemkv_unlocked",
             has_vid = vid.is_some(),
-            "freemkv drive unlocked (null AKE on)"
+            "freemkv drive unlocked (null AKE — Ake=off)"
         );
         Ok(Unlocked { vid, bus_key: None })
     }
@@ -253,7 +256,8 @@ mod tests {
     use super::*;
     use crate::DiscKind;
     use crate::firmware::{
-        STATE_ON, build_identity_cdb, build_memread_cdb, build_reset_cdb, build_set_cdb,
+        REGION_FREE, RESET_TO_OEM, STATE_OFF, build_identity_cdb, build_memread_cdb,
+        build_reset_cdb, build_set_cdb,
     };
     use crate::scsi::mock::{MockTransport, Reply};
     use crate::scsi::{DataDirection, Result, ScsiResult, ScsiTransport};
@@ -317,21 +321,24 @@ mod tests {
     /// (0x0040 at cdb[7..9]) — the drive aborts a sub-16-byte transfer (HW-confirmed).
     #[test]
     fn unlock_set_cdbs_have_the_new_grammar_shape() {
+        // Region-free is REGION_FREE (0x0F) at cdb[6] — 0x01 now forces DVD region 1.
         assert_eq!(
-            build_set_cdb(Feature::Region, STATE_ON),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x02, 0x01, 0x00, 0x40, 0x00]
+            build_set_cdb(Feature::Region, REGION_FREE),
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x02, 0x0F, 0x00, 0x40, 0x00]
         );
+        // Speed max is SPEED_MAX (0x00) — the limiter-off leg of Speed.
         assert_eq!(
             build_set_cdb(Feature::Speed, SPEED_MAX),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x01, 0x01, 0x00, 0x40, 0x00]
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x01, 0x00, 0x00, 0x40, 0x00]
+        );
+        // Ake/Bus unlock direction is now STATE_OFF (0x00) at cdb[6], not 0x01.
+        assert_eq!(
+            build_set_cdb(Feature::Ake, STATE_OFF),
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x06, 0x00, 0x00, 0x40, 0x00]
         );
         assert_eq!(
-            build_set_cdb(Feature::Ake, STATE_ON),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x06, 0x01, 0x00, 0x40, 0x00]
-        );
-        assert_eq!(
-            build_set_cdb(Feature::Bus, STATE_ON),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x07, 0x01, 0x00, 0x40, 0x00]
+            build_set_cdb(Feature::Bus, STATE_OFF),
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x07, 0x00, 0x00, 0x40, 0x00]
         );
     }
 
@@ -385,25 +392,25 @@ mod tests {
     fn set_region_free_issues_the_set_region_on_cdb() {
         let mut t = MockTransport::always(Reply::good(vec![]));
         FreemkvUnlocker::new()
-            .set(&mut t, Feature::Region, STATE_ON)
+            .set(&mut t, Feature::Region, REGION_FREE)
             .expect("ok");
-        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Region, STATE_ON));
+        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Region, REGION_FREE));
     }
 
     #[test]
     fn set_ake_null_issues_the_set_ake_on_cdb() {
         let mut t = MockTransport::always(Reply::good(vec![]));
         FreemkvUnlocker::new()
-            .set(&mut t, Feature::Ake, STATE_ON)
+            .set(&mut t, Feature::Ake, STATE_OFF)
             .expect("ok");
-        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Ake, STATE_ON));
+        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Ake, STATE_OFF));
     }
 
     #[test]
     fn set_drive_rejection_is_not_applicable() {
         let mut t = MockTransport::always(Reply::illegal_request());
         let err = FreemkvUnlocker::new()
-            .set(&mut t, Feature::Ake, STATE_ON)
+            .set(&mut t, Feature::Ake, STATE_OFF)
             .unwrap_err();
         assert_eq!(err, UnlockError::NotApplicable);
     }
@@ -444,11 +451,11 @@ mod tests {
         assert_eq!(t.cdbs.len(), 6);
         // The four vendor SETs land on the right features, in order.
         assert_eq!(t.cdbs[0], build_identity_cdb(RESP_LEN as u16));
-        assert_eq!(t.cdbs[1], build_set_cdb(Feature::Region, STATE_ON));
+        assert_eq!(t.cdbs[1], build_set_cdb(Feature::Region, REGION_FREE));
         assert_eq!(t.cdbs[2], build_set_cdb(Feature::Speed, SPEED_MAX));
-        assert_eq!(t.cdbs[3], build_set_cdb(Feature::Ake, STATE_ON));
+        assert_eq!(t.cdbs[3], build_set_cdb(Feature::Ake, STATE_OFF));
         assert_eq!(t.cdbs[4][0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
-        assert_eq!(t.cdbs[5], build_set_cdb(Feature::Bus, STATE_ON));
+        assert_eq!(t.cdbs[5], build_set_cdb(Feature::Bus, STATE_OFF));
     }
 
     /// A missing region/speed feature does not fail the unlock (best-effort).
@@ -572,8 +579,8 @@ mod tests {
     #[test]
     fn reset_cdb_shape() {
         assert_eq!(
-            build_reset_cdb(),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x00, 0x00, 0x00, 0x40, 0x00]
+            build_reset_cdb(RESET_TO_OEM),
+            [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x00, 0xFF, 0x00, 0x40, 0x00]
         );
     }
 
