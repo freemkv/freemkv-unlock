@@ -79,10 +79,6 @@ pub const STATE_ON: u8 = 0x01;
 /// Any other non-passthrough value is treated as an explicit speed-cap byte.
 pub const SPEED_MAX: u8 = 0x01;
 
-/// [`Feature::Hrl`] state: one-time PERMANENT wipe of the flash HRL to
-/// valid-empty. Destructive; NOT undone by [`Verb::Reset`]. `0x02`.
-pub const HRL_WIPE_ONCE: u8 = 0x02;
-
 /// [`Feature::Bd`] state: force-refuse BD (AACS 1.0) discs (`0x02`). A distinct
 /// sentinel — NOT [`STATE_OFF`] (`0x00`, the SRAM boot value) — so an unarmed image
 /// leaves BD engaged (OEM). Mirrors the firmware ABI `STATE_BD_DISABLE`.
@@ -133,8 +129,8 @@ pub enum Feature {
     /// force-refuse BD discs; passthrough/`0x00` boot/[`STATE_ON`] = OEM (engaged —
     /// the enable direction is a no-op, OEM already engages BD).
     Bd = 0x04,
-    /// Host Revocation List handling. [`STATE_ON`] = skip lookup;
-    /// [`HRL_WIPE_ONCE`] = one-time permanent wipe.
+    /// Host Revocation List handling. [`STATE_ON`] = skip lookup (revoked certs
+    /// accepted, non-destructive).
     Hrl = 0x05,
     /// Drive-host AKE. [`STATE_ON`] = null (drive acts pre-authenticated).
     Ake = 0x06,
@@ -487,8 +483,7 @@ impl<'a> FirmwareControl<'a> {
         self.exec_none(&cdb)
     }
 
-    /// Restore every feature to [`STATE_PASSTHROUGH`] (RESET). NOTE: a prior
-    /// [`Feature::Hrl`] wipe-once is destructive and NOT undone by this.
+    /// Restore every feature to [`STATE_PASSTHROUGH`] (RESET).
     pub fn reset(&mut self) -> Result<()> {
         let cdb = build_reset_cdb();
         self.exec_none(&cdb)
@@ -551,11 +546,6 @@ impl<'a> FirmwareControl<'a> {
     /// Skip the HRL lookup (revoked certs accepted; non-destructive).
     pub fn skip_hrl(&mut self) -> Result<()> {
         self.set(Feature::Hrl, STATE_ON)
-    }
-    /// One-time PERMANENT flash wipe of the HRL to valid-empty. Destructive and
-    /// NOT undone by [`FirmwareControl::reset`].
-    pub fn wipe_hrl_once(&mut self) -> Result<()> {
-        self.set(Feature::Hrl, HRL_WIPE_ONCE)
     }
     /// Null the drive-host AKE (drive acts pre-authenticated).
     pub fn null_ake(&mut self) -> Result<()> {
@@ -632,7 +622,6 @@ impl<'a> FirmwareControl<'a> {
     ///
     /// Issues RESET (every feature → passthrough) and verifies each feature read
     /// back as [`STATE_PASSTHROUGH`]. Rips: nothing — this DISARMS the drive.
-    /// (A prior `wipe_hrl_once` is destructive and is NOT restored.)
     pub fn arm_stealth_oem(&mut self) -> Result<()> {
         self.reset()?;
         for feature in ALL_FEATURES {
