@@ -66,6 +66,18 @@ pub const CDB_ALLOC_LEN: usize = 7;
 /// Bytes returned by one [`Verb::DumpAll`] read (fixed 64-byte window).
 pub const MEMREAD_LEN: usize = 64;
 
+/// Minimum data-in allocation length any freemkv vendor command may request.
+///
+/// **Hardware-confirmed (LG BU40N on freemkv firmware):** the drive's `READ
+/// BUFFER` hijack ABORTS (Check Condition, sense key Aborted Command) any vendor
+/// command whose data-in allocation length is under ~16 bytes (0/1/2 all abort;
+/// 16 and 64 both succeed). Every builder floors its allocation at `64` — it
+/// matches [`MEMREAD_LEN`] / the IDENTITY caller and is safely above the minimum.
+/// The verb/feature/state ride in the CDB, so a larger data-in is harmless; a
+/// [`Verb::Get`] still reads its state byte from data offset 0. Mirrors the
+/// firmware ABI `MIN_ALLOC_LEN`.
+pub const MIN_ALLOC_LEN: u16 = 64;
+
 /// Feature state: **passthrough** — firmware does not touch this subsystem
 /// (OEM behaviour). The boot default of every feature and what [`Verb::Reset`]
 /// restores. `0xFF`.
@@ -197,19 +209,24 @@ pub fn build_cdb(
     cdb
 }
 
-/// Build a `SET feature = state` CDB (no data-in).
+/// Build a `SET feature = state` CDB. Requests a [`MIN_ALLOC_LEN`]-byte data-in
+/// (the drive aborts sub-16-byte transfers — HW-confirmed, see [`MIN_ALLOC_LEN`]);
+/// the feature/state ride in the CDB, so the returned payload is ignored.
 pub fn build_set_cdb(feature: Feature, state: u8) -> [u8; CDB_LEN] {
-    build_cdb(Verb::Set, Some(feature), Some(state), 0)
+    build_cdb(Verb::Set, Some(feature), Some(state), MIN_ALLOC_LEN)
 }
 
-/// Build a `GET feature` CDB (reads the state byte back in a 1-byte data-in).
+/// Build a `GET feature` CDB. Requests a [`MIN_ALLOC_LEN`]-byte data-in (the
+/// drive aborts a 1-byte transfer — HW-confirmed, see [`MIN_ALLOC_LEN`]); the
+/// current state byte is read back from data offset 0.
 pub fn build_get_cdb(feature: Feature) -> [u8; CDB_LEN] {
-    build_cdb(Verb::Get, Some(feature), None, 1)
+    build_cdb(Verb::Get, Some(feature), None, MIN_ALLOC_LEN)
 }
 
-/// Build a `RESET` CDB (all features → passthrough).
+/// Build a `RESET` CDB (all features → passthrough). Floors its data-in at
+/// [`MIN_ALLOC_LEN`] for the same HW min-transfer reason as [`build_set_cdb`].
 pub fn build_reset_cdb() -> [u8; CDB_LEN] {
-    build_cdb(Verb::Reset, None, None, 0)
+    build_cdb(Verb::Reset, None, None, MIN_ALLOC_LEN)
 }
 
 /// Build an `IDENTITY` CDB. `alloc_len` sizes the magic+version+state reply.

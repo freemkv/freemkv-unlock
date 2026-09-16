@@ -34,6 +34,7 @@ fn state_and_frame_constants_match_abi() {
     assert_eq!(RESP_MAGIC, b"freemkv");
     assert_eq!(CDB_LEN, 10);
     assert_eq!(MEMREAD_LEN, 64);
+    assert_eq!(MIN_ALLOC_LEN, 64);
     assert_eq!(STATE_PASSTHROUGH, 0xFF);
     assert_eq!(STATE_OFF, 0x00);
     assert_eq!(STATE_ON, 0x01);
@@ -47,27 +48,43 @@ fn state_and_frame_constants_match_abi() {
 
 #[test]
 fn build_set_cdb_exact_bytes() {
-    // SET Ake = ON: verb 02, feature 06, state 01, no alloc.
+    // SET Ake = ON: verb 02, feature 06, state 01, alloc MIN_ALLOC_LEN (0x0040)
+    // at cdb[7..9] big-endian — the drive aborts a sub-16-byte data-in.
     assert_eq!(
         build_set_cdb(Feature::Ake, STATE_ON),
-        [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x06, 0x01, 0x00, 0x00, 0x00]
+        [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x06, 0x01, 0x00, 0x40, 0x00]
     );
 }
 
 #[test]
 fn build_get_cdb_exact_bytes() {
-    // GET Bus: verb 03, feature 07, alloc 1 at cdb[7..9] big-endian.
+    // GET Bus: verb 03, feature 07, alloc MIN_ALLOC_LEN (0x0040) at cdb[7..9]
+    // big-endian — the drive aborts a 1-byte data-in; state read from offset 0.
     assert_eq!(
         build_get_cdb(Feature::Bus),
-        [0x3C, 0x0E, 0xC0, 0xDE, 0x03, 0x07, 0x00, 0x00, 0x01, 0x00]
+        [0x3C, 0x0E, 0xC0, 0xDE, 0x03, 0x07, 0x00, 0x00, 0x40, 0x00]
     );
 }
 
 #[test]
+fn vendor_commands_floor_alloc_len_at_min_for_hw() {
+    // HW-confirmed: the drive aborts a vendor command with a sub-16-byte data-in
+    // allocation, so SET/GET/RESET all request at least MIN_ALLOC_LEN (= 64,
+    // comfortably above the ~16-byte hardware floor).
+    assert_eq!(MIN_ALLOC_LEN, 64);
+    let alloc =
+        |cdb: &[u8; CDB_LEN]| u16::from_be_bytes([cdb[CDB_ALLOC_LEN], cdb[CDB_ALLOC_LEN + 1]]);
+    assert_eq!(alloc(&build_set_cdb(Feature::Ake, STATE_ON)), MIN_ALLOC_LEN);
+    assert_eq!(alloc(&build_get_cdb(Feature::Ake)), MIN_ALLOC_LEN);
+    assert_eq!(alloc(&build_reset_cdb()), MIN_ALLOC_LEN);
+}
+
+#[test]
 fn build_reset_and_identity_cdb_exact_bytes() {
+    // RESET floors its data-in at MIN_ALLOC_LEN (0x0040) for the same HW reason.
     assert_eq!(
         build_reset_cdb(),
-        [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00]
+        [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x00, 0x00, 0x00, 0x40, 0x00]
     );
     // IDENTITY with a 64-byte allocation (0x0040 big-endian at cdb[7..9]).
     assert_eq!(
