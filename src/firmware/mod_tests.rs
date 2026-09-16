@@ -38,7 +38,6 @@ fn state_and_frame_constants_match_abi() {
     assert_eq!(STATE_OFF, 0x00);
     assert_eq!(STATE_ON, 0x01);
     assert_eq!(SPEED_MAX, 0x01);
-    assert_eq!(HRL_WIPE_ONCE, 0x02);
     assert_eq!(STATE_BD_DISABLE, 0x02);
     assert_eq!([REGION_BD_A, REGION_BD_B, REGION_BD_C], [0x2A, 0x2B, 0x2C]);
     assert_eq!(REGION_DVD_BASE, 0x10);
@@ -340,7 +339,6 @@ fn typed_setters_issue_expected_set_cdbs() {
         fw.enable_uhd().unwrap();
         fw.disable_bd().unwrap();
         fw.skip_hrl().unwrap();
-        fw.wipe_hrl_once().unwrap();
         fw.null_ake().unwrap();
         fw.bus_off().unwrap();
         fw.region_free().unwrap();
@@ -351,13 +349,12 @@ fn typed_setters_issue_expected_set_cdbs() {
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
     assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bd, STATE_BD_DISABLE));
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_ON));
-    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Hrl, HRL_WIPE_ONCE));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Ake, STATE_ON));
-    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Bus, STATE_ON));
-    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Region, STATE_ON));
-    assert_eq!(m.cdbs[7], build_set_cdb(Feature::Region, REGION_BD_B));
-    assert_eq!(m.cdbs[8], build_set_cdb(Feature::Region, 0x12));
-    assert_eq!(m.cdbs[9], build_set_cdb(Feature::Speed, SPEED_MAX));
+    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Ake, STATE_ON));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_ON));
+    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, STATE_ON));
+    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Region, REGION_BD_B));
+    assert_eq!(m.cdbs[7], build_set_cdb(Feature::Region, 0x12));
+    assert_eq!(m.cdbs[8], build_set_cdb(Feature::Speed, SPEED_MAX));
 }
 
 #[test]
