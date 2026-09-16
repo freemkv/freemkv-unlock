@@ -119,7 +119,7 @@ impl AacsUnlocker {
                 tracing::debug!(
                     target: "freemkv::disc",
                     phase = "aacs_arm_freemkv_detected",
-                    version = id.version,
+                    version = %id.version,
                     recipe = ?recipe,
                     "freemkv firmware detected; arming before the cert AKE"
                 );

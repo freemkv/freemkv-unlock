@@ -342,45 +342,32 @@ impl FeatureStates {
             Feature::Bus => self.bus = state,
         }
     }
-
-    /// Parse a feature-state table (the bytes AFTER magic+version in an IDENTITY
-    /// reply) in [`ALL_FEATURES`] order. Missing trailing bytes default to
-    /// [`STATE_PASSTHROUGH`] so a short/older reply parses defensively.
-    pub fn from_table(table: &[u8]) -> Self {
-        let mut s = FeatureStates::all_passthrough();
-        for (i, feature) in ALL_FEATURES.iter().enumerate() {
-            if let Some(&b) = table.get(i) {
-                s.set(*feature, b);
-            }
-        }
-        s
-    }
 }
 
-/// A parsed [`Verb::Identity`] reply: the firmware version plus the current
-/// feature-state table. Only present when the reply led with [`RESP_MAGIC`].
+/// A parsed [`Verb::Identity`] reply. Only present when the reply led with
+/// [`RESP_MAGIC`]. The firmware answers IDENTITY with a human banner
+/// `freemkv <version>` (NUL-padded) — there is NO binary state table in the
+/// reply, so this carries only the version string; read the live feature states
+/// via [`FirmwareControl::states`]/[`get`](FirmwareControl::get).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmwareIdentity {
-    /// Firmware version byte (the byte after [`RESP_MAGIC`]).
-    pub version: u8,
-    /// The feature-state table reported by the drive.
-    pub states: FeatureStates,
+    /// Firmware version string, the banner text after [`RESP_MAGIC`] up to the
+    /// first NUL, trimmed (e.g. `"0.7.1"`).
+    pub version: String,
 }
 
 impl FirmwareIdentity {
     /// Parse an IDENTITY data-in payload. `None` unless it leads with
     /// [`RESP_MAGIC`] (i.e. not freemkv firmware). Layout: `RESP_MAGIC` (7) +
-    /// version (1) + feature-state table (one byte per [`ALL_FEATURES`]).
+    /// ASCII version banner, NUL-terminated/padded.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         if !verify_response(bytes) {
             return None;
         }
-        let version = bytes.get(RESP_MAGIC.len()).copied().unwrap_or(0);
-        let table = bytes.get(RESP_MAGIC.len() + 1..).unwrap_or(&[]);
-        Some(FirmwareIdentity {
-            version,
-            states: FeatureStates::from_table(table),
-        })
+        let tail = &bytes[RESP_MAGIC.len()..];
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        let version = String::from_utf8_lossy(&tail[..end]).trim().to_string();
+        Some(FirmwareIdentity { version })
     }
 }
 
@@ -447,24 +434,7 @@ impl<'a> FirmwareControl<'a> {
         }
     }
 
-    /// Issue a no-data CDB (SET / RESET), caring only about GOOD status.
-    fn exec_none(&mut self, cdb: &[u8; CDB_LEN]) -> Result<()> {
-        let mut empty: [u8; 0] = [];
-        match self
-            .scsi
-            .execute(cdb, DataDirection::None, &mut empty, CMD_TIMEOUT_MS)
-        {
-            Ok(r) if r.status == 0 => Ok(()),
-            Ok(_) => Err(FirmwareError::Rejected),
-            Err(e) => Err(if is_dead_bus(&e) {
-                FirmwareError::Transport
-            } else {
-                FirmwareError::Rejected
-            }),
-        }
-    }
-
-    /// Send IDENTITY and parse the magic + version + feature-state table.
+    /// Send IDENTITY and parse the magic + version banner.
     /// `Ok(None)` if the drive answered but the reply lacked [`RESP_MAGIC`] (not
     /// freemkv firmware); `Err(Transport)` only on a dead bus, `Err(Rejected)`
     /// if the drive refused the command outright (also "not freemkv").
@@ -495,15 +465,22 @@ impl<'a> FirmwareControl<'a> {
     }
 
     /// Set one feature to an explicit state byte (SET).
+    ///
+    /// Issued with a data-in phase (`exec_in`), not `exec_none`: the drive's
+    /// READ BUFFER hijack aborts ANY vendor verb that carries no data-in
+    /// transfer — the `MIN_ALLOC_LEN` floor in the CDB is only honored when the
+    /// host actually reads that many bytes back. The returned bytes are the
+    /// echoed state frame; we discard them (GET is the read path).
     pub fn set(&mut self, feature: Feature, state: u8) -> Result<()> {
         let cdb = build_set_cdb(feature, state);
-        self.exec_none(&cdb)
+        self.exec_in(&cdb).map(|_| ())
     }
 
-    /// Restore every feature to [`STATE_PASSTHROUGH`] (RESET).
+    /// Restore every feature to [`STATE_PASSTHROUGH`] (RESET). Data-in phase for
+    /// the same reason as [`set`](Self::set) — a no-data RESET is aborted.
     pub fn reset(&mut self) -> Result<()> {
         let cdb = build_reset_cdb();
-        self.exec_none(&cdb)
+        self.exec_in(&cdb).map(|_| ())
     }
 
     /// SET a feature, then GET it back and confirm the state stuck.
