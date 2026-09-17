@@ -191,9 +191,8 @@ impl FreemkvUnlocker {
         best_effort(self.set(scsi, Feature::Region, REGION_FREE), "region")?;
         best_effort(self.set(scsi, Feature::Speed, SPEED_MAX), "speed")?;
         // Ake = off/null (LOAD-BEARING): drive acts pre-authenticated, so a bare
-        // 0xAD returns the VID with no cert and no AKE. No fallback — a firmware
-        // that rejects it can't do the one-command unlock. The migrated spec puts
-        // the null/bypass direction on STATE_OFF (0x00), not 0x01.
+        // 0xAD returns the VID with no cert/AKE. No fallback. The migrated spec
+        // puts the null/bypass direction on STATE_OFF (0x00), not 0x01.
         match self.set(scsi, Feature::Ake, STATE_OFF) {
             Ok(()) => {}
             Err(UnlockError::Transport) => return Err(UnlockError::Transport),

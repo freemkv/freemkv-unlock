@@ -78,10 +78,9 @@ pub enum DiscKind {
 
 /// A host certificate for the AACS cert handshake (raw; the consumer collects
 /// these from its key sources and passes them in).
-// `ZeroizeOnDrop` wipes the two host PRIVATE keys when a `HostCert` is dropped
-// so they don't linger in freed heap/stack. The certificates are public key
-// material (they travel to the drive in the clear), so they are `#[zeroize(skip)]`
-// — nothing secret to wipe, and it keeps the EC/ABI-facing cert bytes untouched.
+// `ZeroizeOnDrop` wipes the two host PRIVATE keys on drop so they don't linger in
+// freed memory. The certificates are public material (sent to the drive in the
+// clear), so they are `#[zeroize(skip)]` — nothing secret, cert bytes untouched.
 #[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct HostCert {
     /// AACS 1.0 host private key (20 bytes).

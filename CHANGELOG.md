@@ -1,6 +1,12 @@
 # Changelog
 
-## [1.7.1] — UNRELEASED
+## [1.7.2] — UNRELEASED
+
+### Changed
+
+- firmware: mirror ABI v2 — `Save` + `RESET`-to-flash/OEM modes, the region/speed value encodings, and the HRL/AKE/BUS `off = unlock` (`0x00`) polarity; `full_unlock`'s default profile flipped to match. Aligns `FirmwareControl` with freemkv firmware 0.8.0.
+
+## [1.7.1] — 2026-09-14
 
 ### Added
 
