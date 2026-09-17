@@ -462,12 +462,9 @@ fn read_disc_key(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
 // ── CSSCryptKey ───────────────────────────────────────────────────────────
 
 fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
-    // key_type indexes PERM_CHALLENGE ([_;3]); variant indexes
-    // VARIANTS/PERM_VARIANT ([_;32]). Real (not debug-only) asserts turn an
-    // out-of-bounds index into an explicit precondition violation even in
-    // release builds — this is a once-per-disc path, so the cost is nil, and a
-    // stripped debug_assert would let a bad index reach the raw array indexing
-    // below. See docs/css-mod.md.
+    // key_type indexes PERM_CHALLENGE ([_;3]); variant indexes VARIANTS/
+    // PERM_VARIANT ([_;32]). Real (not debug-only) asserts catch an OOB index even
+    // in release; cost is nil on this once-per-disc path. See docs/css-mod.md.
     assert!(key_type < 3, "crypt_key: key_type out of range");
     assert!((variant as usize) < 32, "crypt_key: variant out of range");
     let perm = &PERM_CHALLENGE[key_type];
@@ -744,10 +741,9 @@ mod tests {
         assert_ne!(crypt_key(0, 0, &challenge), crypt_key(0, 1, &challenge));
     }
 
-    // Fix 9: the bounds checks are real `assert!`s, not `debug_assert!`s (which
-    // are stripped in release), so an out-of-range index is a clean panic in
-    // EVERY build rather than an out-of-bounds array access. `catch_unwind`
-    // holds regardless of the build profile the test itself runs under.
+    // Fix 9: the bounds checks are real `assert!`s, not `debug_assert!`s (stripped
+    // in release), so an out-of-range index is a clean panic in EVERY build.
+    // `catch_unwind` holds regardless of the test's build profile.
     #[test]
     fn crypt_key_asserts_out_of_range_indices() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];

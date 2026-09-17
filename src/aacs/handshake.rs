@@ -150,16 +150,9 @@ const AACS2_LA_PUB_Y: [u8; 32] = [
     0x0F, 0x68, 0x4A, 0x05, 0x96, 0xE9, 0xCE, 0x00, 0xC4, 0xD3, 0xFE, 0x6E, 0x24, 0x45, 0x4D, 0xD0,
 ];
 
-// EXPERIMENTAL gate for the native AACS 2.0 (P-256) AKE at the production API
-// boundary. The 2.0 cert byte offsets (`verify_cert_p256`, `cert_pub_key_p256`)
-// are PROVISIONAL — self-described unverified against a genuine captured 2.0
-// cert (see docs/aacs-handshake.md) — so running the real-anchor P-256 verify
-// could silently mis-verify. Keep DISABLED until a captured test vector confirms
-// the offsets (see the `#[ignore]`d
-// `real_aacs2_cert_verifies_under_the_published_la_anchor`). The AKE code and its
-// fall-through wiring stay fully exercised by tests through the anchor-
-// parametrised entry points; only the production `run_cert_handshake`
-// real-anchor attempt is gated. Flip to `true` once a real cert lands.
+// EXPERIMENTAL gate for the native AACS 2.0 (P-256) AKE. The 2.0 cert offsets are
+// PROVISIONAL (see docs/aacs-handshake.md), so only the production real-anchor
+// verify is gated off; tests still exercise the AKE. Flip once a real cert lands.
 const AACS2_P256_EXPERIMENTAL: bool = false;
 
 // AACS 1.0 LA (Licensing Administrator) public key on the 160-bit curve,
@@ -650,10 +643,9 @@ fn compute_bus_key_p256(
     let dkp = EcPoint::new(dx, dy);
 
     let shared = ec_mul(&d, &dkp, &a, &p);
-    // Defensive: a shared point at infinity has no usable x-coordinate (its
-    // stored x is 0), so it must never be reduced to a bus key. Cannot happen
-    // for d in [1, n) against an on-curve point in the prime-order subgroup, but
-    // guard rather than silently derive an all-zero-ish key.
+    // Defensive: a point at infinity has no usable x (stored x is 0), so never
+    // reduce it to a bus key. Can't happen for d in [1, n) on a prime-order
+    // subgroup point, but guard rather than derive an all-zero-ish key.
     if shared.infinity {
         return None;
     }
@@ -767,11 +759,9 @@ fn compute_bus_key(
         return None;
     }
 
-    // Bus key = lowest 128 bits (last 16 bytes) of x-coordinate. The full shared
-    // x is a secret; wipe the byte buffer on drop. LIMITATION: the `BigUint`s `d`
-    // (private scalar) and `shared.x` hold secret bytes on heap limbs that
-    // `zeroize` cannot reach (num-bigint exposes no clear/Zeroize) — a known
-    // best-effort residual until num-bigint offers zeroization.
+    // Bus key = lowest 128 bits (last 16 bytes) of x-coordinate; wipe the byte
+    // buffer on drop. LIMITATION: the `BigUint`s `d` and `shared.x` keep secret
+    // heap limbs zeroize can't reach (num-bigint has no Zeroize) — best-effort.
     let x_bytes = Zeroizing::new(to_bytes_be_padded(&shared.x, 20));
     let mut bus_key = [0u8; 16];
     bus_key.copy_from_slice(&x_bytes[4..20]); // last 16 of 20
@@ -790,10 +780,9 @@ fn generate_host_key_pair_p256() -> ([u8; 32], [u8; 32], [u8; 32]) {
         let mut priv_bytes = Zeroizing::new([0u8; 32]);
         use rand::Rng;
         rand::rng().fill_bytes(priv_bytes.as_mut_slice());
-        // Rejection-sample d in [1, n): reducing raw RNG bytes mod n would bias
-        // d toward small values (n isn't a power of two), the same modulo bias
-        // the ECDSA nonce path rejects. Redraw any candidate that is 0 or >= n,
-        // matching the AACS 1.0 sibling generate_host_key_pair.
+        // Rejection-sample d in [1, n): reducing raw RNG bytes mod n would bias d
+        // toward small values (same modulo bias the ECDSA nonce path rejects), so
+        // redraw any 0-or->=n candidate, like the AACS 1.0 generate_host_key_pair.
         let d = BigUint::from_bytes_be(priv_bytes.as_slice());
         if d.is_zero() || d >= n {
             continue;
@@ -1063,13 +1052,9 @@ fn aacs_authenticate_with_agid(
     drive_nonce.copy_from_slice(&response[4..24]);
     drive_cert.copy_from_slice(&response[24..116]);
 
-    // Verify drive certificate against the LA anchor. Only a type-0x01 AACS 1.0
-    // cert is verifiable on this 1.0 path. A type-0x11 (AACS 2.0) cert must NOT
-    // be accepted here: doing so previously SKIPPED both this LA verification
-    // AND the step-6 drive-key-point signature verify, then still ran ECDH and
-    // returned Ok — an attacker-chosen-bus-key hole. Reject any non-0x01 type
-    // (0x11 included); `run_cert_handshake` routes a genuine 0x11 drive to the
-    // native P-256 AKE via the v2-cred fallback instead. See docs/aacs-handshake.md.
+    // Verify drive cert against the LA anchor. Only type-0x01 (1.0) is verifiable
+    // here; accepting type-0x11 (2.0) would skip this and the step-6 verify yet run
+    // ECDH (bus-key hole), so reject it — run_cert_handshake routes 0x11 to P-256.
     if drive_cert[0] == 0x01 {
         if !verify_cert_with_anchor(&drive_cert, la_x, la_y) {
             return Err(Error::AacsCertVerify);
@@ -1095,11 +1080,9 @@ fn aacs_authenticate_with_agid(
     drive_key_point.copy_from_slice(&response[4..44]);
     drive_key_sig.copy_from_slice(&response[44..84]);
 
-    // Verify sign(host_nonce || drive_key_point) against the (now LA-verified)
-    // drive cert's public key. Always runs: the only cert type that reaches here
-    // is the type-0x01 one verified above, so `cert_pub_key`'s AACS-1.0 offsets
-    // are correct. (Previously skipped for 0x11, which — paired with the skipped
-    // cert verify — let the drive choose the bus key.)
+    // Verify sign(host_nonce || drive_key_point) against the LA-verified drive
+    // cert's key. Always runs: only the type-0x01 cert verified above reaches
+    // here, so cert_pub_key's AACS-1.0 offsets are correct (0x11 was let through).
     {
         let (drive_pub_x, drive_pub_y) = cert_pub_key(&drive_cert);
         let mut verify_data = [0u8; 60];
@@ -1165,17 +1148,9 @@ fn aacs_authenticate_with_agid(
     })
 }
 
-// Native AACS 2.0 handshake using P-256/SHA-256 with the LA trust anchor as a
-// parameter, so tests can exercise the full AKE under a test LA keypair (the
-// real anchor's private half doesn't exist). Same SCSI protocol as the 1.0 AKE,
-// larger payloads.
-//
-// The production 2.0 cert offsets this consumes are PROVISIONAL/unverified
-// against a genuine captured 2.0 cert (see `verify_cert_p256` and
-// docs/aacs-handshake.md), so the production entry `run_cert_handshake` keeps
-// this path DISABLED behind `AACS2_P256_EXPERIMENTAL` — it must not be reached
-// with the real anchor until a captured test vector confirms the offsets, or it
-// could silently mis-verify. Tests reach it directly with a test anchor.
+// Native AACS 2.0 handshake (P-256/SHA-256); LA anchor is a parameter so tests
+// drive the full AKE under a test keypair. Its 2.0 cert offsets are PROVISIONAL
+// (docs/aacs-handshake.md), so run_cert_handshake gates it off (see AACS2_P256_EXPERIMENTAL).
 fn aacs2_authenticate_p256_with_anchor(
     session: &mut dyn ScsiTransport,
     host_priv_key: &[u8; 32],
@@ -1678,12 +1653,9 @@ pub(crate) fn run_cert_handshake_with_anchors(
         // so skip it — unless the cert also carries v2 creds the attempt can try.
         let host_id = cert_host_id_hex(&hc.certificate);
         let v1_paired = aacs1_keypair_matches(&hc.private_key, &hc.certificate);
-        // Mirror `attempt_one_cert`'s `has_v2` gate exactly: in production
-        // (`allow_p256 = false`) the v2 path is never attempted, so a cert whose
-        // v1 pairing is dead offers nothing the drive round-trip could use and
-        // must be skipped up front — otherwise it reaches the drive, fails the
-        // step-7 self-verify, and burns a `MAX_CERT_ATTEMPTS` slot that a later
-        // valid cert needs.
+        // Mirror `attempt_one_cert`'s `has_v2` gate: in production (allow_p256 =
+        // false) a cert with a dead v1 pairing is useless, so skip it up front —
+        // else it reaches the drive, fails step-7, and burns a MAX_CERT_ATTEMPTS slot.
         let has_v2 = allow_p256 && hc.private_key_v2.is_some() && hc.certificate_v2.is_some();
         if !v1_paired && !has_v2 {
             tracing::info!(
@@ -1739,10 +1711,9 @@ pub(crate) fn run_cert_handshake_with_anchors(
             }
         }
     }
-    // No cert ever reached the drive (every cert skipped as a dead pairing, or
-    // the list was empty): this is a keydb/host-cert problem, not a drive
-    // rejection — report it as such rather than the less accurate
-    // HandshakeRejected the drive never actually issued.
+    // No cert reached the drive (all skipped as dead pairings, or list empty):
+    // a keydb/host-cert problem, not a drive rejection — report it as such rather
+    // than the less accurate HandshakeRejected the drive never issued.
     if drive_attempts == 0 {
         tracing::info!(
             target: "freemkv::disc",
@@ -2173,11 +2144,9 @@ pub(crate) mod tests {
         );
     }
 
-    // Fix 1: on the AACS 1.0 path a type-0x11 (AACS 2.0) drive cert must be
-    // REJECTED at the cert gate — not accepted unverified (which used to skip
-    // BOTH the LA cert verify AND the step-6 drive-key signature, then still run
-    // ECDH: an attacker-chosen-bus-key hole). The orchestrator routes a genuine
-    // 0x11 drive to the native P-256 path instead (see the HybridDrive test).
+    // Fix 1: on the 1.0 path a type-0x11 (2.0) drive cert must be REJECTED at the
+    // gate — accepting it unverified used to skip the LA verify and step-6 sig yet
+    // run ECDH (bus-key hole). 0x11 drives route to P-256 (see HybridDrive test).
     #[test]
     fn type_0x11_drive_cert_is_rejected_on_the_1_0_path() {
         let mut cert_resp = vec![0u8; 116];
@@ -2207,11 +2176,9 @@ pub(crate) mod tests {
         );
     }
 
-    // Plays the DRIVE side of a genuine AACS 1.0 handshake: presents a type-0x01
-    // drive cert signed by its own self-generated test LA key (`la_x`/`la_y`),
-    // signs the step-6 drive key point with the cert's long-term key, and derives
-    // the same bus key as the host (ECDH is symmetric) so its VID MAC verifies.
-    // Auth + VID read SUCCEED; by default it then dies on read-data-keys.
+    // Plays the DRIVE side of a genuine AACS 1.0 handshake: type-0x01 cert signed
+    // by its own test LA key, step-6 signed with the cert key, same bus key as the
+    // host (ECDH symmetric). Auth + VID read SUCCEED, then dies on read-data-keys.
     pub(crate) struct DriveEmu {
         /// Self-generated AACS 1.0 LA test anchor public half. A test threads
         /// `la_x`/`la_y` into `run_cert_handshake_with_anchors` (production can't
@@ -2817,10 +2784,9 @@ pub(crate) mod tests {
         );
     }
 
-    // Fix 6: a shared point at infinity must never be reduced to a bus key. With
-    // host_priv == n (the group order), n·G == O, so the ECDH result is the point
-    // at infinity — the on-curve guard passes (G is on-curve) but the infinity
-    // guard must return None rather than derive an all-zero-ish key.
+    // Fix 6: a shared point at infinity must never become a bus key. host_priv ==
+    // n gives n·G == O, so the on-curve guard passes (G is on-curve) but the
+    // infinity guard must return None rather than derive an all-zero-ish key.
     #[test]
     fn compute_bus_key_rejects_a_shared_point_at_infinity() {
         assert!(
@@ -3808,12 +3774,9 @@ pub(crate) mod tests {
         );
     }
 
-    // Plays a backward-compat 2.0 drive that ALSO speaks the AACS 1.0 AKE: it
-    // completes the 1.0 handshake (genuine type-0x01 cert, signed step 6) but its
-    // 1.0-derived bus key CANNOT authenticate the VID (bad MAC), then serves a
-    // full native P-256 (AACS 2.0) AKE. Phase is keyed off the SCSI payload
-    // length (v1 = 116/84, v2 = 156/132). Proves fix 2: a post-auth 1.0 VID/MAC
-    // failure with v2 creds present falls through to the P-256 path.
+    // A backward-compat 2.0 drive that also speaks 1.0: it completes the 1.0 AKE
+    // but its bus key fails the VID MAC, then serves a native P-256 AKE (phase
+    // keyed off payload length). Proves fix 2: 1.0 MAC failure falls to P-256.
     struct HybridDrive {
         // AACS 1.0 material.
         la1_x: [u8; 20],

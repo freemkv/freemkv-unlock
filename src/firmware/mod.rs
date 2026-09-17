@@ -73,10 +73,9 @@ pub const MEMREAD_LEN: usize = 64;
 /// BUFFER` hijack ABORTS (Check Condition, sense key Aborted Command) any vendor
 /// command whose data-in allocation length is under ~16 bytes (0/1/2 all abort;
 /// 16 and 64 both succeed). Every builder floors its allocation at `64` — it
-/// matches [`MEMREAD_LEN`] / the IDENTITY caller and is safely above the minimum.
-/// The verb/feature/state ride in the CDB, so a larger data-in is harmless; a
-/// [`Verb::Get`] still reads its state byte from data offset 0. Mirrors the
-/// firmware ABI `MIN_ALLOC_LEN`.
+/// matches [`MEMREAD_LEN`] and is safely above the minimum. The verb/feature/
+/// state ride in the CDB, so a larger data-in is harmless; a [`Verb::Get`] still
+/// reads its state byte from data offset 0. Mirrors firmware ABI `MIN_ALLOC_LEN`.
 pub const MIN_ALLOC_LEN: u16 = 64;
 
 /// Feature state: **passthrough** — firmware does not touch this subsystem
