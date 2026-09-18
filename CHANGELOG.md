@@ -2,6 +2,10 @@
 
 ## [1.7.2] — UNRELEASED
 
+### Fixed
+
+- `FreemkvUnlocker::set` now issues the vendor SET over the required 64-byte data-in phase (mirroring `FirmwareControl::set`). freemkv firmware 0.8.x aborts a SET sent with no data phase (CHECK CONDITION / Aborted Command), so every drive-feature SET failed — including the load-bearing `Set(Ake, off)` — and the freemkv firmware unlock silently fell back to the AACS/online-key route. Drives on freemkv firmware now unlock via the freemkv route again (hardware-confirmed on BU40N fw 0.8.1).
+
 ### Changed
 
 - firmware: mirror ABI v2 — `Save` + `RESET`-to-flash/OEM modes, the region/speed value encodings, and the HRL/AKE/BUS `off = unlock` (`0x00`) polarity; `full_unlock`'s default profile flipped to match. Aligns `FirmwareControl` with freemkv firmware 0.8.0.
