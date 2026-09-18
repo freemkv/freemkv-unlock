@@ -90,7 +90,7 @@ impl FreemkvUnlocker {
         }
     }
 
-    // Issue a `Set(feature, state)` (no data-in). Ok(()) on GOOD status;
+    // Issue a `Set(feature, state)` over the required data-in phase. Ok(()) on GOOD status;
     // NotApplicable if rejected; Transport only on a dead bus.
     fn set(
         &self,
@@ -99,8 +99,11 @@ impl FreemkvUnlocker {
         state: u8,
     ) -> std::result::Result<(), UnlockError> {
         let cdb = build_set_cdb(feature, state);
-        let mut empty: [u8; 0] = [];
-        match scsi.execute(&cdb, DataDirection::None, &mut empty, 5_000) {
+        // SET needs the 64-byte data-in phase its CDB advertises — the drive aborts
+        // a no-data SET (CHECK CONDITION / Aborted Command, HW-confirmed on BU40N fw
+        // 0.8.1). Mirror FirmwareControl::set (exec_in): read the table back, ignore it.
+        let mut buf = [0u8; RESP_LEN];
+        match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
             Ok(r) if r.status == 0 => Ok(()),
             Ok(r) => {
                 tracing::debug!(
@@ -313,6 +316,43 @@ mod tests {
             build_identity_cdb(RESP_LEN as u16),
             [0x3C, 0x0E, 0xC0, 0xDE, 0x01, 0x00, 0x00, 0x00, 0x40, 0x00]
         );
+    }
+
+    /// Regression (BU40N fw 0.8.1): a SET issued WITHOUT the data-in phase its
+    /// CDB advertises is aborted by the drive (CHECK CONDITION / Aborted Command),
+    /// so the unlocker's `set()` MUST read the MIN_ALLOC_LEN table back like
+    /// `FirmwareControl::set` — not send `DataDirection::None`. Before the fix
+    /// the whole freemkv unlock failed at `Set(Ake)` and fell back to AACS.
+    #[test]
+    fn set_issues_the_required_data_in_phase() {
+        struct DataInContract;
+        impl ScsiTransport for DataInContract {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                assert_eq!(cdb[4], 0x02, "test exercises only the SET verb");
+                // Model the drive: a SET with no from-device phase is aborted.
+                if !matches!(dir, DataDirection::FromDevice) || data.is_empty() {
+                    return Ok(ScsiResult {
+                        status: 2,
+                        bytes_transferred: 0,
+                        sense: [0u8; 32],
+                    });
+                }
+                Ok(ScsiResult {
+                    status: 0,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        FreemkvUnlocker::new()
+            .set(&mut DataInContract, Feature::Region, REGION_FREE)
+            .expect("SET must succeed by issuing the data-in phase the firmware requires");
     }
 
     /// Each unlock SET is `Verb::Set` (02) on the right feature id (cdb[5]) with
