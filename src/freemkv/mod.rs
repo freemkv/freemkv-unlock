@@ -18,8 +18,8 @@
 //! the migrated spec the HRL/AKE/BUS unlock direction is `STATE_OFF`, not `0x01`.
 
 use crate::firmware::{
-    Feature, MEMREAD_LEN, REGION_FREE, RESP_MAGIC, SPEED_MAX, STATE_OFF, build_identity_cdb,
-    build_memread_cdb, build_set_cdb,
+    Feature, MEMREAD_LEN, MIN_ALLOC_LEN, REGION_FREE, RESP_MAGIC, SPEED_MAX, STATE_OFF,
+    build_identity_cdb, build_memread_cdb, build_set_cdb,
 };
 use crate::scsi::{DataDirection, ScsiTransport};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
@@ -99,10 +99,10 @@ impl FreemkvUnlocker {
         state: u8,
     ) -> std::result::Result<(), UnlockError> {
         let cdb = build_set_cdb(feature, state);
-        // SET needs the 64-byte data-in phase its CDB advertises — the drive aborts
-        // a no-data SET (CHECK CONDITION / Aborted Command, HW-confirmed on BU40N fw
-        // 0.8.1). Mirror FirmwareControl::set (exec_in): read the table back, ignore it.
-        let mut buf = [0u8; RESP_LEN];
+        // SET needs the data-in phase its CDB advertises — a no-data SET is aborted
+        // (CHECK CONDITION, HW-confirmed on BU40N fw 0.8.1). Buffer sized from the SAME
+        // const the CDB advertises (MIN_ALLOC_LEN) so the transfer length has one source.
+        let mut buf = [0u8; MIN_ALLOC_LEN as usize];
         match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
             Ok(r) if r.status == 0 => Ok(()),
             Ok(r) => {
