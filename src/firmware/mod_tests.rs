@@ -44,6 +44,7 @@ fn state_and_frame_constants_match_abi() {
     assert_eq!(REGION_DVD_BASE, 0x00);
     assert_eq!(REGION_FREE, 0x0F);
     assert_eq!(RESET_TO_FLASH, 0x00);
+    assert_eq!(RESET_TO_DEFAULTS, 0x01);
     assert_eq!(RESET_TO_OEM, 0xFF);
 }
 
@@ -330,6 +331,16 @@ fn reset_sends_reset_cdb_and_clears_state() {
     }
     assert_eq!(m.cdbs[0], build_reset_cdb(RESET_TO_OEM));
     assert_eq!(m.states, FeatureStates::all_passthrough());
+}
+
+#[test]
+fn reset_to_defaults_sends_the_defaults_mode_cdb() {
+    let mut m = FwMock::new();
+    {
+        let mut fw = FirmwareControl::new(&mut m);
+        fw.reset_to_defaults().expect("reset to defaults");
+    }
+    assert_eq!(m.cdbs[0], build_reset_cdb(RESET_TO_DEFAULTS));
 }
 
 #[test]
