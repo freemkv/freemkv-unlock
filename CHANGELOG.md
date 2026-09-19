@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.3] — UNRELEASED
+
+### Changed
+
+- firmware: mirror the fw 0.8.3 RESET ABI — added `RESET_TO_DEFAULTS` (`0x01`, restore the baked create-time defaults into RAM) and `FirmwareControl::reset_to_defaults()`; `RESET_TO_OEM` (`0xFF`) is now documented as TRUE OEM (RAM passthrough **and** the NV block blanked to all-`0xFF`, so the drive is traceless), and `RESET_TO_FLASH` as marker-gated (a never-saved drive loads the defaults). Wire values unchanged.
+
 ## [1.7.2] — UNRELEASED
 
 ### Fixed
