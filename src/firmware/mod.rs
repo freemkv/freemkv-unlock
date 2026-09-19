@@ -698,17 +698,22 @@ impl<'a> FirmwareControl<'a> {
     /// **arm_bypass_bd** — full-bypass Blu-ray rip (NO host cert needed).
     ///
     /// Sets: `Ake = null` (drive acts pre-authenticated, so a bare VID read
-    /// returns the volume ID with no cert and no AKE). Rips: BD with no cert.
+    /// returns the volume ID with no cert and no AKE) and `Hrl = skip`
+    /// (revocation off, so a revoked/absent cert never trips the HRL check).
+    /// Rips: BD with no cert.
     pub fn arm_bypass_bd(&mut self) -> Result<()> {
+        self.set_verify(Feature::Hrl, STATE_OFF)?;
         self.set_verify(Feature::Ake, STATE_OFF)
     }
 
     /// **arm_bypass_uhd** — full-bypass UHD rip (NO host cert needed).
     ///
     /// Sets: `Uhd = on` (engage the UHD disc), `Ake = null` (skip the
-    /// handshake), `Bus = off` (content de-bussed). Rips: UHD with no cert.
+    /// handshake), `Bus = off` (content de-bussed), and `Hrl = skip`
+    /// (revocation off). Rips: UHD with no cert.
     pub fn arm_bypass_uhd(&mut self) -> Result<()> {
         self.set_verify(Feature::Uhd, STATE_ON)?;
+        self.set_verify(Feature::Hrl, STATE_OFF)?;
         self.set_verify(Feature::Ake, STATE_OFF)?;
         self.set_verify(Feature::Bus, STATE_OFF)
     }

@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.7.1"
+version = "1.7.4"
 dependencies = [
  "aes",
  "base64",
@@ -406,16 +406,16 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
 name = "freemkv-engine"
-version = "1.7.1"
+version = "1.7.4"
 
 [[patch.unused]]
 name = "freemkv-i18n"
-version = "1.7.1"
+version = "1.7.4"
 
 [[patch.unused]]
 name = "freemkv-keysources"
-version = "1.7.1"
+version = "1.7.4"
 
 [[patch.unused]]
 name = "libfreemkv"
-version = "1.7.1"
+version = "1.7.4"

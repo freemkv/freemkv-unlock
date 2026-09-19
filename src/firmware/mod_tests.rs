@@ -489,8 +489,12 @@ fn arm_bypass_bd_nulls_ake() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_bypass_bd().expect("armed");
     }
-    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Ake, STATE_OFF));
-    assert_eq!(m.cdbs[1], build_get_cdb(Feature::Ake));
+    // Hrl=off (revocation skip) is set+verified FIRST, then Ake=null.
+    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Hrl, STATE_OFF));
+    assert_eq!(m.cdbs[1], build_get_cdb(Feature::Hrl));
+    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Ake, STATE_OFF));
+    assert_eq!(m.cdbs[3], build_get_cdb(Feature::Ake));
+    assert_eq!(m.states.hrl, STATE_OFF);
     assert_eq!(m.states.ake, STATE_OFF);
 }
 
@@ -501,10 +505,13 @@ fn arm_bypass_uhd_sets_uhd_ake_bus() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_bypass_uhd().expect("armed");
     }
+    // Recipe order: Uhd=on, Hrl=off, Ake=null, Bus=off (each SET then verifying GET).
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
-    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Ake, STATE_OFF));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_OFF));
+    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Ake, STATE_OFF));
+    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Bus, STATE_OFF));
     assert_eq!(m.states.uhd, STATE_ON);
+    assert_eq!(m.states.hrl, STATE_OFF);
     assert_eq!(m.states.ake, STATE_OFF);
     assert_eq!(m.states.bus, STATE_OFF);
 }
@@ -563,10 +570,11 @@ fn set_verify_reports_mismatch() {
     let mut d = StuckDrive;
     let mut fw = FirmwareControl::new(&mut d);
     let err = fw.arm_bypass_bd().unwrap_err();
+    // arm_bypass_bd now verifies Hrl=off FIRST, so the stuck drive trips on Hrl.
     assert_eq!(
         err,
         FirmwareError::VerifyFailed {
-            feature: Feature::Ake,
+            feature: Feature::Hrl,
             wanted: STATE_OFF,
             got: STATE_PASSTHROUGH,
         }
