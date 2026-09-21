@@ -1,7 +1,6 @@
 # Changelog
 
-## [1.7.4]
-
+## [1.7.4] — UNRELEASED
 ### Maintenance
 
 - CI consolidated to the central reusable workflows; no functional changes.
