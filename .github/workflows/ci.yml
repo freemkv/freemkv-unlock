@@ -167,9 +167,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
@@ -193,9 +192,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
