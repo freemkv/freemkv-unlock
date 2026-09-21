@@ -23,6 +23,11 @@ on:
     branches: [qa]
   workflow_dispatch:
 
+# A re-push to qa supersedes its own in-progress run instead of stacking.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Single source of truth for the MSRV — see ci.yml. Jobs that build/test AT
   # the MSRV read `needs.resolve-msrv.outputs.v` from Cargo.toml's rust-version;
@@ -32,7 +37,7 @@ jobs:
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -56,7 +61,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Stamp the next rc
@@ -85,7 +90,7 @@ jobs:
         os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
@@ -103,7 +108,7 @@ jobs:
   cross-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: freemkv-unlock
       # clippy runs on stable (matches ci.yml's lint job); build/test stay on
@@ -126,7 +131,7 @@ jobs:
     needs: resolve-msrv
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
