@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.7.4]
+
+### Maintenance
+
+- CI consolidated to the central reusable workflows; no functional changes.
+
 ## [1.7.3] — 2026-09-19
 
 ### Changed
