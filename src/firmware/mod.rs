@@ -184,14 +184,12 @@ pub enum Verb {
     Poke = 0x0D,
     /// **Debug-knock only.** Invokes the firmware's boot function entry with
     /// r0=4 to force the cold path (BSS clear + C-runtime data init + full
-    /// post-init sequence). Recovers a wedged drive without a power cycle
-    /// (SCSI target briefly returns Aborted Command mid-reboot, then comes
-    /// back ~5s later; the safe-knock verb chain is re-armed to its power-on
-    /// defaults). The target VA is baked into the emitted handler at build
-    /// time (resolved from the boot-init signature = `boot_init_site - 0x10`),
-    /// so no CDB arguments are carried beyond the verb byte. Refused under
-    /// the safe [`KNOCK`]; only executed under [`DEBUG_KNOCK`]. See
-    /// [`build_reboot_cdb`].
+    /// post-init), recovering a wedged drive without a power cycle. The target
+    /// briefly returns Aborted Command mid-reboot, then comes back ~5s later
+    /// with the safe-knock verb chain re-armed to its power-on defaults. The
+    /// target VA is baked into the handler at build time, so no CDB arguments
+    /// are carried beyond the verb byte. Refused under the safe [`KNOCK`];
+    /// only executed under [`DEBUG_KNOCK`]. See [`build_reboot_cdb`].
     Reboot = 0x0F,
 }
 

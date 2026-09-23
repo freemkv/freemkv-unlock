@@ -115,10 +115,9 @@ fn build_call_and_poke_cdb_exact_bytes() {
         build_poke_cdb(0x0200_0E40, 0xAA),
         [0x3C, 0x0E, 0xDE, 0xB9, 0x0D, 0x02, 0x00, 0x0E, 0x40, 0xAA]
     );
-    // Reboot: verb 0x0F at cdb[4], DEBUG_KNOCK at cdb[2..4], no on-wire target/arg
-    // (the boot-function-entry VA is baked into the emitted handler at build time).
-    // Alloc floors at MIN_ALLOC_LEN (0x0040 big-endian at cdb[7..9]) so the drive
-    // does not abort the data-in before the verb executes.
+    // Reboot: verb 0x0F at cdb[4], DEBUG_KNOCK at cdb[2..4], no on-wire target
+    // (the boot-entry VA is baked into the handler at build time). Alloc floors
+    // at MIN_ALLOC_LEN (0x0040 at cdb[7..9]) so the data-in is not aborted.
     assert_eq!(
         build_reboot_cdb(),
         [0x3C, 0x0E, 0xDE, 0xB9, 0x0F, 0x00, 0x00, 0x00, 0x40, 0x00]

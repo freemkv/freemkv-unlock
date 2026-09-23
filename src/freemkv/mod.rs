@@ -197,9 +197,8 @@ impl FreemkvUnlocker {
         best_effort(self.set(scsi, Feature::Region, REGION_FREE), "region")?;
         best_effort(self.set(scsi, Feature::Speed, SPEED_MAX), "speed")?;
         // Encryption = off (LOAD-BEARING): the consolidated cert/bus bypass —
-        // drive acts pre-authenticated (so a bare 0xAD returns the VID with no
-        // cert/AKE) AND content returns de-bussed. No fallback. The old
-        // separate Bus lever (wire id 0x07) is retired.
+        // drive acts pre-authenticated (bare 0xAD returns the VID with no
+        // cert/AKE) AND content returns de-bussed. No fallback.
         match self.set(scsi, Feature::Encryption, STATE_OFF) {
             Ok(()) => {}
             Err(UnlockError::Transport) => return Err(UnlockError::Transport),
