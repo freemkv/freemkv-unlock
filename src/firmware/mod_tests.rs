@@ -13,7 +13,11 @@ fn verb_values_match_abi() {
     assert_eq!(Verb::Get as u8, 0x03);
     assert_eq!(Verb::Reset as u8, 0x04);
     assert_eq!(Verb::DumpAll as u8, 0x09);
+    assert_eq!(Verb::FlashWrite as u8, 0x0A);
     assert_eq!(Verb::Save as u8, 0x0B);
+    assert_eq!(Verb::Call as u8, 0x0C);
+    assert_eq!(Verb::Poke as u8, 0x0D);
+    assert_eq!(Verb::Reboot as u8, 0x0F);
 }
 
 #[test]
@@ -23,8 +27,17 @@ fn feature_values_match_abi() {
     assert_eq!(Feature::Uhd as u8, 0x03);
     assert_eq!(Feature::Bd as u8, 0x04);
     assert_eq!(Feature::Hrl as u8, 0x05);
-    assert_eq!(Feature::Ake as u8, 0x06);
-    assert_eq!(Feature::Bus as u8, 0x07);
+    assert_eq!(Feature::Encryption as u8, 0x06);
+    // Wire id 0x07 (was `Bus`) is retired — proven inert on BU40N/MT1959.
+    assert_eq!(ALL_FEATURES.len(), 6);
+}
+
+#[test]
+fn debug_knock_distinct_from_safe_knock() {
+    // The fw dispatches Call/Poke ONLY under DEBUG_KNOCK; a typo of a safe verb
+    // vs a debug verb under the wrong knock never crosses the line.
+    assert_ne!(KNOCK, DEBUG_KNOCK);
+    assert_eq!(DEBUG_KNOCK, [0xDE, 0xB9]);
 }
 
 #[test]
@@ -52,21 +65,22 @@ fn state_and_frame_constants_match_abi() {
 
 #[test]
 fn build_set_cdb_exact_bytes() {
-    // SET Ake = ON: verb 02, feature 06, state 01, alloc MIN_ALLOC_LEN (0x0040)
-    // at cdb[7..9] big-endian — the drive aborts a sub-16-byte data-in.
+    // SET Encryption = ON: verb 02, feature 06, state 01, alloc MIN_ALLOC_LEN
+    // (0x0040) at cdb[7..9] big-endian — the drive aborts a sub-16-byte data-in.
     assert_eq!(
-        build_set_cdb(Feature::Ake, STATE_ON),
+        build_set_cdb(Feature::Encryption, STATE_ON),
         [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x06, 0x01, 0x00, 0x40, 0x00]
     );
 }
 
 #[test]
 fn build_get_cdb_exact_bytes() {
-    // GET Bus: verb 03, feature 07, alloc MIN_ALLOC_LEN (0x0040) at cdb[7..9]
-    // big-endian — the drive aborts a 1-byte data-in; state read from offset 0.
+    // GET Encryption: verb 03, feature 06, alloc MIN_ALLOC_LEN (0x0040) at
+    // cdb[7..9] big-endian — the drive aborts a 1-byte data-in; state read
+    // from offset 0.
     assert_eq!(
-        build_get_cdb(Feature::Bus),
-        [0x3C, 0x0E, 0xC0, 0xDE, 0x03, 0x07, 0x00, 0x00, 0x40, 0x00]
+        build_get_cdb(Feature::Encryption),
+        [0x3C, 0x0E, 0xC0, 0xDE, 0x03, 0x06, 0x00, 0x00, 0x40, 0x00]
     );
 }
 
@@ -78,10 +92,37 @@ fn vendor_commands_floor_alloc_len_at_min_for_hw() {
     assert_eq!(MIN_ALLOC_LEN, 64);
     let alloc =
         |cdb: &[u8; CDB_LEN]| u16::from_be_bytes([cdb[CDB_ALLOC_LEN], cdb[CDB_ALLOC_LEN + 1]]);
-    assert_eq!(alloc(&build_set_cdb(Feature::Ake, STATE_ON)), MIN_ALLOC_LEN);
-    assert_eq!(alloc(&build_get_cdb(Feature::Ake)), MIN_ALLOC_LEN);
+    assert_eq!(
+        alloc(&build_set_cdb(Feature::Encryption, STATE_ON)),
+        MIN_ALLOC_LEN
+    );
+    assert_eq!(alloc(&build_get_cdb(Feature::Encryption)), MIN_ALLOC_LEN);
     assert_eq!(alloc(&build_reset_cdb(RESET_TO_OEM)), MIN_ALLOC_LEN);
     assert_eq!(alloc(&build_save_cdb()), MIN_ALLOC_LEN);
+}
+
+#[test]
+fn build_call_and_poke_cdb_exact_bytes() {
+    // Call: verb 0x0C at cdb[4], DEBUG_KNOCK at cdb[2..4], target big-endian
+    // in cdb[5..9], r0 in cdb[9].
+    assert_eq!(
+        build_call_cdb(0x0102_0304, 0xAB),
+        [0x3C, 0x0E, 0xDE, 0xB9, 0x0C, 0x01, 0x02, 0x03, 0x04, 0xAB]
+    );
+    // Poke: verb 0x0D at cdb[4], DEBUG_KNOCK at cdb[2..4], target big-endian
+    // in cdb[5..9], value in cdb[9].
+    assert_eq!(
+        build_poke_cdb(0x0200_0E40, 0xAA),
+        [0x3C, 0x0E, 0xDE, 0xB9, 0x0D, 0x02, 0x00, 0x0E, 0x40, 0xAA]
+    );
+    // Reboot: verb 0x0F at cdb[4], DEBUG_KNOCK at cdb[2..4], no on-wire target/arg
+    // (the boot-function-entry VA is baked into the emitted handler at build time).
+    // Alloc floors at MIN_ALLOC_LEN (0x0040 big-endian at cdb[7..9]) so the drive
+    // does not abort the data-in before the verb executes.
+    assert_eq!(
+        build_reboot_cdb(),
+        [0x3C, 0x0E, 0xDE, 0xB9, 0x0F, 0x00, 0x00, 0x00, 0x40, 0x00]
+    );
 }
 
 #[test]
@@ -271,13 +312,13 @@ impl ScsiTransport for FwMock {
 #[test]
 fn identity_detects_freemkv_and_issues_identity_cdb() {
     let mut m = FwMock::new();
-    m.states.ake = STATE_ON;
+    m.states.encryption = STATE_ON;
     {
         let mut fw = FirmwareControl::new(&mut m);
         let id = fw.identity().expect("no fault").expect("is freemkv");
         assert_eq!(id.version, "0.6.6");
         // States no longer ride in IDENTITY — read them via GET.
-        assert_eq!(fw.get(Feature::Ake).expect("get"), STATE_ON);
+        assert_eq!(fw.get(Feature::Encryption).expect("get"), STATE_ON);
         assert!(fw.is_freemkv().expect("no fault"));
     }
     assert_eq!(m.cdbs[0], build_identity_cdb(MEMREAD_LEN as u16));
@@ -311,20 +352,19 @@ fn get_and_set_roundtrip_issue_the_right_cdbs() {
     let mut m = FwMock::new();
     {
         let mut fw = FirmwareControl::new(&mut m);
-        assert_eq!(fw.get(Feature::Bus).expect("get"), STATE_PASSTHROUGH);
-        fw.set(Feature::Bus, STATE_ON).expect("set");
-        assert_eq!(fw.get(Feature::Bus).expect("get"), STATE_ON);
+        assert_eq!(fw.get(Feature::Encryption).expect("get"), STATE_PASSTHROUGH);
+        fw.set(Feature::Encryption, STATE_ON).expect("set");
+        assert_eq!(fw.get(Feature::Encryption).expect("get"), STATE_ON);
     }
-    assert_eq!(m.cdbs[0], build_get_cdb(Feature::Bus));
-    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bus, STATE_ON));
-    assert_eq!(m.cdbs[2], build_get_cdb(Feature::Bus));
+    assert_eq!(m.cdbs[0], build_get_cdb(Feature::Encryption));
+    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Encryption, STATE_ON));
+    assert_eq!(m.cdbs[2], build_get_cdb(Feature::Encryption));
 }
 
 #[test]
 fn reset_sends_reset_cdb_and_clears_state() {
     let mut m = FwMock::new();
-    m.states.ake = STATE_ON;
-    m.states.bus = STATE_ON;
+    m.states.encryption = STATE_ON;
     {
         let mut fw = FirmwareControl::new(&mut m);
         fw.reset().expect("reset");
@@ -350,12 +390,12 @@ fn save_then_reset_to_flash_restores_the_saved_value() {
     let mut m = FwMock::new();
     {
         let mut fw = FirmwareControl::new(&mut m);
-        fw.set(Feature::Bus, STATE_OFF).expect("set");
+        fw.set(Feature::Encryption, STATE_OFF).expect("set");
         fw.save().expect("save");
         fw.reset().expect("reset to OEM");
-        assert_eq!(fw.get(Feature::Bus).expect("get"), STATE_PASSTHROUGH);
+        assert_eq!(fw.get(Feature::Encryption).expect("get"), STATE_PASSTHROUGH);
         fw.reset_to_flash().expect("reset to flash");
-        assert_eq!(fw.get(Feature::Bus).expect("get"), STATE_OFF);
+        assert_eq!(fw.get(Feature::Encryption).expect("get"), STATE_OFF);
     }
     // The verbs issued, in order: SET, SAVE, RESET, GET, RESET, GET.
     assert_eq!(
@@ -386,10 +426,10 @@ fn states_probes_every_feature_in_order() {
     }
     assert_eq!(states.speed, SPEED_MAX);
     assert_eq!(states.hrl, STATE_ON);
-    // Seven GETs, one per feature, in ALL_FEATURES order.
-    assert_eq!(m.cdbs.len(), 7);
+    // Six GETs, one per feature, in ALL_FEATURES order (Bus id 0x07 retired).
+    assert_eq!(m.cdbs.len(), 6);
     let features: Vec<u8> = m.cdbs.iter().map(|c| c[CDB_FEATURE]).collect();
-    assert_eq!(features, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+    assert_eq!(features, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
     assert!(m.verbs().iter().all(|&v| v == Verb::Get as u8));
 }
 
@@ -416,8 +456,7 @@ fn typed_setters_issue_expected_set_cdbs() {
         fw.enable_uhd().unwrap();
         fw.disable_bd().unwrap();
         fw.skip_hrl().unwrap();
-        fw.null_ake().unwrap();
-        fw.bus_off().unwrap();
+        fw.disable_encryption().unwrap();
         fw.region_free().unwrap();
         fw.force_region_bd(BdRegion::B).unwrap();
         fw.force_region_dvd(2).unwrap();
@@ -425,16 +464,15 @@ fn typed_setters_issue_expected_set_cdbs() {
     }
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
     assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bd, STATE_OFF));
-    // The HRL/AKE/BUS unlock direction is now STATE_OFF (0x00), not STATE_ON.
+    // The HRL/Encryption unlock direction is STATE_OFF (0x00), not STATE_ON.
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
-    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Ake, STATE_OFF));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_OFF));
+    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Encryption, STATE_OFF));
     // Region-free is REGION_FREE (0x0F) — 0x01 now forces DVD region 1.
-    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, REGION_FREE));
-    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Region, REGION_BD_B));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Region, REGION_FREE));
+    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, REGION_BD_B));
     // force_region_dvd(2) = REGION_DVD_BASE + 2 = 0x02 under the new base.
-    assert_eq!(m.cdbs[7], build_set_cdb(Feature::Region, 0x02));
-    assert_eq!(m.cdbs[8], build_set_cdb(Feature::Speed, SPEED_MAX));
+    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Region, 0x02));
+    assert_eq!(m.cdbs[7], build_set_cdb(Feature::Speed, SPEED_MAX));
 }
 
 #[test]
@@ -461,7 +499,7 @@ fn arm_oem_bd_sets_and_verifies_hrl_skip() {
 }
 
 #[test]
-fn arm_oem_uhd_sets_uhd_hrl_bus_each_verified() {
+fn arm_oem_uhd_sets_uhd_hrl_encryption_each_verified() {
     let mut m = FwMock::new();
     {
         let mut fw = FirmwareControl::new(&mut m);
@@ -476,50 +514,48 @@ fn arm_oem_uhd_sets_uhd_hrl_bus_each_verified() {
     );
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Bus, STATE_OFF));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Encryption, STATE_OFF));
     assert_eq!(m.states.uhd, STATE_ON);
     assert_eq!(m.states.hrl, STATE_OFF);
-    assert_eq!(m.states.bus, STATE_OFF);
+    assert_eq!(m.states.encryption, STATE_OFF);
 }
 
 #[test]
-fn arm_bypass_bd_nulls_ake() {
+fn arm_bypass_bd_disables_encryption() {
     let mut m = FwMock::new();
     {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_bypass_bd().expect("armed");
     }
-    // Hrl=off (revocation skip) is set+verified FIRST, then Ake=null.
+    // Hrl=off (revocation skip) is set+verified FIRST, then Encryption=off.
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Hrl, STATE_OFF));
     assert_eq!(m.cdbs[1], build_get_cdb(Feature::Hrl));
-    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Ake, STATE_OFF));
-    assert_eq!(m.cdbs[3], build_get_cdb(Feature::Ake));
+    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Encryption, STATE_OFF));
+    assert_eq!(m.cdbs[3], build_get_cdb(Feature::Encryption));
     assert_eq!(m.states.hrl, STATE_OFF);
-    assert_eq!(m.states.ake, STATE_OFF);
+    assert_eq!(m.states.encryption, STATE_OFF);
 }
 
 #[test]
-fn arm_bypass_uhd_sets_uhd_ake_bus() {
+fn arm_bypass_uhd_sets_uhd_hrl_encryption() {
     let mut m = FwMock::new();
     {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_bypass_uhd().expect("armed");
     }
-    // Recipe order: Uhd=on, Hrl=off, Ake=null, Bus=off (each SET then verifying GET).
+    // Recipe order: Uhd=on, Hrl=off, Encryption=off (each SET then verifying GET).
     assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Ake, STATE_OFF));
-    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Bus, STATE_OFF));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Encryption, STATE_OFF));
     assert_eq!(m.states.uhd, STATE_ON);
     assert_eq!(m.states.hrl, STATE_OFF);
-    assert_eq!(m.states.ake, STATE_OFF);
-    assert_eq!(m.states.bus, STATE_OFF);
+    assert_eq!(m.states.encryption, STATE_OFF);
 }
 
 #[test]
 fn arm_stealth_oem_resets_then_verifies_all_passthrough() {
     let mut m = FwMock::new();
-    m.states.ake = STATE_ON;
+    m.states.encryption = STATE_ON;
     m.states.uhd = STATE_ON;
     {
         let mut fw = FirmwareControl::new(&mut m);
@@ -539,7 +575,7 @@ fn arm_by_recipe_enum_dispatches() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm(ArmRecipe::BypassBd).expect("armed");
     }
-    assert_eq!(m.states.ake, STATE_OFF);
+    assert_eq!(m.states.encryption, STATE_OFF);
 }
 
 #[test]

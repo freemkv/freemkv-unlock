@@ -11,11 +11,14 @@
 //! module's CDB builders so the wire framing never drifts.
 //!
 //! Unlock mapping onto the grammar: region-free = `Set(Region, free)`
-//! (`REGION_FREE`), riplock lift = `Set(Speed, max)` (`SPEED_MAX`), the
-//! load-bearing transport unlock = `Set(Ake, off)` (`STATE_OFF` — drive acts
-//! pre-authenticated → a bare `0xAD` returns the VID with no cert and no AKE), and
-//! the trailing bus-off = `Set(Bus, off)` (`STATE_OFF`, content de-bussed). Under
-//! the migrated spec the HRL/AKE/BUS unlock direction is `STATE_OFF`, not `0x01`.
+//! (`REGION_FREE`), riplock lift = `Set(Speed, max)` (`SPEED_MAX`), and the
+//! load-bearing transport unlock = `Set(Encryption, off)` (`STATE_OFF` — the
+//! consolidated cert/bus bypass: drive acts pre-authenticated → a bare `0xAD`
+//! returns the VID with no cert and no AKE, and content returns de-bussed).
+//! The old separate `Bus` lever (wire id `0x07`) is retired — it was proven
+//! inert on BU40N/MT1959, and the single `Encryption` lever de-busses on its
+//! own. Under the migrated spec the HRL/Encryption unlock direction is
+//! `STATE_OFF`, not `0x01`.
 
 use crate::firmware::{
     Feature, MEMREAD_LEN, MIN_ALLOC_LEN, REGION_FREE, RESP_MAGIC, SPEED_MAX, STATE_OFF,
@@ -162,8 +165,8 @@ impl FreemkvUnlocker {
     }
 
     // Full freemkv unlock: IDENTITY (hard gate) → Set(Region,free) →
-    // Set(Speed,max) (best-effort) → Set(Ake,off) (LOAD-BEARING) → bare 0xAD VID
-    // (best-effort) → Set(Bus,off) (trailing, best-effort).
+    // Set(Speed,max) (best-effort) → Set(Encryption,off) (LOAD-BEARING —
+    // consolidated cert/bus bypass) → bare 0xAD VID (best-effort).
     fn full_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -193,41 +196,31 @@ impl FreemkvUnlocker {
         // Region-free + riplock lift (best-effort features).
         best_effort(self.set(scsi, Feature::Region, REGION_FREE), "region")?;
         best_effort(self.set(scsi, Feature::Speed, SPEED_MAX), "speed")?;
-        // Ake = off/null (LOAD-BEARING): drive acts pre-authenticated, so a bare
-        // 0xAD returns the VID with no cert/AKE. No fallback. The migrated spec
-        // puts the null/bypass direction on STATE_OFF (0x00), not 0x01.
-        match self.set(scsi, Feature::Ake, STATE_OFF) {
+        // Encryption = off (LOAD-BEARING): the consolidated cert/bus bypass —
+        // drive acts pre-authenticated (so a bare 0xAD returns the VID with no
+        // cert/AKE) AND content returns de-bussed. No fallback. The old
+        // separate Bus lever (wire id 0x07) is retired.
+        match self.set(scsi, Feature::Encryption, STATE_OFF) {
             Ok(()) => {}
             Err(UnlockError::Transport) => return Err(UnlockError::Transport),
             Err(_) => {
                 tracing::debug!(
                     target: "freemkv::disc",
-                    phase = "freemkv_null_ake_rejected",
-                    "Set(Ake, null) rejected — cannot unlock this drive"
+                    phase = "freemkv_disable_encryption_rejected",
+                    "Set(Encryption, off) rejected — cannot unlock this drive"
                 );
                 return Err(UnlockError::VidUnavailable);
             }
         }
         // Bare 0xAD VID read — the shared BEST-EFFORT reader (identical to the
-        // LD/Renesas routes). The null AKE already unlocked the drive, so a VID
-        // miss must not discard it: only a dead bus propagates (`?`), else `None`.
+        // LD/Renesas routes). Encryption=off already unlocked the drive, so a
+        // VID miss must not discard it: only a dead bus propagates (`?`), else `None`.
         let vid = crate::vid::read_aacs_vid(scsi)?;
-        // Trailing Set(Bus, off): remove in-transit bus encryption (STATE_OFF is
-        // the de-bussed direction). FULLY best-effort — inert without the lever,
-        // and a failure here never discards an already-obtained unlock.
-        if let Err(e) = self.set(scsi, Feature::Bus, STATE_OFF) {
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "freemkv_bus_off_unavailable",
-                ?e,
-                "bus-off (Set Bus) not applied; continuing"
-            );
-        }
         tracing::debug!(
             target: "freemkv::disc",
             phase = "freemkv_unlocked",
             has_vid = vid.is_some(),
-            "freemkv drive unlocked (null AKE — Ake=off)"
+            "freemkv drive unlocked (Encryption=off — consolidated cert/bus bypass)"
         );
         Ok(Unlocked { vid, bus_key: None })
     }
@@ -370,14 +363,11 @@ mod tests {
             build_set_cdb(Feature::Speed, SPEED_MAX),
             [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x01, 0x00, 0x00, 0x40, 0x00]
         );
-        // Ake/Bus unlock direction is now STATE_OFF (0x00) at cdb[6], not 0x01.
+        // Encryption unlock direction is STATE_OFF (0x00) at cdb[6]; wire id
+        // 0x07 (was `Bus`) is retired.
         assert_eq!(
-            build_set_cdb(Feature::Ake, STATE_OFF),
+            build_set_cdb(Feature::Encryption, STATE_OFF),
             [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x06, 0x00, 0x00, 0x40, 0x00]
-        );
-        assert_eq!(
-            build_set_cdb(Feature::Bus, STATE_OFF),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x07, 0x00, 0x00, 0x40, 0x00]
         );
     }
 
@@ -437,19 +427,19 @@ mod tests {
     }
 
     #[test]
-    fn set_ake_null_issues_the_set_ake_on_cdb() {
+    fn set_encryption_off_issues_the_set_encryption_cdb() {
         let mut t = MockTransport::always(Reply::good(vec![]));
         FreemkvUnlocker::new()
-            .set(&mut t, Feature::Ake, STATE_OFF)
+            .set(&mut t, Feature::Encryption, STATE_OFF)
             .expect("ok");
-        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Ake, STATE_OFF));
+        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Encryption, STATE_OFF));
     }
 
     #[test]
     fn set_drive_rejection_is_not_applicable() {
         let mut t = MockTransport::always(Reply::illegal_request());
         let err = FreemkvUnlocker::new()
-            .set(&mut t, Feature::Ake, STATE_OFF)
+            .set(&mut t, Feature::Encryption, STATE_OFF)
             .unwrap_err();
         assert_eq!(err, UnlockError::NotApplicable);
     }
@@ -465,19 +455,18 @@ mod tests {
 
     // ── full_unlock / unlock ─────────────────────────────────────────────
 
-    /// The full unlock runs IDENTITY → Set(Region) → Set(Speed) → Set(Ake) →
-    /// bare VID → Set(Bus) in order.
+    /// The full unlock runs IDENTITY → Set(Region) → Set(Speed) →
+    /// Set(Encryption) → bare VID in order.
     #[test]
-    fn full_unlock_issues_identity_region_speed_ake_then_bare_vid_then_bus() {
+    fn full_unlock_issues_identity_region_speed_encryption_then_bare_vid() {
         let vid = [0x7Cu8; 16];
         let mut t = MockTransport::scripted(
             vec![
                 Reply::good(freemkv_identity_payload()), // IDENTITY
                 Reply::good(vec![]),                     // Set Region
                 Reply::good(vec![]),                     // Set Speed
-                Reply::good(vec![]),                     // Set Ake (load-bearing)
+                Reply::good(vec![]),                     // Set Encryption (load-bearing)
                 Reply::good(vid_ds_response(vid)),       // 0xAD bare VID
-                Reply::good(vec![]),                     // Set Bus (trailing)
             ],
             Reply::TransportFault,
         );
@@ -485,16 +474,15 @@ mod tests {
         let out = FreemkvUnlocker::new()
             .unlock(&mut t, &ctx(&id))
             .expect("no fault")
-            .expect("null AKE ⇒ unlocked");
+            .expect("encryption off ⇒ unlocked");
         assert_eq!(out.vid, Some(vid));
-        assert_eq!(t.cdbs.len(), 6);
-        // The four vendor SETs land on the right features, in order.
+        assert_eq!(t.cdbs.len(), 5);
+        // The three vendor SETs land on the right features, in order.
         assert_eq!(t.cdbs[0], build_identity_cdb(RESP_LEN as u16));
         assert_eq!(t.cdbs[1], build_set_cdb(Feature::Region, REGION_FREE));
         assert_eq!(t.cdbs[2], build_set_cdb(Feature::Speed, SPEED_MAX));
-        assert_eq!(t.cdbs[3], build_set_cdb(Feature::Ake, STATE_OFF));
+        assert_eq!(t.cdbs[3], build_set_cdb(Feature::Encryption, STATE_OFF));
         assert_eq!(t.cdbs[4][0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
-        assert_eq!(t.cdbs[5], build_set_cdb(Feature::Bus, STATE_OFF));
     }
 
     /// A missing region/speed feature does not fail the unlock (best-effort).
@@ -519,17 +507,17 @@ mod tests {
         assert_eq!(out.vid, Some(vid));
     }
 
-    /// The null AKE is LOAD-BEARING: if the drive rejects it, this isn't an
-    /// unlockable freemkv drive, so `unlock()` declines (`None`) and falls
-    /// through — never a hard error.
+    /// Set(Encryption, off) is LOAD-BEARING: if the drive rejects it, this
+    /// isn't an unlockable freemkv drive, so `unlock()` declines (`None`) and
+    /// falls through — never a hard error.
     #[test]
-    fn declines_when_null_ake_rejected() {
+    fn declines_when_disable_encryption_rejected() {
         let mut t = MockTransport::scripted(
             vec![
                 Reply::good(freemkv_identity_payload()), // identity
                 Reply::good(vec![]),                     // region
                 Reply::good(vec![]),                     // speed
-                Reply::illegal_request(),                // null ake REJECTED
+                Reply::illegal_request(),                // Set(Encryption,off) REJECTED
             ],
             Reply::TransportFault,
         );
@@ -542,8 +530,9 @@ mod tests {
         );
     }
 
-    /// Best-effort VID: the null AKE succeeded (drive unlocked), but the bare
-    /// VID read was rejected — `unlock()` still returns `Some`, with `vid: None`.
+    /// Best-effort VID: Set(Encryption,off) succeeded (drive unlocked), but the
+    /// bare VID read was rejected — `unlock()` still returns `Some`, with
+    /// `vid: None`.
     #[test]
     fn unlocks_without_vid_when_bare_read_fails() {
         let mut t = MockTransport::scripted(
@@ -551,7 +540,7 @@ mod tests {
                 Reply::good(freemkv_identity_payload()), // identity
                 Reply::good(vec![]),                     // region
                 Reply::good(vec![]),                     // speed
-                Reply::good(vec![]),                     // null ake
+                Reply::good(vec![]),                     // Set(Encryption,off)
                 Reply::illegal_request(),                // bare VID: no medium
             ],
             Reply::TransportFault,

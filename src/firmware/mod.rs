@@ -44,8 +44,13 @@ use crate::scsi::{DataDirection, ScsiTransport};
 pub const READ_BUFFER_OPCODE: u8 = 0x3C;
 /// The freemkv sub-command mode at `cdb[1]`; OEM rejects modes `>= 0x0E`.
 pub const KNOCK_MODE: u8 = 0x0E;
-/// Two-byte knock at `cdb[2..4]` ("C0DE").
+/// Two-byte knock at `cdb[2..4]` ("C0DE") — the *safe* knock carried by every
+/// durable verb (Identity/Set/Get/Reset/DumpAll/Save/FlashWrite).
 pub const KNOCK: [u8; 2] = [0xC0, 0xDE];
+/// Two-byte knock at `cdb[2..4]` — the *debug* knock, distinct from [`KNOCK`]
+/// by construction. The only frame the fw honours for the debug-only verbs
+/// ([`Verb::Call`], [`Verb::Poke`], [`Verb::Reboot`]).
+pub const DEBUG_KNOCK: [u8; 2] = [0xDE, 0xB9];
 /// Response-framing magic leading the [`Verb::Identity`] reply (`b"freemkv"`).
 pub const RESP_MAGIC: &[u8] = b"freemkv";
 
@@ -153,12 +158,41 @@ pub enum Verb {
     /// Diagnostic RAM peek: [`MEMREAD_LEN`] bytes at the 32-bit address in
     /// `cdb[5..9]` (big-endian).
     DumpAll = 0x09,
+    /// **TEMPORARY** diagnostic probe: program a single byte to an allowlisted
+    /// flash offset via the OEM PROGRAM routine. `CDB[5..9]` = 32-bit flash offset
+    /// (big-endian); `CDB[9]` = value byte. The firmware refuses any offset outside
+    /// the compile-time allowlist window (`0x1EA000..0x1EB000` — the corpus-proven-
+    /// unlocked NV/SAVE block) with a distinct `"REFU"` status word (PROGRAM not
+    /// called). Reply: 4-byte offset echo (BE) + 4-byte PROGRAM/REFU status (BE).
+    /// Not part of the durable feature grammar; subsumed by [`Verb::Save`].
+    FlashWrite = 0x0A,
     /// Persist the whole RAM feature-state table to the flash config block. This is
     /// the ONLY verb that writes the config to flash: [`Verb::Set`] and
     /// [`Verb::Reset`] touch RAM only, so a host's changes stay volatile until a
     /// `Save` commits them (and survive a power cycle only once saved). Ignores
     /// feature/state.
     Save = 0x0B,
+    /// **Debug-knock only.** Interactive fw-exploration `blx target` primitive.
+    /// `CDB[5..9]` = 32-bit target VA (big-endian); `CDB[9]` = single u8 that
+    /// is loaded into r0 as the sole register argument. Refused under the safe
+    /// [`KNOCK`]; only executed under [`DEBUG_KNOCK`]. See [`build_call_cdb`].
+    Call = 0x0C,
+    /// **Debug-knock only.** Poke a single byte to an arbitrary address.
+    /// `CDB[5..9]` = 32-bit target address (big-endian, RAM or MMIO);
+    /// `CDB[9]` = byte value to store. Refused under the safe [`KNOCK`]; only
+    /// executed under [`DEBUG_KNOCK`]. See [`build_poke_cdb`].
+    Poke = 0x0D,
+    /// **Debug-knock only.** Invokes the firmware's boot function entry with
+    /// r0=4 to force the cold path (BSS clear + C-runtime data init + full
+    /// post-init sequence). Recovers a wedged drive without a power cycle
+    /// (SCSI target briefly returns Aborted Command mid-reboot, then comes
+    /// back ~5s later; the safe-knock verb chain is re-armed to its power-on
+    /// defaults). The target VA is baked into the emitted handler at build
+    /// time (resolved from the boot-init signature = `boot_init_site - 0x10`),
+    /// so no CDB arguments are carried beyond the verb byte. Refused under
+    /// the safe [`KNOCK`]; only executed under [`DEBUG_KNOCK`]. See
+    /// [`build_reboot_cdb`].
+    Reboot = 0x0F,
 }
 
 /// The feature selector in `cdb[5]` for [`Verb::Set`] / [`Verb::Get`]. These
@@ -195,27 +229,25 @@ pub enum Feature {
     /// revoked certs accepted, non-destructive, the unlock direction); [`STATE_ON`]
     /// (`0x01`) = on (enforce the HRL).
     Hrl = 0x05,
-    /// Drive-host AKE. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM real handshake;
-    /// [`STATE_OFF`] (`0x00`) = off (null/bypass — the drive acts pre-authenticated,
-    /// the unlock direction); [`STATE_ON`] (`0x01`) = on (require the real handshake).
-    Ake = 0x06,
-    /// In-transit AACS bus encryption. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (bus
-    /// encryption on); [`STATE_OFF`] (`0x00`) = off (de-bussed — content returned
-    /// with no bus encryption, the unlock direction); [`STATE_ON`] (`0x01`) = on
-    /// (bus encryption).
-    Bus = 0x07,
+    /// The one master encryption/cert bypass. [`STATE_OFF`] (`0x00`) = every
+    /// drive-side encryption/cert requirement gone (cert-AKE relaxed, bus-wrap
+    /// off — what used to need a cert now doesn't). [`STATE_PASSTHROUGH`] (`0xFF`)
+    /// = OEM behavior (real handshake, bus-encrypted content). [`STATE_ON`]
+    /// (`0x01`) = on (require the real handshake). Wire id `0x07` is retired
+    /// (was `Bus`, empirically proved inert as a separate datapath lever on
+    /// BU40N/MT1959 — the single Encryption lever de-busses on its own).
+    Encryption = 0x06,
 }
 
 /// The set of all features, in the canonical order the IDENTITY feature-state
 /// table serialises them (and the order [`FirmwareControl::states`] probes).
-pub const ALL_FEATURES: [Feature; 7] = [
+pub const ALL_FEATURES: [Feature; 6] = [
     Feature::Speed,
     Feature::Region,
     Feature::Uhd,
     Feature::Bd,
     Feature::Hrl,
-    Feature::Ake,
-    Feature::Bus,
+    Feature::Encryption,
 ];
 
 /// A Blu-ray region for [`FirmwareControl::force_region_bd`].
@@ -316,6 +348,63 @@ pub fn build_memread_cdb(addr: u32) -> [u8; CDB_LEN] {
     cdb
 }
 
+/// Build a 10-byte CDB for [`Verb::Call`]: `blx target(r0)` where `target` is
+/// packed big-endian in `cdb[5..9]` and the u8 `r0` register argument rides in
+/// `cdb[9]`. Carries the [`DEBUG_KNOCK`] at `cdb[2..4]` — the ONLY frame the
+/// fw honours for Call. The handler ORs the thumb bit into the address at
+/// runtime. r1..r3 are undefined at callee entry.
+pub fn build_call_cdb(target: u32, r0: u8) -> [u8; CDB_LEN] {
+    let mut cdb = [0u8; CDB_LEN];
+    cdb[CDB_OPCODE] = READ_BUFFER_OPCODE;
+    cdb[CDB_MODE] = KNOCK_MODE;
+    cdb[CDB_KNOCK..CDB_KNOCK + 2].copy_from_slice(&DEBUG_KNOCK);
+    cdb[CDB_VERB] = Verb::Call as u8;
+    cdb[5] = (target >> 24) as u8;
+    cdb[6] = (target >> 16) as u8;
+    cdb[7] = (target >> 8) as u8;
+    cdb[8] = target as u8;
+    cdb[9] = r0;
+    cdb
+}
+
+/// Build a 10-byte CDB for [`Verb::Poke`]: write a single byte `val` to the
+/// arbitrary 32-bit address `target` (RAM or MMIO). Target is packed
+/// big-endian in `cdb[5..9]` and `val` rides in `cdb[9]`. Carries the
+/// [`DEBUG_KNOCK`] at `cdb[2..4]`. NO bounds check on the address — this is a
+/// diagnostic primitive for on-drive state discovery, not a durable verb.
+pub fn build_poke_cdb(target: u32, val: u8) -> [u8; CDB_LEN] {
+    let mut cdb = [0u8; CDB_LEN];
+    cdb[CDB_OPCODE] = READ_BUFFER_OPCODE;
+    cdb[CDB_MODE] = KNOCK_MODE;
+    cdb[CDB_KNOCK..CDB_KNOCK + 2].copy_from_slice(&DEBUG_KNOCK);
+    cdb[CDB_VERB] = Verb::Poke as u8;
+    cdb[5] = (target >> 24) as u8;
+    cdb[6] = (target >> 16) as u8;
+    cdb[7] = (target >> 8) as u8;
+    cdb[8] = target as u8;
+    cdb[9] = val;
+    cdb
+}
+
+/// Build a 10-byte CDB for [`Verb::Reboot`]: force the firmware boot function's
+/// cold path (soft-reboot the controller). Carries the [`DEBUG_KNOCK`] at
+/// `cdb[2..4]`. NO arguments are transmitted on the wire — the target VA is
+/// baked into the emitted handler at build time (per-image, resolved from the
+/// boot-init signature). Requests a [`MIN_ALLOC_LEN`]-byte data-in like every
+/// other durable-shape verb: the drive returns Aborted Command mid-reboot
+/// anyway, so callers should tolerate a rejection on this send and re-probe
+/// identity after a short delay.
+pub fn build_reboot_cdb() -> [u8; CDB_LEN] {
+    let mut cdb = [0u8; CDB_LEN];
+    cdb[CDB_OPCODE] = READ_BUFFER_OPCODE;
+    cdb[CDB_MODE] = KNOCK_MODE;
+    cdb[CDB_KNOCK..CDB_KNOCK + 2].copy_from_slice(&DEBUG_KNOCK);
+    cdb[CDB_VERB] = Verb::Reboot as u8;
+    cdb[CDB_ALLOC_LEN] = (MIN_ALLOC_LEN >> 8) as u8;
+    cdb[CDB_ALLOC_LEN + 1] = MIN_ALLOC_LEN as u8;
+    cdb
+}
+
 /// Whether a device data response leads with [`RESP_MAGIC`].
 pub fn verify_response(bytes: &[u8]) -> bool {
     bytes.starts_with(RESP_MAGIC)
@@ -365,10 +454,8 @@ pub struct FeatureStates {
     pub bd: u8,
     /// [`Feature::Hrl`] state.
     pub hrl: u8,
-    /// [`Feature::Ake`] state.
-    pub ake: u8,
-    /// [`Feature::Bus`] state.
-    pub bus: u8,
+    /// [`Feature::Encryption`] state (the consolidated cert/bus bypass).
+    pub encryption: u8,
 }
 
 impl FeatureStates {
@@ -380,8 +467,7 @@ impl FeatureStates {
             uhd: STATE_PASSTHROUGH,
             bd: STATE_PASSTHROUGH,
             hrl: STATE_PASSTHROUGH,
-            ake: STATE_PASSTHROUGH,
-            bus: STATE_PASSTHROUGH,
+            encryption: STATE_PASSTHROUGH,
         }
     }
 
@@ -393,8 +479,7 @@ impl FeatureStates {
             Feature::Uhd => self.uhd,
             Feature::Bd => self.bd,
             Feature::Hrl => self.hrl,
-            Feature::Ake => self.ake,
-            Feature::Bus => self.bus,
+            Feature::Encryption => self.encryption,
         }
     }
 
@@ -405,8 +490,7 @@ impl FeatureStates {
             Feature::Uhd => self.uhd = state,
             Feature::Bd => self.bd = state,
             Feature::Hrl => self.hrl = state,
-            Feature::Ake => self.ake = state,
-            Feature::Bus => self.bus = state,
+            Feature::Encryption => self.encryption = state,
         }
     }
 }
@@ -468,7 +552,7 @@ const CMD_TIMEOUT_MS: u32 = 5_000;
 /// # fn demo(scsi: &mut dyn freemkv_unlock::scsi::ScsiTransport) {
 /// let mut fw = FirmwareControl::new(scsi);
 /// if fw.is_freemkv().unwrap_or(false) {
-///     // Real AKE on a UHD disc, revocation ignored, bus de-encrypted:
+///     // Encryption off on a UHD disc, revocation ignored:
 ///     let _ = fw.arm_oem_uhd();
 /// }
 /// # }
@@ -639,15 +723,13 @@ impl<'a> FirmwareControl<'a> {
     pub fn skip_hrl(&mut self) -> Result<()> {
         self.set(Feature::Hrl, STATE_OFF)
     }
-    /// Null the drive-host AKE (drive acts pre-authenticated). The unlock direction
-    /// is now [`STATE_OFF`] (`0x00` = handshake off/bypassed).
-    pub fn null_ake(&mut self) -> Result<()> {
-        self.set(Feature::Ake, STATE_OFF)
-    }
-    /// Turn AACS in-transit bus encryption off (content returned de-bussed). The
-    /// unlock direction is now [`STATE_OFF`] (`0x00` = bus encryption off).
-    pub fn bus_off(&mut self) -> Result<()> {
-        self.set(Feature::Bus, STATE_OFF)
+    /// Disable every drive-side encryption/cert requirement in one shot: the
+    /// drive acts pre-authenticated (no handshake) AND content returns de-bussed
+    /// (no in-transit bus encryption). The consolidated `Encryption` lever
+    /// replaces the old separate `Ake`/`Bus` levers — wire id `0x07` (`Bus`) is
+    /// retired. The unlock direction is [`STATE_OFF`] (`0x00`).
+    pub fn disable_encryption(&mut self) -> Result<()> {
+        self.set(Feature::Encryption, STATE_OFF)
     }
     /// Region-free (RPC-1). Sends [`REGION_FREE`] (`0x0F`) — under the migrated
     /// region scheme `0x01` now means "force DVD region 1", not region-free.
@@ -684,38 +766,37 @@ impl<'a> FirmwareControl<'a> {
         self.set_verify(Feature::Hrl, STATE_OFF)
     }
 
-    /// **arm_oem_uhd** — OEM-style UHD (AACS 2.0) rip with a REAL AKE.
+    /// **arm_oem_uhd** — OEM-style UHD (AACS 2.0) rip.
     ///
     /// Sets: `Uhd = on` (mode-gate neutralized so the drive engages the UHD
-    /// disc), `Hrl = skip` (revocation off), `Bus = off` (content de-bussed).
-    /// The host still runs the real AKE. Rips: UHD via the OEM cert path.
+    /// disc), `Hrl = skip` (revocation off), `Encryption = off` (content
+    /// de-bussed — the consolidated cert/bus bypass). Rips: UHD via the OEM
+    /// path.
     pub fn arm_oem_uhd(&mut self) -> Result<()> {
         self.set_verify(Feature::Uhd, STATE_ON)?;
         self.set_verify(Feature::Hrl, STATE_OFF)?;
-        self.set_verify(Feature::Bus, STATE_OFF)
+        self.set_verify(Feature::Encryption, STATE_OFF)
     }
 
     /// **arm_bypass_bd** — full-bypass Blu-ray rip (NO host cert needed).
     ///
-    /// Sets: `Ake = null` (drive acts pre-authenticated, so a bare VID read
-    /// returns the volume ID with no cert and no AKE) and `Hrl = skip`
-    /// (revocation off, so a revoked/absent cert never trips the HRL check).
-    /// Rips: BD with no cert.
+    /// Sets: `Encryption = off` (the consolidated cert/bus bypass — drive acts
+    /// pre-authenticated, no handshake, content de-bussed) and `Hrl = skip`
+    /// (revocation off). Rips: BD with no cert.
     pub fn arm_bypass_bd(&mut self) -> Result<()> {
         self.set_verify(Feature::Hrl, STATE_OFF)?;
-        self.set_verify(Feature::Ake, STATE_OFF)
+        self.set_verify(Feature::Encryption, STATE_OFF)
     }
 
     /// **arm_bypass_uhd** — full-bypass UHD rip (NO host cert needed).
     ///
-    /// Sets: `Uhd = on` (engage the UHD disc), `Ake = null` (skip the
-    /// handshake), `Bus = off` (content de-bussed), and `Hrl = skip`
-    /// (revocation off). Rips: UHD with no cert.
+    /// Sets: `Uhd = on` (engage the UHD disc), `Encryption = off` (the
+    /// consolidated cert/bus bypass), and `Hrl = skip` (revocation off).
+    /// Rips: UHD with no cert.
     pub fn arm_bypass_uhd(&mut self) -> Result<()> {
         self.set_verify(Feature::Uhd, STATE_ON)?;
         self.set_verify(Feature::Hrl, STATE_OFF)?;
-        self.set_verify(Feature::Ake, STATE_OFF)?;
-        self.set_verify(Feature::Bus, STATE_OFF)
+        self.set_verify(Feature::Encryption, STATE_OFF)
     }
 
     /// **arm_stealth_oem** — return the drive to byte-for-byte OEM behaviour.

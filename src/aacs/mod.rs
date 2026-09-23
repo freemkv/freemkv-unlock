@@ -360,7 +360,7 @@ mod tests {
         };
         // A minimal freemkv drive: IDENTITY→magic, SET updates state, GET reads it.
         struct FwDrive {
-            ake: u8,
+            encryption: u8,
             hrl: u8,
             cdbs: Vec<Vec<u8>>,
         }
@@ -380,17 +380,18 @@ mod tests {
                     resp.extend(std::iter::repeat_n(STATE_PASSTHROUGH, ALL_FEATURES.len()));
                     n = resp.len().min(data.len());
                     data[..n].copy_from_slice(&resp[..n]);
-                } else if cdb[CDB_VERB] == Verb::Set as u8 && cdb[CDB_FEATURE] == Feature::Ake as u8
+                } else if cdb[CDB_VERB] == Verb::Set as u8
+                    && cdb[CDB_FEATURE] == Feature::Encryption as u8
                 {
-                    self.ake = cdb[CDB_STATE];
+                    self.encryption = cdb[CDB_STATE];
                 } else if cdb[CDB_VERB] == Verb::Set as u8 && cdb[CDB_FEATURE] == Feature::Hrl as u8
                 {
                     self.hrl = cdb[CDB_STATE];
                 } else if cdb[CDB_VERB] == Verb::Get as u8
-                    && cdb[CDB_FEATURE] == Feature::Ake as u8
+                    && cdb[CDB_FEATURE] == Feature::Encryption as u8
                     && !data.is_empty()
                 {
-                    data[0] = self.ake;
+                    data[0] = self.encryption;
                     n = 1;
                 } else if cdb[CDB_VERB] == Verb::Get as u8
                     && cdb[CDB_FEATURE] == Feature::Hrl as u8
@@ -407,19 +408,22 @@ mod tests {
             }
         }
         let mut t = FwDrive {
-            ake: STATE_PASSTHROUGH,
+            encryption: STATE_PASSTHROUGH,
             hrl: STATE_PASSTHROUGH,
             cdbs: Vec::new(),
         };
         let u = AacsUnlocker::new(vec![host_cert()]).arm_before_unlock(ArmRecipe::BypassBd);
         u.maybe_arm(&mut t).expect("armed");
         assert_eq!(t.hrl, STATE_OFF, "the recipe skipped revocation (Hrl=off)");
-        assert_eq!(t.ake, STATE_OFF, "the recipe nulled the AKE (Ake=off)");
-        // IDENTITY, then Set(Hrl,off)+verify, then Set(Ake,off)+verify.
+        assert_eq!(
+            t.encryption, STATE_OFF,
+            "the recipe disabled encryption (Encryption=off)"
+        );
+        // IDENTITY, then Set(Hrl,off)+verify, then Set(Encryption,off)+verify.
         assert_eq!(t.cdbs[0][CDB_VERB], Verb::Identity as u8);
         assert_eq!(t.cdbs[1], build_set_cdb(Feature::Hrl, STATE_OFF));
         assert_eq!(t.cdbs[2][CDB_VERB], Verb::Get as u8);
-        assert_eq!(t.cdbs[3], build_set_cdb(Feature::Ake, STATE_OFF));
+        assert_eq!(t.cdbs[3], build_set_cdb(Feature::Encryption, STATE_OFF));
         assert_eq!(t.cdbs[4][CDB_VERB], Verb::Get as u8);
     }
 

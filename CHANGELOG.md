@@ -1,6 +1,13 @@
 # Changelog
 
+## [1.7.5] — UNRELEASED
+
+### Changed
+
+- firmware: mirror the fw 0.9.0 ABI — `Ake` (`0x06`) and `Bus` (`0x07`) are retired into a single `Encryption` (`0x06`) lever, so the unlock recipe now sets one flag instead of two and wire id `0x07` is gone. Required to talk to firmware 0.9.0.
+
 ## [1.7.4] — 2026-09-21
+
 ### Maintenance
 
 - CI consolidated to the central reusable workflows; no functional changes.
