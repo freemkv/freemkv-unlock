@@ -24,12 +24,13 @@ fn verb_values_match_abi() {
 fn feature_values_match_abi() {
     assert_eq!(Feature::Speed as u8, 0x01);
     assert_eq!(Feature::Region as u8, 0x02);
-    assert_eq!(Feature::Uhd as u8, 0x03);
-    assert_eq!(Feature::Bd as u8, 0x04);
+    assert_eq!(Feature::Unrestricted as u8, 0x03);
     assert_eq!(Feature::Hrl as u8, 0x05);
     assert_eq!(Feature::Encryption as u8, 0x06);
+    // Wire id 0x04 (was `Bd`) is retired — fw 0.9.2 unified BD+UHD into
+    // Unrestricted; the BD slot is now unused/reserved (fw no-ops it).
     // Wire id 0x07 (was `Bus`) is retired — proven inert on BU40N/MT1959.
-    assert_eq!(ALL_FEATURES.len(), 6);
+    assert_eq!(ALL_FEATURES.len(), 5);
 }
 
 #[test]
@@ -425,10 +426,11 @@ fn states_probes_every_feature_in_order() {
     }
     assert_eq!(states.speed, SPEED_MAX);
     assert_eq!(states.hrl, STATE_ON);
-    // Six GETs, one per feature, in ALL_FEATURES order (Bus id 0x07 retired).
-    assert_eq!(m.cdbs.len(), 6);
+    // Five GETs, one per feature, in ALL_FEATURES order (Bd id 0x04 and Bus id
+    // 0x07 both retired).
+    assert_eq!(m.cdbs.len(), 5);
     let features: Vec<u8> = m.cdbs.iter().map(|c| c[CDB_FEATURE]).collect();
-    assert_eq!(features, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+    assert_eq!(features, vec![0x01, 0x02, 0x03, 0x05, 0x06]);
     assert!(m.verbs().iter().all(|&v| v == Verb::Get as u8));
 }
 
@@ -452,8 +454,7 @@ fn typed_setters_issue_expected_set_cdbs() {
     let mut m = FwMock::new();
     {
         let mut fw = FirmwareControl::new(&mut m);
-        fw.enable_uhd().unwrap();
-        fw.disable_bd().unwrap();
+        fw.enable_unrestricted().unwrap();
         fw.skip_hrl().unwrap();
         fw.disable_encryption().unwrap();
         fw.region_free().unwrap();
@@ -461,17 +462,16 @@ fn typed_setters_issue_expected_set_cdbs() {
         fw.force_region_dvd(2).unwrap();
         fw.unlock_speed().unwrap();
     }
-    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
-    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Bd, STATE_OFF));
+    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Unrestricted, STATE_ON));
     // The HRL/Encryption unlock direction is STATE_OFF (0x00), not STATE_ON.
-    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
-    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Encryption, STATE_OFF));
+    assert_eq!(m.cdbs[1], build_set_cdb(Feature::Hrl, STATE_OFF));
+    assert_eq!(m.cdbs[2], build_set_cdb(Feature::Encryption, STATE_OFF));
     // Region-free is REGION_FREE (0x0F) — 0x01 now forces DVD region 1.
-    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Region, REGION_FREE));
-    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, REGION_BD_B));
+    assert_eq!(m.cdbs[3], build_set_cdb(Feature::Region, REGION_FREE));
+    assert_eq!(m.cdbs[4], build_set_cdb(Feature::Region, REGION_BD_B));
     // force_region_dvd(2) = REGION_DVD_BASE + 2 = 0x02 under the new base.
-    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Region, 0x02));
-    assert_eq!(m.cdbs[7], build_set_cdb(Feature::Speed, SPEED_MAX));
+    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, 0x02));
+    assert_eq!(m.cdbs[6], build_set_cdb(Feature::Speed, SPEED_MAX));
 }
 
 #[test]
@@ -511,10 +511,10 @@ fn arm_oem_uhd_sets_uhd_hrl_encryption_each_verified() {
         vec![0x02, 0x03, 0x02, 0x03, 0x02, 0x03],
         "each set is verified by a get"
     );
-    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
+    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Unrestricted, STATE_ON));
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
     assert_eq!(m.cdbs[4], build_set_cdb(Feature::Encryption, STATE_OFF));
-    assert_eq!(m.states.uhd, STATE_ON);
+    assert_eq!(m.states.unrestricted, STATE_ON);
     assert_eq!(m.states.hrl, STATE_OFF);
     assert_eq!(m.states.encryption, STATE_OFF);
 }
@@ -542,11 +542,11 @@ fn arm_bypass_uhd_sets_uhd_hrl_encryption() {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_bypass_uhd().expect("armed");
     }
-    // Recipe order: Uhd=on, Hrl=off, Encryption=off (each SET then verifying GET).
-    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Uhd, STATE_ON));
+    // Recipe order: Unrestricted=on, Hrl=off, Encryption=off (each SET then verifying GET).
+    assert_eq!(m.cdbs[0], build_set_cdb(Feature::Unrestricted, STATE_ON));
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Hrl, STATE_OFF));
     assert_eq!(m.cdbs[4], build_set_cdb(Feature::Encryption, STATE_OFF));
-    assert_eq!(m.states.uhd, STATE_ON);
+    assert_eq!(m.states.unrestricted, STATE_ON);
     assert_eq!(m.states.hrl, STATE_OFF);
     assert_eq!(m.states.encryption, STATE_OFF);
 }
@@ -555,7 +555,7 @@ fn arm_bypass_uhd_sets_uhd_hrl_encryption() {
 fn arm_stealth_oem_resets_then_verifies_all_passthrough() {
     let mut m = FwMock::new();
     m.states.encryption = STATE_ON;
-    m.states.uhd = STATE_ON;
+    m.states.unrestricted = STATE_ON;
     {
         let mut fw = FirmwareControl::new(&mut m);
         fw.arm_stealth_oem().expect("disarmed");

@@ -210,18 +210,16 @@ pub enum Feature {
     /// [`REGION_BD_A`]/`_B`/`_C` (`0x0A`/`0x0B`/`0x0C`) = force BD region A/B/C;
     /// [`REGION_FREE`] (`0x0F`) = region-free (any disc plays).
     Region = 0x02,
-    /// UHD (AACS 2.0) capability gate. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (as
-    /// shipped); [`STATE_OFF`] (`0x00`) = No (refuse UHD discs); [`STATE_ON`]
-    /// (`0x01`) = Yes (accept UHD — the mode gate is neutralized so the drive
-    /// engages UHD discs). On the byte-extraction classifier (e.g. BU40N) the No
-    /// (OFF) leg currently reads back but behaves == OEM (boot-safe no-op, pending
-    /// deeper RE) — do NOT treat OFF as a proven UHD disable there.
-    Uhd = 0x03,
-    /// Blu-ray (AACS 1.0) capability gate. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (BD
-    /// engaged as shipped); [`STATE_OFF`] (`0x00`) = No (force-refuse BD discs — the
-    /// drive raises its own `6F` refusal sense); [`STATE_ON`] (`0x01`) = Yes (accept
-    /// BD — an enable direction, not a no-op).
-    Bd = 0x04,
+    /// Unrestricted (BD/UHD) capability widen gate. fw 0.9.2 unified the former
+    /// separate BD (AACS 1.0) and UHD (AACS 2.0) accept gates into this single
+    /// lever. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (as shipped); [`STATE_OFF`]
+    /// (`0x00`) = No (refuse BD/UHD discs); [`STATE_ON`] (`0x01`) = Yes (accept
+    /// BD/UHD — the mode gate is neutralized so the drive engages both). On the
+    /// byte-extraction classifier (e.g. BU40N) the No (OFF) leg currently reads
+    /// back but behaves == OEM (boot-safe no-op, pending deeper RE) — do NOT
+    /// treat OFF as a proven disable there. Wire id `0x04` (was `Bd`) is retired:
+    /// the BD slot is now unused/reserved, the firmware treats it as a no-op.
+    Unrestricted = 0x03,
     /// Host Revocation List handling on the cert path. [`STATE_PASSTHROUGH`]
     /// (`0xFF`) = OEM enforce; [`STATE_OFF`] (`0x00`) = off (skip the HRL lookup —
     /// revoked certs accepted, non-destructive, the unlock direction); [`STATE_ON`]
@@ -239,11 +237,10 @@ pub enum Feature {
 
 /// The set of all features, in the canonical order the IDENTITY feature-state
 /// table serialises them (and the order [`FirmwareControl::states`] probes).
-pub const ALL_FEATURES: [Feature; 6] = [
+pub const ALL_FEATURES: [Feature; 5] = [
     Feature::Speed,
     Feature::Region,
-    Feature::Uhd,
-    Feature::Bd,
+    Feature::Unrestricted,
     Feature::Hrl,
     Feature::Encryption,
 ];
@@ -446,10 +443,8 @@ pub struct FeatureStates {
     pub speed: u8,
     /// [`Feature::Region`] state.
     pub region: u8,
-    /// [`Feature::Uhd`] state.
-    pub uhd: u8,
-    /// [`Feature::Bd`] state.
-    pub bd: u8,
+    /// [`Feature::Unrestricted`] state.
+    pub unrestricted: u8,
     /// [`Feature::Hrl`] state.
     pub hrl: u8,
     /// [`Feature::Encryption`] state (the consolidated cert/bus bypass).
@@ -462,8 +457,7 @@ impl FeatureStates {
         FeatureStates {
             speed: STATE_PASSTHROUGH,
             region: STATE_PASSTHROUGH,
-            uhd: STATE_PASSTHROUGH,
-            bd: STATE_PASSTHROUGH,
+            unrestricted: STATE_PASSTHROUGH,
             hrl: STATE_PASSTHROUGH,
             encryption: STATE_PASSTHROUGH,
         }
@@ -474,8 +468,7 @@ impl FeatureStates {
         match feature {
             Feature::Speed => self.speed,
             Feature::Region => self.region,
-            Feature::Uhd => self.uhd,
-            Feature::Bd => self.bd,
+            Feature::Unrestricted => self.unrestricted,
             Feature::Hrl => self.hrl,
             Feature::Encryption => self.encryption,
         }
@@ -485,8 +478,7 @@ impl FeatureStates {
         match feature {
             Feature::Speed => self.speed = state,
             Feature::Region => self.region = state,
-            Feature::Uhd => self.uhd = state,
-            Feature::Bd => self.bd = state,
+            Feature::Unrestricted => self.unrestricted = state,
             Feature::Hrl => self.hrl = state,
             Feature::Encryption => self.encryption = state,
         }
@@ -533,6 +525,10 @@ pub enum ArmRecipe {
     BypassBd,
     /// [`FirmwareControl::arm_bypass_uhd`].
     BypassUhd,
+    // NOTE: `Feature::Unrestricted` now unifies the former BD+UHD accept gates
+    // (fw 0.9.2); the OemBd/OemUhd/BypassBd/BypassUhd recipe names above are
+    // kept as-is (they name the disc TYPE being ripped, not the retired
+    // per-format feature), see `arm_oem_uhd`/`arm_bypass_uhd` below.
     /// [`FirmwareControl::arm_stealth_oem`].
     StealthOem,
 }
@@ -697,24 +693,15 @@ impl<'a> FirmwareControl<'a> {
 
     // ── Typed setters ────────────────────────────────────────────────────────
 
-    /// Force the UHD (AACS 2.0) capability gate on (drive engages UHD discs).
-    pub fn enable_uhd(&mut self) -> Result<()> {
-        self.set(Feature::Uhd, STATE_ON)
+    /// Force the Unrestricted (BD/UHD) capability gate on (drive engages both
+    /// BD and UHD discs). fw 0.9.2 unified the former separate UHD/BD gates
+    /// into this single lever.
+    pub fn enable_unrestricted(&mut self) -> Result<()> {
+        self.set(Feature::Unrestricted, STATE_ON)
     }
-    /// Force the UHD capability gate off.
-    pub fn disable_uhd(&mut self) -> Result<()> {
-        self.set(Feature::Uhd, STATE_OFF)
-    }
-    /// Force the Blu-ray (AACS 1.0) capability gate on.
-    pub fn enable_bd(&mut self) -> Result<()> {
-        self.set(Feature::Bd, STATE_ON)
-    }
-    /// Force the Blu-ray capability gate off (drive refuses BD discs). Sends the
-    /// uniform [`STATE_OFF`] (`0x00`) — an unarmed image boots to [`STATE_PASSTHROUGH`]
-    /// (`0xFF`, OEM) via the firmware power-on hook, so `0x00` no longer collides
-    /// with the boot value (the retired `0x02` sentinel is gone).
-    pub fn disable_bd(&mut self) -> Result<()> {
-        self.set(Feature::Bd, STATE_OFF)
+    /// Force the Unrestricted (BD/UHD) capability gate off.
+    pub fn disable_unrestricted(&mut self) -> Result<()> {
+        self.set(Feature::Unrestricted, STATE_OFF)
     }
     /// Skip the HRL lookup (revoked certs accepted; non-destructive). The unlock
     /// direction is now [`STATE_OFF`] (`0x00` = HRL enforcement off).
@@ -766,12 +753,12 @@ impl<'a> FirmwareControl<'a> {
 
     /// **arm_oem_uhd** — OEM-style UHD (AACS 2.0) rip.
     ///
-    /// Sets: `Uhd = on` (mode-gate neutralized so the drive engages the UHD
-    /// disc), `Hrl = skip` (revocation off), `Encryption = off` (content
-    /// de-bussed — the consolidated cert/bus bypass). Rips: UHD via the OEM
-    /// path.
+    /// Sets: `Unrestricted = on` (mode-gate neutralized so the drive engages
+    /// the UHD disc), `Hrl = skip` (revocation off), `Encryption = off`
+    /// (content de-bussed — the consolidated cert/bus bypass). Rips: UHD via
+    /// the OEM path.
     pub fn arm_oem_uhd(&mut self) -> Result<()> {
-        self.set_verify(Feature::Uhd, STATE_ON)?;
+        self.set_verify(Feature::Unrestricted, STATE_ON)?;
         self.set_verify(Feature::Hrl, STATE_OFF)?;
         self.set_verify(Feature::Encryption, STATE_OFF)
     }
@@ -788,11 +775,11 @@ impl<'a> FirmwareControl<'a> {
 
     /// **arm_bypass_uhd** — full-bypass UHD rip (NO host cert needed).
     ///
-    /// Sets: `Uhd = on` (engage the UHD disc), `Encryption = off` (the
-    /// consolidated cert/bus bypass), and `Hrl = skip` (revocation off).
+    /// Sets: `Unrestricted = on` (engage the UHD disc), `Encryption = off`
+    /// (the consolidated cert/bus bypass), and `Hrl = skip` (revocation off).
     /// Rips: UHD with no cert.
     pub fn arm_bypass_uhd(&mut self) -> Result<()> {
-        self.set_verify(Feature::Uhd, STATE_ON)?;
+        self.set_verify(Feature::Unrestricted, STATE_ON)?;
         self.set_verify(Feature::Hrl, STATE_OFF)?;
         self.set_verify(Feature::Encryption, STATE_OFF)
     }
