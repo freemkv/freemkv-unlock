@@ -13,7 +13,6 @@ const FIRMWARE_EXTRA: [u8; 16] = [0; 16];
 /// that drive — real profiles must supply their own (see `DriveProfile`).
 const VENDOR_VERIFY: [u8; 10] = [0xF1, 0x01, 0x02, 0x00, 0x0D, 0x30, 0x01, 0xF3, 0xAD, 0x23];
 
-// See docs/variant-b-firmware-upload.md — trace_step rationale.
 // Swallows everything except a transport fault; these steps are advisory,
 // the unlock retries below are the real gate.
 fn trace_step(phase: &'static str, r: crate::scsi::Result<crate::scsi::ScsiResult>) -> Result<()> {
@@ -58,7 +57,7 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         return Err(crate::ld::error::Error::UnlockFailed);
     }
 
-    // Step 1: Upload the firmware via MODE SELECT (see docs/variant-b-firmware-upload.md).
+    // Step 1: Upload the firmware via MODE SELECT.
     // MODE SELECT(10)'s parameter-list length is 16-bit, so reject only a
     // blob that can't be expressed in the CDB.
     let write_len = firmware.len();
@@ -124,8 +123,6 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     )?;
 
     // Step 4: Vendor verify (0xF1 — B-only, not standard SCSI), per-drive.
-    // See docs/variant-b-firmware-upload.md for why the outcome is traced
-    // rather than discarded.
     let verify_cdb = mt.profile.fw_verify_cdb.unwrap_or(VENDOR_VERIFY);
     let mut dummy = [0u8; 0];
     trace_step(
@@ -134,8 +131,7 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     )?;
 
     // Step 5: Unlock retries (up to 5, then a final fatal attempt). The
-    // confirmation pass after success is intentionally best-effort — see
-    // docs/variant-b-firmware-upload.md.
+    // confirmation pass after success is intentionally best-effort.
     for _attempt in 0..5 {
         match mt.do_unlock(scsi) {
             Ok(_) => {

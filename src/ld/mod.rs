@@ -8,7 +8,7 @@
 
 // `cdb` is only the bdemu emulator's wire format (real unlocking uses profile
 // templates), gated behind `emulation`; also compiled under `cfg(test)` so its
-// wire-format tests run in default-feature CI. See docs/ld-mod.md — cdb gating.
+// wire-format tests run in default-feature CI.
 #[cfg(any(feature = "emulation", test))]
 mod cdb;
 mod error;
@@ -21,7 +21,7 @@ use crate::{DriveId, UnlockCtx, UnlockError, Unlocked, Unlocker};
 
 // ── Public profile catalog ──────────────────────────────────────────────────
 // Only the catalog is public (supported-drive lookup, used by bdemu); the
-// unlock mechanism stays private. See docs/ld-mod.md — public catalog design.
+// unlock mechanism stays private.
 
 pub use profile::{DriveProfile as Profile, Identity, Platform, ProfileMatch, Profiles};
 
@@ -122,7 +122,7 @@ impl LdUnlocker {
 impl LdUnlocker {
     // The MediaTek firmware unlock. Since it removes AACS at the drive (clear
     // content), this one op satisfies both features and bus-removal, so both
-    // trait methods delegate here. See docs/ld-mod.md — firmware_unlock contract.
+    // trait methods delegate here.
     fn firmware_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -144,7 +144,7 @@ impl LdUnlocker {
         mt.init(scsi)?;
         // `init` only proves the handshake completed, not that the drive reached
         // extended-access state. Reporting unlocked off `init` alone shipped
-        // ciphertext at rc=0. See docs/ld-mod.md — half-unlock fallback.
+        // ciphertext at rc=0.
         if !mt.is_unlocked() {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -159,7 +159,7 @@ impl LdUnlocker {
         if let Err(e) = mt.probe_disc(scsi) {
             // A transport fault here is a dead bus, not a calibration miss — most
             // profiles never touch the bus again, so this was the only dead-bus
-            // signal. See docs/ld-mod.md — probe_disc dead-bus classification.
+            // signal.
             if e.is_transport_failure() {
                 tracing::warn!(
                     target: "freemkv::disc",
@@ -432,7 +432,6 @@ mod tests {
 
     // THE probe-disc dead-bus test: bus dies during speed calibration after a
     // full unlock; must abort with Transport, not report a successful unlock.
-    // See docs/ld-mod.md — probe_disc dead-bus test / mutation notes.
     #[test]
     fn transport_fault_during_probe_disc_is_transport_not_a_successful_unlock() {
         let id = known_vid_drive_id();

@@ -127,7 +127,7 @@ impl Mt1959 {
         let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 5_000)?;
         // A drive sense arrives as `Ok` with a non-zero status; a merely
         // SHORT response is the drive answering badly — neither is a dead
-        // bus. See docs/mt1959.md — short-probe-not-transport-failure.
+        // bus.
         if result.status != 0 || result.bytes_transferred != expected {
             return Err(Error::Scsi {
                 opcode: SCSI_READ_BUFFER,
@@ -181,7 +181,7 @@ impl Mt1959 {
 
         // `response` is a fixed 64-byte buffer; the meaningful bound is how
         // many bytes the drive actually delivered. Require enough bytes to
-        // validate before checking markers, up front. See docs/mt1959.md — min-unlock-response-length.
+        // validate before checking markers, up front.
         let n = result.bytes_transferred.min(response.len());
         if n < MIN_UNLOCK_RESPONSE {
             tracing::debug!(
@@ -206,7 +206,6 @@ impl Mt1959 {
 
         // Extended-access state requires the signature match AND both the
         // primary marker at [12..16] AND the secondary marker at [16..20].
-        // See docs/mt1959.md — unlock-marker-gating.
         self.unlocked =
             response[FIRMWARE_MODE_OFFSET..FIRMWARE_MODE_OFFSET + 4] == FIRMWARE_MODE_SIG;
 
@@ -282,7 +281,7 @@ impl Mt1959 {
                     return Err(Error::UnlockFailed);
                 }
                 // A dead bus must abort here, not be retried three times as
-                // firmware reloads. See docs/mt1959.md — run-init-transport-fault.
+                // firmware reloads.
                 Err(e) if e.is_transport_failure() => {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -349,7 +348,7 @@ impl Mt1959 {
         }
 
         // Detect disc type from capacity to select probe mode (BD vs UHD
-        // init address). See docs/mt1959.md — probe-init-address-detection.
+        // init address).
         let cap_cdb = [
             SCSI_READ_CAPACITY,
             0x00,
@@ -368,7 +367,7 @@ impl Mt1959 {
         let cap = scsi.execute(&cap_cdb, DataDirection::FromDevice, &mut cap_buf, 5_000)?;
         let disc_sectors = if cap.status == 0 && cap.bytes_transferred >= 4 {
             // last_lba + 1 = sector count; saturate on the 32-bit-overflow
-            // sentinel rather than wrap to 0. See docs/mt1959.md — capacity-saturation.
+            // sentinel rather than wrap to 0.
             u32::from_be_bytes([cap_buf[0], cap_buf[1], cap_buf[2], cap_buf[3]]).saturating_add(1)
         } else {
             0
@@ -413,7 +412,7 @@ impl Mt1959 {
             {
                 // A dead bus MUST keep its transport classification; a
                 // short/rejected reply is the drive's own failure and stays
-                // `UnlockFailed`. See docs/mt1959.md — probe-failure-classification.
+                // `UnlockFailed`.
                 if e.is_transport_failure() {
                     return Err(e);
                 }
@@ -423,7 +422,6 @@ impl Mt1959 {
         }
 
         // Pass 2: continue past the coarse range (do not restart at 0).
-        // See docs/mt1959.md — probe-pass-overlap-fix.
         let mut addr: u32 = PROBE_COARSE_END as u32;
         while addr < PROBE_FINE_END {
             let mut resp = [0u8; PROBE_RESPONSE_SIZE as usize];
@@ -436,7 +434,7 @@ impl Mt1959 {
             ) {
                 // Fine probing is best-effort — a short/rejected reply just ends
                 // the sweep early, but a transport fault must keep its
-                // classification and abort. See docs/mt1959.md — probe-pass2-transport-fault.
+                // classification and abort.
                 if e.is_transport_failure() {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -696,7 +694,7 @@ mod tests {
 
     // THE defect-15 test: a zero-byte response used to skip every marker
     // check (each individually `n >= ..` guarded) and report a fully
-    // unlocked drive. See docs/mt1959.md — defect-15.
+    // unlocked drive.
     #[test]
     fn do_unlock_rejects_a_zero_length_response() {
         let sig = [0x99, 0x9E, 0xC3, 0x75];
@@ -776,7 +774,7 @@ mod tests {
 
     // THE defect-4 test: a dead bus must abort `run_init` at once, not
     // re-upload firmware on all three attempts and return the generic
-    // `UnlockFailed`. See docs/mt1959.md — defect-4.
+    // `UnlockFailed`.
     #[test]
     fn run_init_aborts_on_a_transport_fault_without_reloading_firmware() {
         let mut t =
@@ -894,7 +892,7 @@ mod tests {
 
     // THE probe pass-1 dead-bus test: a bus that dies during the coarse
     // probe must keep its transport classification so the caller aborts
-    // with `Transport`. See docs/mt1959.md — pass1-dead-bus-mutation.
+    // with `Transport`.
     #[test]
     fn transport_fault_during_pass1_probe_stays_a_transport_failure() {
         let mut t = ProbeFaultsTransport { fault_at: 0 };
@@ -909,7 +907,7 @@ mod tests {
 
     // THE probe pass-2 dead-bus test: the loop used to `break` on ANY
     // error and return `Ok(())`, swallowing a dead bus mid-pass-2. It
-    // must now propagate. See docs/mt1959.md — pass2-dead-bus-mutation.
+    // must now propagate.
     #[test]
     fn transport_fault_during_pass2_probe_stays_a_transport_failure() {
         let mut t = ProbeFaultsTransport {
@@ -952,7 +950,7 @@ mod tests {
 
     // variant_a's firmware-verify-read transport-abort branch: WRITE_BUFFER
     // succeeds, the 0x45 verify read faults — a dead bus must abort there,
-    // not be swallowed into the unlock retries. See docs/mt1959.md — variant-a-verify-read-transport-abort.
+    // not be swallowed into the unlock retries.
     #[test]
     fn variant_a_verify_read_transport_fault_aborts() {
         let mut profile = fixture_profile([0; 4]);
@@ -1013,7 +1011,7 @@ mod tests {
 
     // variant_b's firmware-upload step (here the metadata read) hitting a
     // dead bus must abort via `trace_step`, not be swallowed into the
-    // unlock retries. See docs/mt1959.md — variant-b-upload-step-transport-abort.
+    // unlock retries.
     #[test]
     fn variant_b_upload_step_transport_fault_aborts() {
         let mut profile = fixture_profile([0; 4]);

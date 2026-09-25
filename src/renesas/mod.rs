@@ -24,8 +24,7 @@ const RENESAS_MARKER_OFFSET: usize = 16;
 /// interface tag. A rejection (CHECK CONDITION or `Err` with a sense) is
 /// `Ok(false)`: not a Renesas drive.
 ///
-/// `Err(Transport)` on a dead bus. See docs/renesas-mod.md for why a
-/// transport fault must not be folded into `Ok(false)`.
+/// `Err(Transport)` on a dead bus.
 pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
     let mut buf = [0u8; RB_F1_LEN];
     match scsi.execute(&RB_F1_CDB, DataDirection::FromDevice, &mut buf, 5_000) {
@@ -71,8 +70,7 @@ impl Renesas {
     }
 
     // MakeMKV's vendor "open" sequence: primary read (A), and on refusal a
-    // knock + second read (B). See docs/renesas-mod.md for the full sequence
-    // and why we run A→knock→B rather than bailing after A.
+    // knock + second read (B).
     fn vendor_open(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
         const RB_B0_04_CDB: [u8; 10] = [0x3C, 0x02, 0xB0, 0x00, 0x00, 0x04, 0x00, 0x00, 0xA4, 0x00];
         const KNOCK_A5AAAA_CDB: [u8; 10] =
@@ -128,7 +126,7 @@ impl Unlocker for Renesas {
     /// best-effort `0xAD` reader. `Some` once the open succeeds — the drive
     /// serves clear content whether or not the bonus VID read did; `None` if it
     /// isn't a Renesas drive or the open is refused; `Err(Transport)` on a dead
-    /// bus. See docs/renesas-mod.md for the MakeMKV-parity rationale.
+    /// bus.
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -188,7 +186,7 @@ mod tests {
     }
 
     // Rejects like a MediaTek drive: ILLEGAL REQUEST with a sense, which is
-    // what distinguishes this from a dead bus. See docs/renesas-mod.md.
+    // what distinguishes this from a dead bus.
     struct RejectingTransport;
     impl ScsiTransport for RejectingTransport {
         fn execute(
@@ -280,7 +278,7 @@ mod tests {
     }
 
     // Same rejection via a CONFORMING transport (`Ok` + CHECK CONDITION);
-    // must reach the same answer. See docs/renesas-mod.md.
+    // must reach the same answer.
     #[test]
     fn check_condition_is_not_a_renesas_drive() {
         use crate::scsi::mock::{MockTransport, Reply};
@@ -308,7 +306,7 @@ mod tests {
 
     // A recognized Renesas drive whose A read (RB 0xB0@0x04) is REFUSED but
     // whose B read (RB 0xB0@0x50) SUCCEEDS after the knock must unlock — and the
-    // knock CDB has to be issued BETWEEN A and B. See docs/renesas-mod.md.
+    // knock CDB has to be issued BETWEEN A and B.
     #[test]
     fn knock_runs_between_a_and_b_and_b_opens() {
         // The exact knock CDB the code issues (pinned wire format).
@@ -395,7 +393,7 @@ mod tests {
     }
 
     // A recognized Renesas drive that REFUSES the vendor open read must
-    // defer to the next unlocker, not claim the drive. See docs/renesas-mod.md.
+    // defer to the next unlocker, not claim the drive.
     #[test]
     fn open_rejection_defers_to_next_unlocker() {
         struct GateOkOpenRefused;

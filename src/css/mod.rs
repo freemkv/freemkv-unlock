@@ -14,7 +14,7 @@ use crate::scsi::{DataDirection, ScsiTransport};
 
 // Issue ONE CSS bus-auth CDB, honouring the transport contract: treats a
 // non-zero status as CssAuthFailed and checks bytes_transferred >= min_bytes
-// rather than trusting an unfilled buffer. See docs/css-mod.md#css_scsi.
+// rather than trusting an unfilled buffer.
 fn css_scsi(
     scsi: &mut dyn ScsiTransport,
     cdb: &[u8],
@@ -202,7 +202,7 @@ impl crate::Unlocker for DvdUnlocker {
     fn name(&self) -> &'static str {
         // "DVD" names the medium this bus-auth unlocks, not the CSS scheme:
         // the bus-auth runs on any DVD regardless of whether the content is
-        // actually scrambled. See docs/css-mod.md#dvdunlocker-name.
+        // actually scrambled.
         "DVD"
     }
 
@@ -240,7 +240,7 @@ impl crate::Unlocker for DvdUnlocker {
 
 // Probes GET CONFIGURATION current-profile (DVD family 0x0010..=0x001F) so
 // DvdUnlocker can self-verify against the drive rather than trust the
-// caller's DiscKind. See docs/css-mod.md#mounted_disc_is_dvd.
+// caller's DiscKind.
 fn mounted_disc_is_dvd(
     scsi: &mut dyn ScsiTransport,
 ) -> std::result::Result<bool, crate::UnlockError> {
@@ -300,7 +300,6 @@ fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()>
     tracing::debug!(target: "freemkv::css", agid, "css unlock: bus authentication ok");
     // Disc-key REPORT KEY: best-effort only, for firmware that ties part of
     // its read-unlock to it; bytes are unused and failure is non-fatal.
-    // See docs/css-mod.md#disc-key-report-key (7014 bug history).
     if let Err(e) = read_disc_key(scsi, agid) {
         tracing::debug!(target: "freemkv::css", error_code = e.code(), "css unlock: disc-key REPORT KEY skipped (non-fatal)");
     }
@@ -311,7 +310,7 @@ fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()>
 // ── Step 1: Bus Authentication ────────────────────────────────────────────
 
 // Runs the CSS bus-auth handshake to set ASF=1 (invalidate AGIDs, allocate,
-// challenge/response). Returns the AGID; no bus key is derived. See docs/css-mod.md.
+// challenge/response). Returns the AGID; no bus key is derived.
 fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     // Invalidate all AGIDs via REPORT KEY format 0x3F. This is also what makes
     // an abandoned AGID self-heal — which is not a reason to abandon one.
@@ -438,7 +437,7 @@ fn authenticate_with_agid(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> 
 // ── Step 2: Disc Key ──────────────────────────────────────────────────────
 
 // Issues READ DVD STRUCTURE format 0x02 (opcode 0xAD) purely for its
-// bus-auth side effect; returned bytes are unused. See docs/css-mod.md#read_disc_key.
+// bus-auth side effect; returned bytes are unused.
 fn read_disc_key(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
     // READ DVD STRUCTURE, format 0x02 (disc key), 2048+4 bytes
     let alloc_len: u16 = 2048 + 4;
@@ -464,7 +463,7 @@ fn read_disc_key(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
 fn crypt_key(key_type: usize, variant: u8, challenge: &[u8; 10]) -> [u8; 5] {
     // key_type indexes PERM_CHALLENGE ([_;3]); variant indexes VARIANTS/
     // PERM_VARIANT ([_;32]). Real (not debug-only) asserts catch an OOB index even
-    // in release; cost is nil on this once-per-disc path. See docs/css-mod.md.
+    // in release; cost is nil on this once-per-disc path.
     assert!(key_type < 3, "crypt_key: key_type out of range");
     assert!((variant as usize) < 32, "crypt_key: variant out of range");
     let perm = &PERM_CHALLENGE[key_type];
@@ -620,7 +619,7 @@ mod tests {
 
     // SECURITY REGRESSION GUARD: scans source files for a `tracing` field
     // binding a forbidden key name to a value expression (only a string
-    // literal or `_fp` field is allowed). See docs/css-mod.md#key-guard.
+    // literal or `_fp` field is allowed).
     #[test]
     fn no_key_bytes_in_instrumentation() {
         use std::path::Path;
@@ -776,7 +775,7 @@ mod tests {
     // ── CSS constant-table integrity ───────────────────────────────────────
 
     // Each PERM_CHALLENGE row must be a permutation of indices 0..10; a
-    // non-permutation would drop/duplicate bytes. See docs/css-mod.md#perm-challenge-rows.
+    // non-permutation would drop/duplicate bytes.
     #[test]
     fn perm_challenge_rows_are_permutations() {
         for (row, perm) in PERM_CHALLENGE.iter().enumerate() {
@@ -795,7 +794,6 @@ mod tests {
 
     // Each PERM_VARIANT row must map the 32 variants to 32 distinct 5-bit
     // values; a collision would make two variants indistinguishable.
-    // See docs/css-mod.md#perm-variant-rows.
     #[test]
     fn perm_variant_rows_are_permutations_of_0_31() {
         for (row, perm) in PERM_VARIANT.iter().enumerate() {
@@ -816,7 +814,7 @@ mod tests {
     // ── crypt_key behaviour ────────────────────────────────────────────────
 
     // crypt_key's result must depend on every challenge byte: flipping any
-    // single byte must change the output. See docs/css-mod.md#crypt-key-byte-dependence.
+    // single byte must change the output.
     #[test]
     fn crypt_key_depends_on_every_challenge_byte() {
         let base: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -834,7 +832,7 @@ mod tests {
 
     // crypt_key(0, v, ..) must be distinct for each of the 32 variants:
     // bus-auth brute-forces the variant by matching against key1, so a
-    // collision could select the wrong one. See docs/css-mod.md.
+    // collision could select the wrong one.
     #[test]
     fn crypt_key_type0_distinct_per_variant() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -851,7 +849,6 @@ mod tests {
 
     // crypt_key's `key_type < 3` debug_assert must fire for key_type 3
     // (which would otherwise index PERM_CHALLENGE out of bounds).
-    // See docs/css-mod.md#crypt-key-preconditions.
     #[test]
     #[should_panic]
     fn crypt_key_rejects_out_of_range_key_type() {
@@ -861,7 +858,6 @@ mod tests {
 
     // crypt_key's `variant < 32` debug_assert must fire for variant 32
     // (which would otherwise index VARIANTS/PERM_VARIANT out of bounds).
-    // See docs/css-mod.md#crypt-key-preconditions.
     #[test]
     #[should_panic]
     fn crypt_key_rejects_out_of_range_variant() {
@@ -895,7 +891,6 @@ mod tests {
 
     // The key-format field is masked to 6 bits so a format with high bits
     // set (e.g. 0xFF) cannot corrupt the AGID bits of byte 10.
-    // See docs/css-mod.md#cdb-builders.
     #[test]
     fn report_key_cdb_masks_format_to_6_bits() {
         let cdb = report_key_cdb(0, 0xFF, 8);
@@ -904,7 +899,7 @@ mod tests {
 
     // send_key_cdb encodes a 12-byte MMC SEND KEY (opcode 0xA3) CDB with the
     // parameter-list length at bytes 8-9 (big-endian) and AGID/format at
-    // byte 10. See docs/css-mod.md#cdb-builders.
+    // byte 10.
     #[test]
     fn send_key_cdb_matches_mmc_layout() {
         let cdb = send_key_cdb(0b11, 0x03, 0x000C); // AGID=3, format=3, param_len=12
@@ -921,7 +916,6 @@ mod tests {
 
     // Allocation length > 255 must split across bytes 8 (high) and 9 (low)
     // as a 16-bit big-endian field, e.g. 0x0804 (the disc-key block size).
-    // See docs/css-mod.md#cdb-builders.
     #[test]
     fn report_key_cdb_alloc_len_is_16bit_big_endian() {
         let cdb = report_key_cdb(0, 0x00, 0x0804);
@@ -1012,7 +1006,7 @@ mod tests {
 
     // Defect-7 regression: a transport fault on the first probe command
     // must abort as Transport, not fall through to NotApplicable (which
-    // let the consumer keep probing a dead bus). See docs/css-mod.md.
+    // let the consumer keep probing a dead bus).
     #[test]
     fn transport_fault_probing_for_a_dvd_aborts() {
         let id = DriveId::default();
@@ -1039,7 +1033,7 @@ mod tests {
 
     // Defect-2 regression: a DVD is mounted, then the bus dies mid
     // bus-auth — must abort as Transport, not collapse to CssAuthFailed /
-    // NotApplicable. See docs/css-mod.md.
+    // NotApplicable.
     #[test]
     fn transport_fault_during_bus_auth_aborts() {
         let id = DriveId::default();

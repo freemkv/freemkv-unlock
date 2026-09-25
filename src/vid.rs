@@ -8,7 +8,7 @@
 //! BEST-EFFORT: only a dead bus is an `Err(Transport)`. A CHECK CONDITION, a
 //! short response, or an all-zero VID all yield `Ok(None)` — a VID miss must
 //! never discard an unlock that already removed the bus (a key source can still
-//! supply the key). See docs/freemkv-abi.md for the fixed-length reply rules.
+//! supply the key).
 
 use crate::UnlockError;
 use crate::scsi::{DataDirection, ScsiTransport};
