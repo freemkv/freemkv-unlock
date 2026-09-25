@@ -210,15 +210,11 @@ pub enum Feature {
     /// [`REGION_BD_A`]/`_B`/`_C` (`0x0A`/`0x0B`/`0x0C`) = force BD region A/B/C;
     /// [`REGION_FREE`] (`0x0F`) = region-free (any disc plays).
     Region = 0x02,
-    /// Unrestricted (BD/UHD) capability widen gate. fw 0.9.2 unified the former
-    /// separate BD (AACS 1.0) and UHD (AACS 2.0) accept gates into this single
-    /// lever. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM (as shipped); [`STATE_OFF`]
-    /// (`0x00`) = No (refuse BD/UHD discs); [`STATE_ON`] (`0x01`) = Yes (accept
-    /// BD/UHD — the mode gate is neutralized so the drive engages both). On the
-    /// byte-extraction classifier (e.g. BU40N) the No (OFF) leg currently reads
-    /// back but behaves == OEM (boot-safe no-op, pending deeper RE) — do NOT
-    /// treat OFF as a proven disable there. Wire id `0x04` (was `Bd`) is retired:
-    /// the BD slot is now unused/reserved, the firmware treats it as a no-op.
+    /// Unrestricted (BD/UHD) capability widen gate — fw 0.9.2 unified the former
+    /// separate BD/UHD accept gates. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM;
+    /// [`STATE_OFF`] (`0x00`) = No (currently no-op on byte-extraction classifiers
+    /// like BU40N, pending RE); [`STATE_ON`] (`0x01`) = Yes (accept BD/UHD).
+    /// Wire id `0x04` (was `Bd`) is retired: unused/reserved, fw treats as no-op.
     Unrestricted = 0x03,
     /// Host Revocation List handling on the cert path. [`STATE_PASSTHROUGH`]
     /// (`0xFF`) = OEM enforce; [`STATE_OFF`] (`0x00`) = off (skip the HRL lookup —
@@ -525,10 +521,9 @@ pub enum ArmRecipe {
     BypassBd,
     /// [`FirmwareControl::arm_bypass_uhd`].
     BypassUhd,
-    // NOTE: `Feature::Unrestricted` now unifies the former BD+UHD accept gates
-    // (fw 0.9.2); the OemBd/OemUhd/BypassBd/BypassUhd recipe names above are
-    // kept as-is (they name the disc TYPE being ripped, not the retired
-    // per-format feature), see `arm_oem_uhd`/`arm_bypass_uhd` below.
+    // NOTE: Feature::Unrestricted unifies former BD+UHD gates (fw 0.9.2); recipe
+    // names above name the disc TYPE being ripped, not the retired per-format
+    // feature — see `arm_oem_uhd`/`arm_bypass_uhd`.
     /// [`FirmwareControl::arm_stealth_oem`].
     StealthOem,
 }
