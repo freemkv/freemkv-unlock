@@ -4,7 +4,8 @@
 
 ### Changed
 
-- Version aligned to 1.7.6 for the unified release. No functional changes to this crate; the release is driven by the freemkv 1.7.6 Linux desktop shell (GTK4 + libadwaita) and the rip-finished desktop notification (issue #56).
+- firmware: mirror the fw 0.9.2 ABI — `Feature::Bd` (wire id `0x04`) is retired, and `Feature::Uhd` is renamed to `Feature::Unrestricted` (wire id `0x03`). `ALL_FEATURES` shrinks from 6 to 5. Required to talk to firmware 0.9.2. **Breaking**: any downstream code naming `Feature::Bd` or `Feature::Uhd` must be updated.
+- Version aligned to 1.7.6 for the unified release alongside the freemkv 1.7.6 Linux desktop shell (issue #56).
 
 ## [1.7.5] — 2026-09-23
 
