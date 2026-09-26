@@ -42,10 +42,9 @@ pub struct Identity {
 
 /// Per-drive profile.
 ///
-/// Only `identity` and `signature` are public; everything else (firmware
-/// image, per-drive vendor CDB templates) is `pub(crate)` unlock mechanism
-/// that must stay inside this unpublished crate.
-/// See docs/drive-profile-visibility.md — field-visibility and allow(dead_code) rationale.
+/// Only `identity` and `signature` are public; everything else (firmware image, per-drive
+/// vendor CDB templates) is `pub(crate)` unlock mechanism that must stay inside this
+/// unpublished crate.
 #[allow(dead_code)]
 #[derive(Clone, Deserialize)]
 pub struct DriveProfile {

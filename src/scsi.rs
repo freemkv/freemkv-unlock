@@ -99,9 +99,8 @@ pub(crate) fn build_set_cd_speed(read_speed: u16) -> [u8; 12] {
     ]
 }
 
-// ── Test fixture ────────────────────────────────────────────────────────────
-// Crate-wide mock transport, able to express all three transport outcomes.
-// See docs/scsi-mock-fixture.md — why this fixture exists
+// ── Test fixture ──────────────────────────────────────────────────────────── Crate-wide mock
+// transport, able to express all three transport outcomes.
 #[cfg(test)]
 #[allow(dead_code)] // a fixture: each helper is used by a subset of the modules
 pub(crate) mod mock {

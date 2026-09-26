@@ -25,16 +25,13 @@ mod vid;
 // harness armed `Ake=null` can read the VID with NO cert AKE and prove no
 // SEND KEY crossed the bus.
 pub use vid::read_aacs_vid;
-// `ld` is public only for its drive-profile catalog + (under `emulation`) the
-// handshake wire format bdemu needs; the unlocker impl stays `pub(crate)`.
-// See docs/module-visibility.md — module visibility rationale.
+// `ld` is public only for its drive-profile catalog + (under `emulation`) the handshake wire
+// format bdemu needs; the unlocker impl stays `pub(crate)`.
 pub mod ld;
-// `renesas` is public for its `is_renesas` drive-probe (dead bus vs. "not a
-// Renesas drive"); the unlocker impl stays `pub(crate)`.
-// See docs/module-visibility.md — module visibility rationale.
+// `renesas` is public for its `is_renesas` drive-probe (dead bus vs. "not a Renesas drive");
+// the unlocker impl stays `pub(crate)`.
 pub mod renesas;
-// `freemkv` self-identifies rather than matching a bundled profile, so it
-// stays fully private. See docs/module-visibility.md — module visibility rationale.
+// `freemkv` self-identifies rather than matching a bundled profile, so it stays fully private.
 mod freemkv;
 
 use scsi::ScsiTransport;
@@ -109,11 +106,10 @@ impl std::fmt::Debug for HostCert {
     }
 }
 
-/// Per-attempt context the consumer hands to EVERY unlocker, uniformly: the
-/// drive identity and the mounted disc's kind. These are the shared facts the
-/// dispatch loop knows; anything an individual unlocker needs beyond them (the
-/// AACS cert route's host certs) is injected into THAT unlocker at construction,
-/// so the loop and the other unlockers never see it. See docs/module-visibility.md.
+/// Per-attempt context the consumer hands to EVERY unlocker, uniformly: the drive identity and
+/// the mounted disc's kind. These are the shared facts the dispatch loop knows; anything an
+/// individual unlocker needs beyond them (the AACS cert route's host certs) is injected into
+/// THAT unlocker at construction, so the loop and the other unlockers never see it.
 pub struct UnlockCtx<'a> {
     pub drive_id: &'a DriveId,
     pub kind: DiscKind,
@@ -136,9 +132,8 @@ pub struct Unlocked {
     pub bus_key: Option<[u8; 16]>,
 }
 
-// Hand-written, REDACTING Debug: `bus_key`/`vid` are key material that must
-// never reach a log in plaintext; presence (Some/None) stays observable.
-// See docs/unlocked-debug-redaction.md — full rationale.
+// Hand-written, REDACTING Debug: `bus_key`/`vid` are key material that must never reach a log
+// in plaintext; presence (Some/None) stays observable.
 impl std::fmt::Debug for Unlocked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Unlocked")

@@ -5,9 +5,7 @@
 //! allocate an AGID, exchange host/drive certs and key points, verify
 //! signatures, derive the bus key via ECDH, then read VID / Read Data Keys.
 //!
-//! Supports AACS 1.0 and AACS 2.0 cert chains; see docs/aacs-handshake.md
-//! for the full step list and cert-fallback rules, and
-//! [`run_cert_handshake`] for the dispatch.
+//! Supports AACS 1.0 and AACS 2.0 cert chains.
 use crate::aacs::error::{Error, Result};
 use crate::scsi::{DataDirection, ScsiTransport};
 use num_bigint::BigUint;
@@ -26,8 +24,6 @@ fn handshake_err(err: Error, fallback: Error) -> Error {
     }
 }
 
-// See docs/aacs-handshake.md — why status/length are checked here, at the
-// seam, instead of trusting `ScsiTransport::execute`'s `Ok` result.
 fn scsi_read(session: &mut dyn ScsiTransport, cdb: &[u8], len: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     let r = session.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000)?;
@@ -42,8 +38,6 @@ fn scsi_read(session: &mut dyn ScsiTransport, cdb: &[u8], len: usize) -> Result<
     Ok(buf)
 }
 
-// See docs/aacs-handshake.md — shares scsi_read's status-check reasoning:
-// a drive REFUSING the host cert answers `Ok` + CHECK CONDITION.
 fn scsi_write(session: &mut dyn ScsiTransport, cdb: &[u8], data: &[u8]) -> Result<()> {
     let mut buf = data.to_vec();
     let r = session.execute(cdb, DataDirection::ToDevice, &mut buf, 5_000)?;
@@ -150,9 +144,9 @@ const AACS2_LA_PUB_Y: [u8; 32] = [
     0x0F, 0x68, 0x4A, 0x05, 0x96, 0xE9, 0xCE, 0x00, 0xC4, 0xD3, 0xFE, 0x6E, 0x24, 0x45, 0x4D, 0xD0,
 ];
 
-// EXPERIMENTAL gate for the native AACS 2.0 (P-256) AKE. The 2.0 cert offsets are
-// PROVISIONAL (see docs/aacs-handshake.md), so only the production real-anchor
-// verify is gated off; tests still exercise the AKE. Flip once a real cert lands.
+// EXPERIMENTAL gate for the native AACS 2.0 (P-256) AKE. The 2.0 cert offsets are PROVISIONAL,
+// so only the production real-anchor verify is gated off; tests still exercise the AKE. Flip
+// once a real cert lands.
 const AACS2_P256_EXPERIMENTAL: bool = false;
 
 // AACS 1.0 LA (Licensing Administrator) public key on the 160-bit curve,
@@ -342,9 +336,8 @@ fn ec_double(pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
     EcPoint::new(x3, y3)
 }
 
-// Scalar multiplication using double-and-add. Not constant-time (timing
-// depends on the secret scalar) — accepted tradeoff for a local, once-per-
-// disc handshake. See docs/aacs-handshake.md for the full rationale.
+// Scalar multiplication using double-and-add. Not constant-time (timing depends on the secret
+// scalar) — accepted tradeoff for a local, once-per- disc handshake.
 fn ec_mul(k: &BigUint, pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
     if k.is_zero() {
         return EcPoint::infinity();
@@ -596,9 +589,7 @@ fn ecdsa_verify_p256(pub_x: &[u8], pub_y: &[u8], sig_r: &[u8], sig_s: &[u8], dat
     &r_point.x % &n == r
 }
 
-// Verify an AACS 2.0 drive cert (type 0x11) against an AACS 2.0 LA key. See
-// docs/aacs-handshake.md — offsets are PROVISIONAL pending a real captured
-// cert; LA anchor is a parameter so tests can drive it standalone.
+// Verify an AACS 2.0 drive cert (type 0x11) against an AACS 2.0 LA key.
 fn verify_cert_p256(cert: &[u8], la_x: &[u8; 32], la_y: &[u8; 32]) -> bool {
     if cert.len() < 132 {
         return false;
@@ -1148,9 +1139,9 @@ fn aacs_authenticate_with_agid(
     })
 }
 
-// Native AACS 2.0 handshake (P-256/SHA-256); LA anchor is a parameter so tests
-// drive the full AKE under a test keypair. Its 2.0 cert offsets are PROVISIONAL
-// (docs/aacs-handshake.md), so run_cert_handshake gates it off (see AACS2_P256_EXPERIMENTAL).
+// Native AACS 2.0 handshake (P-256/SHA-256); LA anchor is a parameter so tests drive the full
+// AKE under a test keypair. Its 2.0 cert offsets are PROVISIONAL, so run_cert_handshake gates
+// it off (see AACS2_P256_EXPERIMENTAL).
 fn aacs2_authenticate_p256_with_anchor(
     session: &mut dyn ScsiTransport,
     host_priv_key: &[u8; 32],
@@ -1222,9 +1213,8 @@ fn aacs2_authenticate_p256_with_agid(
     drive_nonce.copy_from_slice(&response[4..24]);
     let drive_cert = &response[24..156];
 
-    // Chain-of-trust gate, mandatory on this live path (see
-    // docs/aacs-handshake.md): (a) reject any non-0x11 cert type outright,
-    // (b) treat cert verify failure as FATAL, not logged-and-continued.
+    // Chain-of-trust gate, mandatory on this live path: (a) reject any non-0x11 cert type
+    // outright, (b) treat cert verify failure as FATAL, not logged-and-continued.
     if drive_cert[0] != 0x11 {
         tracing::warn!(
             target: "freemkv::disc",
@@ -3171,9 +3161,8 @@ pub(crate) mod tests {
         );
     }
 
-    // AACS 2.0 (P-256) host-cert handshake — live-path proofs under a
-    // self-generated test LA keypair (no genuine 2.0 cert exists to sign
-    // with). See docs/aacs-handshake.md for the framing detail.
+    // AACS 2.0 (P-256) host-cert handshake — live-path proofs under a self-generated test LA
+    // keypair (no genuine 2.0 cert exists to sign with).
 
     /// Build a synthetic 132-byte AACS 2.0 drive certificate carrying
     /// `(pub_x,pub_y)`, signed by the test LA private key over cert[..68]
@@ -3486,9 +3475,8 @@ pub(crate) mod tests {
         );
     }
 
-    // SANITY: `ecdsa_verify_p256` + P-256 constants + SHA-256 verify against
-    // GENUINE AACS 2.0 material (a real Content Cert, since no AKE cert
-    // exists locally). See docs/aacs-handshake.md for the full rationale.
+    // SANITY: `ecdsa_verify_p256` + P-256 constants + SHA-256 verify against GENUINE AACS 2.0
+    // material (a real Content Cert, since no AKE cert exists locally).
     #[test]
     fn ecdsa_verify_p256_verifies_a_genuine_aacs2_content_cert() {
         fn hx(s: &str) -> Vec<u8> {
@@ -3525,7 +3513,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ── Round-2 coverage: EC math edge cases ── `mod_inv` returns `None`
+    // ── EC math edge cases ── `mod_inv` returns `None`
     // when `gcd(a, m) != 1`; called directly with a non-coprime pair since
     // production always passes a prime curve modulus.
     #[test]
@@ -3592,7 +3580,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ── Round-2 coverage: Debug redaction ───────────────────────────────────
+    // ── Debug redaction ───────────────────────────────────
 
     /// `AacsAuth`'s hand-written `Debug` must redact `bus_key` / `volume_id` /
     /// `read_data_key` (key material) while still showing whether each is
@@ -3641,7 +3629,7 @@ pub(crate) mod tests {
         assert!(s2.contains("[redacted]"));
     }
 
-    // ── Round-2 coverage: AACS 1.0 cert-verify gate ─────────────────────────
+    // ── AACS 1.0 cert-verify gate ─────────────────────────
 
     /// `aacs_authenticate` rejects a host cert shorter than 92 bytes before
     /// issuing a single SCSI command.
@@ -3678,7 +3666,7 @@ pub(crate) mod tests {
         assert!(matches!(err, Error::AacsCertVerify));
     }
 
-    // ── Round-2 coverage: AACS 2.0 (P-256) wiring ── the native AKE entry
+    // ── AACS 2.0 (P-256) wiring ── the native AKE entry
     // must forward a dead bus on the first step unchanged (so the orchestrator
     // can classify it as a transport abort rather than a cert rejection).
     #[test]
@@ -3746,7 +3734,7 @@ pub(crate) mod tests {
         );
     }
 
-    // ── Round-2 coverage: run_cert_handshake full success ── auth, VID read,
+    // ── run_cert_handshake full success ── auth, VID read,
     // AND read-data-keys all succeed here; every other test above stops
     // short — this is the only one reaching the final `Ok(CertHandshake)`.
     #[test]

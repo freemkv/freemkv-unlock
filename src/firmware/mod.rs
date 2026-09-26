@@ -1,19 +1,7 @@
-//! firmware — an ergonomic, typed Rust API for the freemkv-firmware
-//! vendor-command grammar.
+//! Typed mirror of the freemkv firmware vendor-command ABI.
 //!
-//! # This file is a MIRROR of the wire contract
-//!
-//! The single source of truth for the freemkv vendor-command ABI is
-//! `freemkv-firmware/crates/freemkv-fw/src/abi.rs`. The firmware tool and this
-//! host crate share **no code** — this module is a hand-kept mirror, so the
-//! numeric values below (verbs, features, state bytes, CDB field offsets) ARE
-//! the contract and MUST NOT drift. [`tests`] pins every pinned value so a drift
-//! against `abi.rs` is caught at `cargo test` time.
-//!
-//! # Grammar: `verb [feature] [state]`
-//!
-//! A freemkv command hijacks the standard SCSI `READ BUFFER` (`0x3C`) opcode via
-//! an OEM-unused mode plus a two-byte knock, then carries a small verb grammar:
+//! Numeric values must match `freemkv-firmware/crates/freemkv-fw/src/abi.rs`.
+//! Tests pin the verbs, features, state bytes and CDB offsets.
 //!
 //! ```text
 //!   cdb[0]    = 0x3C  (READ BUFFER)          ← standard opcode; bridge-safe
@@ -26,15 +14,8 @@
 //!   cdb[9]    = control (0)
 //! ```
 //!
-//! [`Verb::DumpAll`] is the exception: it packs a 32-bit RAM address big-endian
-//! into `cdb[5..9]` and always returns a fixed [`MEMREAD_LEN`]-byte window.
-//!
-//! Every feature defaults to [`STATE_PASSTHROUGH`] (firmware does not touch the
-//! subsystem → byte-identical to OEM); [`Verb::Reset`] with [`RESET_TO_OEM`]
-//! returns every feature to passthrough (and, firmware ≥0.8.3, blanks the NV block
-//! so the drive is traceless), [`RESET_TO_DEFAULTS`] restores the baked create-time
-//! defaults, while [`RESET_TO_FLASH`] reloads the last
-//! [`Verb::Save`]d config block.
+//! DumpAll instead encodes a 32-bit address in `cdb[5..9]` and returns MEMREAD_LEN bytes.
+//! Features default to passthrough. Reset selects OEM, built-in defaults or saved flash state.
 
 use crate::scsi::{DataDirection, ScsiTransport};
 

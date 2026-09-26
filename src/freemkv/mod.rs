@@ -1,24 +1,10 @@
-//! freemkv — the self-identifying custom-firmware unlocker.
+//! Unlock drives that identify themselves as freemkv firmware.
 //!
-//! Detects a freemkv-firmware drive by issuing the vendor IDENTITY command
-//! (`3C 0E C0 DE 01 …`) and checking the reply starts `b"freemkv"` — no bundled
-//! profile database is needed, unlike [`crate::ld`], because the firmware
-//! self-identifies.
-//!
-//! The wire grammar (verbs/features/states, CDB layout) lives in
-//! [`crate::firmware`], the typed mirror of `freemkv-fw/src/abi.rs`. This module
-//! only sequences the vendor commands into an unlock; it reuses the firmware
-//! module's CDB builders so the wire framing never drifts.
-//!
-//! Unlock mapping onto the grammar: region-free = `Set(Region, free)`
-//! (`REGION_FREE`), riplock lift = `Set(Speed, max)` (`SPEED_MAX`), and the
-//! load-bearing transport unlock = `Set(Encryption, off)` (`STATE_OFF` — the
-//! consolidated cert/bus bypass: drive acts pre-authenticated → a bare `0xAD`
-//! returns the VID with no cert and no AKE, and content returns de-bussed).
-//! The old separate `Bus` lever (wire id `0x07`) is retired — it was proven
-//! inert on BU40N/MT1959, and the single `Encryption` lever de-busses on its
-//! own. Under the migrated spec the HRL/Encryption unlock direction is
-//! `STATE_OFF`, not `0x01`.
+//! The vendor IDENTITY response must start with `b"freemkv"`. Commands use the
+//! builders in [`crate::firmware`], which mirror the firmware ABI.
+//! Unlocking sets Region to free, Speed to max, and Encryption to [`crate::firmware::STATE_OFF`].
+//! Encryption-off disables the certificate/bus barrier; the retired Bus feature
+//! must not be used as a substitute.
 
 use crate::firmware::{
     Feature, MEMREAD_LEN, MIN_ALLOC_LEN, REGION_FREE, RESP_MAGIC, SPEED_MAX, STATE_OFF,
