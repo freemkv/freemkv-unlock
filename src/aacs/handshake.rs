@@ -982,8 +982,42 @@ fn aacs_authenticate_with_anchor(
     la_x: &[u8; 20],
     la_y: &[u8; 20],
 ) -> Result<AacsAuth> {
+    aacs1_ake(session, host_priv_key, host_cert, la_x, la_y).map_err(V1Fail::into_error)
+}
+
+/// Why the 1.0 AKE failed. `DriveCert`: the drive presented a recognised cert
+/// that failed for a drive-side reason (type 0x01 failing LA verification, or
+/// type 0x11 on the 1.0 path), so no other host cert can pass the 1.0 AKE.
+enum V1Fail {
+    DriveCert,
+    Other(Error),
+}
+
+impl From<Error> for V1Fail {
+    fn from(e: Error) -> Self {
+        V1Fail::Other(e)
+    }
+}
+
+impl V1Fail {
+    fn into_error(self) -> Error {
+        match self {
+            V1Fail::DriveCert => Error::AacsCertVerify,
+            V1Fail::Other(e) => e,
+        }
+    }
+}
+
+/// [`aacs_authenticate_with_anchor`] keeping the [`V1Fail`] distinction.
+fn aacs1_ake(
+    session: &mut dyn ScsiTransport,
+    host_priv_key: &[u8; 20],
+    host_cert: &[u8],
+    la_x: &[u8; 20],
+    la_y: &[u8; 20],
+) -> std::result::Result<AacsAuth, V1Fail> {
     if host_cert.len() < 92 {
-        return Err(Error::AacsCertShort);
+        return Err(Error::AacsCertShort.into());
     }
 
     // Step 1: Invalidate all AGIDs
@@ -1017,7 +1051,7 @@ fn aacs_authenticate_with_agid(
     host_cert: &[u8],
     la_x: &[u8; 20],
     la_y: &[u8; 20],
-) -> Result<AacsAuth> {
+) -> std::result::Result<AacsAuth, V1Fail> {
     // Step 3: Generate host nonce and ephemeral key pair
     let mut host_nonce = [0u8; 20];
     use rand::Rng;
@@ -1051,7 +1085,7 @@ fn aacs_authenticate_with_agid(
     // ECDH (bus-key hole), so reject it — run_cert_handshake routes 0x11 to P-256.
     if drive_cert[0] == 0x01 {
         if !verify_cert_with_anchor(&drive_cert, la_x, la_y) {
-            return Err(Error::AacsCertVerify);
+            return Err(V1Fail::DriveCert);
         }
     } else {
         tracing::warn!(
@@ -1061,7 +1095,12 @@ fn aacs_authenticate_with_agid(
             "drive certificate is not a verifiable AACS 1.0 (type 0x01) cert on the \
              1.0 path; rejecting (a genuine 0x11 drive is retried on the native P-256 path)"
         );
-        return Err(Error::AacsCertVerify);
+        // 0x11 is a real 2.0 drive; any other type (e.g. a zeroed cert) is unproven.
+        return Err(if drive_cert[0] == 0x11 {
+            V1Fail::DriveCert
+        } else {
+            V1Fail::Other(Error::AacsCertVerify)
+        });
     }
 
     // Step 6: Read drive key point + signature (REPORT KEY format 0x02)
@@ -1089,7 +1128,7 @@ fn aacs_authenticate_with_agid(
         sig_s.copy_from_slice(&drive_key_sig[20..40]);
 
         if !ecdsa_verify(&drive_pub_x, &drive_pub_y, &sig_r, &sig_s, &verify_data) {
-            return Err(Error::AacsKeyVerify);
+            return Err(Error::AacsKeyVerify.into());
         }
     }
 
@@ -1112,7 +1151,7 @@ fn aacs_authenticate_with_agid(
         &host_sig_s,
         &sign_data,
     ) {
-        return Err(Error::AacsHostSignVerify);
+        return Err(Error::AacsHostSignVerify.into());
     }
 
     // Step 8: Send host key point + signature (SEND KEY format 0x02)
@@ -1539,17 +1578,11 @@ enum CertOutcome {
     /// Auth completed but no usable VID — terminal.
     VidUnavailable,
     /// Rejected (non-transport) — record + try the next cert. `v1_drive_dead`:
-    /// the 1.0 AKE failed on the drive's own cert/key, which no host cert fixes.
+    /// the 1.0 AKE failed on the drive's own cert ([`V1Fail::DriveCert`]).
     Reject {
         code: u16,
         v1_drive_dead: bool,
     },
-}
-
-/// A 1.0 AKE failure caused by the drive's own cert or key point (type/LA
-/// verify, step-6 signature, off-curve key point), independent of the host cert.
-fn is_v1_drive_side(e: &Error) -> bool {
-    matches!(e, Error::AacsCertVerify | Error::AacsKeyVerify)
 }
 
 /// The cert's v1 creds pass every host-side check the 1.0 AKE makes before
@@ -1579,7 +1612,7 @@ fn attempt_one_cert(
 ) -> CertOutcome {
     let mut v1_drive_dead = false;
     if try_v1 {
-        match aacs_authenticate_with_anchor(scsi, &hc.private_key, &hc.certificate, la.0, la.1) {
+        match aacs1_ake(scsi, &hc.private_key, &hc.certificate, la.0, la.1) {
             Ok(auth) => match finish_auth(scsi, auth, idx) {
                 Ok(ch) => return CertOutcome::Ok(ch),
                 Err(FinishErr::Transport) => return CertOutcome::Transport,
@@ -1597,9 +1630,12 @@ fn attempt_one_cert(
                     return CertOutcome::VidUnavailable;
                 }
             },
-            Err(e) if e.is_scsi_transport_failure() => return CertOutcome::Transport,
-            Err(e) => {
-                v1_drive_dead = is_v1_drive_side(&e);
+            Err(V1Fail::Other(e)) if e.is_scsi_transport_failure() => {
+                return CertOutcome::Transport;
+            }
+            Err(f) => {
+                v1_drive_dead = matches!(f, V1Fail::DriveCert);
+                let e = f.into_error();
                 if !has_v2 {
                     return CertOutcome::Reject {
                         code: e.code(),
@@ -1686,6 +1722,12 @@ pub(crate) fn run_cert_handshake_with_anchors(
         // neither a 1.0 AKE that can still pass nor usable v2 creds.
         let has_v2 = v2_creds_usable(hc, allow_p256);
         if !has_v2 && v1_drive_dead {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "cert_skip_v1_drive_dead",
+                cert_index = idx,
+                "skipping v1-only host cert: the drive's own 1.0 cert already failed"
+            );
             continue;
         }
         let v1_ok = v1_creds_usable(hc);
@@ -2259,6 +2301,9 @@ pub(crate) mod tests {
         /// When set, the step-6 key-point signature is corrupted on the wire
         /// (a drive-side failure no host cert can fix).
         pub(crate) bad_step6_sig: bool,
+        /// Answer this many initial drive-cert reads (REPORT KEY 0x01) with a
+        /// GOOD-status, all-zero (type 0x00) certificate.
+        pub(crate) zero_drive_cert_reads: usize,
         /// Every CDB issued, in order (lets a test assert the AGID was released).
         pub(crate) cdbs: Vec<Vec<u8>>,
     }
@@ -2298,6 +2343,7 @@ pub(crate) mod tests {
                 certs_sent: Vec::new(),
                 revoke_cert_sends: 0,
                 bad_step6_sig: false,
+                zero_drive_cert_reads: 0,
                 cdbs: Vec::new(),
             }
         }
@@ -2325,6 +2371,10 @@ pub(crate) mod tests {
                 crate::scsi::SCSI_REPORT_KEY => match cdb[10] & 0x3F {
                     0x3F => ok(vec![0u8; 2], data), // invalidate
                     0x00 => ok(vec![0u8; 8], data), // AGID alloc → agid 0
+                    0x01 if self.zero_drive_cert_reads > 0 => {
+                        self.zero_drive_cert_reads -= 1;
+                        ok(vec![0u8; 116], data)
+                    }
                     0x01 => {
                         // drive cert (type 0x01, LA-signed) + nonce.
                         let mut r = vec![0u8; 116];
@@ -4604,19 +4654,70 @@ pub(crate) mod tests {
         );
     }
 
-    /// A bad step-6 drive key-point signature is likewise host-cert independent.
+    /// A bad step-6 drive key-point signature may be leftover session state,
+    /// not proven host-cert independent: a per-cert reject, drive not marked dead.
     #[test]
-    fn drive_key_signature_failure_ends_the_loop_after_one_attempt() {
+    fn drive_key_signature_failure_is_a_per_cert_reject() {
         let mut emu = DriveEmu::new();
         emu.bad_step6_sig = true;
-        let certs = vec![dummy_cert(), dummy_cert()];
-        let err = run_handshake_v1(&mut emu, &certs).expect_err("drive signature never verifies");
-        assert_eq!(err, crate::UnlockError::HandshakeRejected);
-        assert_eq!(
-            emu.certs_sent.len(),
-            1,
-            "no further host cert may be shipped"
-        );
+        let (lax, lay) = (emu.la_x, emu.la_y);
+        let la = (&lax, &lay, &[0u8; 32], &[0u8; 32]);
+        match attempt_one_cert(&mut emu, &dummy_cert(), 0, la, true, false) {
+            CertOutcome::Reject {
+                code,
+                v1_drive_dead,
+            } => {
+                assert_eq!(code, Error::AacsKeyVerify.code());
+                assert!(
+                    !v1_drive_dead,
+                    "a step-6 failure must not mark the drive dead"
+                );
+            }
+            _ => panic!("expected a per-cert Reject"),
+        }
+    }
+
+    /// A type-0x11 drive cert on the 1.0 path is a genuine 2.0 drive: carried
+    /// forward as drive-dead; a zeroed (type 0x00) cert is not.
+    #[test]
+    fn only_a_recognised_drive_cert_type_marks_the_1_0_drive_dead() {
+        for (cert_type, dead) in [(0x11u8, true), (0x00u8, false)] {
+            let mut cert_resp = vec![0u8; 116];
+            cert_resp[24] = cert_type;
+            let mut script = vec![Reply::good(vec![0u8; 2]); 4];
+            script.push(Reply::good(vec![0u8; 8]));
+            script.push(Reply::good(vec![]));
+            script.push(Reply::good(cert_resp));
+            let mut t = MockTransport::scripted(script, Reply::good(vec![0u8; 2]));
+            let la = (&AACS_LA_PUB_X, &AACS_LA_PUB_Y, &[0u8; 32], &[0u8; 32]);
+            match attempt_one_cert(&mut t, &dummy_cert(), 0, la, true, false) {
+                CertOutcome::Reject {
+                    code,
+                    v1_drive_dead,
+                } => {
+                    assert_eq!(code, Error::AacsCertVerify.code());
+                    assert_eq!(v1_drive_dead, dead, "cert type {cert_type:#04x}");
+                }
+                _ => panic!("expected a per-cert Reject"),
+            }
+        }
+    }
+
+    /// A zeroed (type 0x00) drive cert served GOOD-status for a revoked host
+    /// cert is not proven drive-side: the loop must still try, and accept, the
+    /// next host cert.
+    #[test]
+    fn zeroed_drive_cert_for_one_host_cert_still_tries_the_next() {
+        let mut emu = DriveEmu::new();
+        emu.serve_data_keys = true;
+        emu.zero_drive_cert_reads = 1;
+        let first = dummy_cert();
+        let second = dummy_cert();
+        let ch = run_handshake_v1(&mut emu, &[first, second.clone()])
+            .expect("the second cert authenticates");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+        assert_eq!(emu.certs_sent.len(), 2);
+        assert_eq!(&emu.certs_sent[1][..], &second.certificate[..92]);
     }
 
     /// Once the drive's 1.0 side is proven dead, a later cert with v2 creds
