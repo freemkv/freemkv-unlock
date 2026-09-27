@@ -35,10 +35,10 @@ pub const DEBUG_KNOCK: [u8; 2] = [0xDE, 0xB9];
 /// Response-framing magic leading the [`Verb::Identity`] reply (`b"freemkv"`).
 pub const RESP_MAGIC: &[u8] = b"freemkv";
 
-/// Oldest firmware `(major, minor)` whose grammar this mirror speaks: 0.9 made
-/// wire id `0x06` the consolidated `Encryption` lever. Released 0.8.x (`0x06` =
-/// `Ake`, bus encryption on the separate `0x07`) and 0.7.x (sub-function
-/// grammar) answer the same knock but not this grammar, so they are refused.
+/// Oldest firmware `(major, minor)` this mirror arms: 0.9 made wire id `0x06`
+/// the consolidated `Encryption` lever. Released 0.8.x (`0x06` = `Ake`, separate
+/// `0x07 Bus`) de-busses via `0x06` alone only as a hardware-dependent side
+/// effect (not validated), and 0.7.x uses a sub-function grammar: both refused.
 pub const MIN_FW_VERSION: (u32, u32) = (0, 9);
 
 /// Length of a freemkv (READ BUFFER) CDB.
@@ -475,7 +475,7 @@ impl FeatureStates {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmwareIdentity {
     /// The version token after `freemkv ` (printable non-space ASCII), e.g.
-    /// `"0.9.2"`; empty for the 0.7.x binary-version reply. A Speed cap in the
+    /// `"0.9.2"`; empty if no `freemkv ` token follows the magic. A Speed cap in the
     /// printable range can append one character after the patch number.
     pub version: String,
 }
@@ -819,6 +819,7 @@ impl<'a> FirmwareControl<'a> {
     ///
     /// Issues RESET (every feature → passthrough) and verifies each feature read
     /// back as [`STATE_PASSTHROUGH`]. Rips: nothing — this DISARMS the drive.
+    /// Needs fw >= [`MIN_FW_VERSION`]; raw [`reset`](Self::reset) has no gate.
     pub fn arm_stealth_oem(&mut self) -> Result<()> {
         self.require_supported()?;
         self.reset()?;

@@ -203,19 +203,30 @@ fn identity_parse_ignores_the_appended_flag_table() {
     }
 }
 
-/// Released fw 0.7.x answers `freemkv` + a binary version byte (no banner):
-/// still freemkv, but no version token.
+/// Released fw 0.7.1 answers `freemkv 0.7.1` + zero padding: parsed, but
+/// below MIN_FW_VERSION.
 #[test]
-fn identity_parse_legacy_binary_version_has_no_token() {
+fn identity_parse_legacy_07_is_unsupported() {
+    let mut payload = b"freemkv 0.7.1".to_vec();
+    payload.resize(MEMREAD_LEN, 0);
+    let id = FirmwareIdentity::parse(&payload).expect("has magic");
+    assert_eq!(id.version, "0.7.1");
+    assert!(!id.is_supported());
+}
+
+/// Magic with no ` <version>` token parses as freemkv with an empty version.
+#[test]
+fn identity_parse_without_a_token_has_an_empty_version() {
     let mut payload = RESP_MAGIC.to_vec();
     payload.push(0x01);
     payload.resize(MEMREAD_LEN, 0);
     let id = FirmwareIdentity::parse(&payload).expect("has magic");
     assert_eq!(id.version, "");
+    assert!(!id.is_supported());
 }
 
-/// The supported-grammar predicate: 0.9+ only; 0.8.x (Ake/Bus), 0.7.x (no
-/// token) and garbage are refused. A trailing flag char never moves minor.
+/// The supported-grammar predicate: 0.9+ only; 0.8.x, 0.7.x, an empty token
+/// and garbage are refused. A trailing flag char never moves minor.
 #[test]
 fn identity_is_supported_only_from_min_fw_version() {
     let id = |v: &str| FirmwareIdentity {
@@ -316,7 +327,15 @@ impl ScsiTransport for FwMock {
                 // Non-freemkv: GOOD status but no magic (buffer stays zero).
                 if self.is_freemkv {
                     let s = self.states;
-                    let flags = [s.speed, s.region, s.unrestricted, 0xFF, s.hrl, s.encryption];
+                    // Slot 0x04 (`Bd`, unexposed) at its DEFAULT_FLAGS value.
+                    let flags = [
+                        s.speed,
+                        s.region,
+                        s.unrestricted,
+                        STATE_ON,
+                        s.hrl,
+                        s.encryption,
+                    ];
                     let resp = identity_reply(self.version, flags);
                     let n = resp.len().min(data.len());
                     data[..n].copy_from_slice(&resp[..n]);
@@ -729,9 +748,8 @@ fn arm_by_recipe_enum_dispatches() {
     assert_eq!(m.states.encryption, STATE_OFF);
 }
 
-/// Regression: every recipe refuses firmware whose IDENTITY is not on the
-/// supported grammar (fw 0.8.x: 0x06 is `Ake`, `Bus` separate) and a
-/// non-freemkv drive — before sending any SET/RESET.
+/// Regression: every recipe refuses firmware below MIN_FW_VERSION (fw 0.8.x)
+/// and a non-freemkv drive — before sending any SET/RESET.
 #[test]
 fn arm_refuses_unsupported_firmware_before_any_set() {
     let recipes = [
@@ -753,12 +771,12 @@ fn arm_refuses_unsupported_firmware_before_any_set() {
     }
 }
 
-/// Released fw 0.7.x: same knock, binary version byte, old sub-function
+/// Released fw 0.7.1: same knock, `freemkv 0.7.1` reply, old sub-function
 /// grammar (0x02 = Speed). Refused, with no SET sent.
 #[test]
 fn arm_refuses_legacy_07_firmware() {
-    let mut legacy = RESP_MAGIC.to_vec();
-    legacy.push(0x01);
+    let mut legacy = b"freemkv 0.7.1".to_vec();
+    legacy.resize(MEMREAD_LEN, 0);
     let mut t = MockTransport::always(Reply::good(legacy));
     let r = FirmwareControl::new(&mut t).arm(ArmRecipe::BypassBd);
     assert!(r.is_err());

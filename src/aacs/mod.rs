@@ -531,8 +531,8 @@ mod tests {
         }
     }
 
-    /// Regression: fw 0.8.x is not on the supported grammar, so the recipe is
-    /// never sent and the plain cert route runs.
+    /// Regression: fw 0.8.x is below MIN_FW_VERSION, so the recipe is never
+    /// sent and the plain cert route runs.
     #[test]
     fn unsupported_firmware_is_not_armed() {
         let mut emu = handshake::tests::DriveEmu::new();

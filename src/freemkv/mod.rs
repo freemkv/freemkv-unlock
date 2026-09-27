@@ -31,8 +31,8 @@ impl FreemkvUnlocker {
     }
 
     // Issue IDENTITY: Ok(true) only for freemkv firmware on the supported
-    // grammar; Ok(false) if rejected, not freemkv, or too old (0.7.x/0.8.x
-    // answer SETs with GOOD but would not unlock). A dead bus is Err(Transport).
+    // grammar; Ok(false) if rejected, not freemkv, or below MIN_FW_VERSION (older
+    // fw answers SETs with GOOD; unlock not validated). Dead bus: Err(Transport).
     fn identify(&self, scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
         let cdb = build_identity_cdb(RESP_LEN as u16);
         let mut buf = [0u8; RESP_LEN];
@@ -381,20 +381,18 @@ mod tests {
         );
     }
 
-    /// Regression: released fw 0.7.x (binary version byte, old sub-function
+    /// Regression: released fw 0.7.x (`freemkv 0.7.1` reply, old sub-function
     /// grammar where 0x02 = Speed) answers GOOD to every SET. The unlocker must
     /// decline it, not claim a drive it never unlocked.
     #[test]
     fn declines_legacy_07_firmware_without_sending_a_set() {
-        let mut legacy = b"freemkv".to_vec();
-        legacy.push(0x01);
-        let mut t = MockTransport::always(Reply::good(legacy));
+        let mut t = MockTransport::always(Reply::good(identity_payload("0.7.1", &[])));
         assert!(unlock(&mut t).expect("no fault").is_none());
         assert_eq!(t.calls(), 1, "only the IDENTITY probe");
     }
 
-    /// Regression: fw 0.8.x — 0x06 is `Ake` there and bus encryption is the
-    /// separate `Bus` (0x07) lever, so Encryption=off would not de-bus.
+    /// Regression: fw 0.8.x (0x06 = `Ake`, separate `Bus`): de-bus via 0x06
+    /// alone is not validated (hardware-dependent), so decline.
     #[test]
     fn declines_08_firmware_without_sending_a_set() {
         let flags = [0xFF, 0xFF, 0x01, 0x01, 0xFF, 0xFF, 0xFF];
