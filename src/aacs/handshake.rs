@@ -1080,9 +1080,9 @@ fn aacs_authenticate_with_agid(
     drive_nonce.copy_from_slice(&response[4..24]);
     drive_cert.copy_from_slice(&response[24..116]);
 
-    // Verify drive cert against the LA anchor. Only type-0x01 (1.0) is verifiable
-    // here; accepting type-0x11 (2.0) would skip this and the step-6 verify yet run
-    // ECDH (bus-key hole), so reject it — run_cert_handshake routes 0x11 to P-256.
+    // Only a type-0x01 (1.0) cert is verifiable here; accepting 0x11 would skip this and
+    // the step-6 verify yet run ECDH (bus-key hole). 0x11 gets P-256 only when enabled
+    // (AACS2_P256_EXPERIMENTAL, off in production); otherwise the handshake fails.
     if drive_cert[0] == 0x01 {
         if !verify_cert_with_anchor(&drive_cert, la_x, la_y) {
             return Err(V1Fail::DriveCert);
@@ -1093,7 +1093,7 @@ fn aacs_authenticate_with_agid(
             phase = "aacs_cert_unsupported_type",
             cert_type = drive_cert[0],
             "drive certificate is not a verifiable AACS 1.0 (type 0x01) cert on the \
-             1.0 path; rejecting (a genuine 0x11 drive is retried on the native P-256 path)"
+             1.0 path; rejecting"
         );
         // 0x11 is a real 2.0 drive; any other type (e.g. a zeroed cert) is unproven.
         return Err(if drive_cert[0] == 0x11 {
