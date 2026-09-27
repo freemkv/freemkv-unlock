@@ -171,18 +171,6 @@ fn region_state_bytes() {
 
 // ── Identity / states parsing ────────────────────────────────────────────────
 
-/// The fw 0.9.x IDENTITY wire shape (core.rs `identity_blob` + handler):
-/// `freemkv <ver>` with NO NUL, then the 6 raw flag bytes `flag[0x01..=0x06]`,
-/// then zero padding to the 64-byte window.
-fn identity_reply(version: &str, flags: [u8; 6]) -> Vec<u8> {
-    let mut p = RESP_MAGIC.to_vec();
-    p.push(b' ');
-    p.extend_from_slice(version.as_bytes());
-    p.extend_from_slice(&flags);
-    p.resize(MEMREAD_LEN, 0);
-    p
-}
-
 #[test]
 fn identity_parse_reads_version_banner() {
     let payload = identity_reply("0.9.2", [0x00; 6]);
@@ -629,8 +617,7 @@ fn force_region_dvd_rejects_out_of_range_as_caller_error() {
         let mut fw = FirmwareControl::new(&mut m);
         for bad in [0u8, 9] {
             let err = fw.force_region_dvd(bad).unwrap_err();
-            assert_ne!(err, FirmwareError::Rejected, "region {bad}");
-            assert_ne!(err, FirmwareError::Transport, "region {bad}");
+            assert_eq!(err, FirmwareError::InvalidArgument, "region {bad}");
         }
     }
     assert!(m.cdbs.is_empty());
@@ -765,7 +752,11 @@ fn arm_refuses_unsupported_firmware_before_any_set() {
             m.version = version;
             m.is_freemkv = freemkv;
             let r = FirmwareControl::new(&mut m).arm(recipe);
-            assert!(r.is_err(), "{recipe:?} on {version}/{freemkv}");
+            assert_eq!(
+                r,
+                Err(FirmwareError::UnsupportedFirmware),
+                "{recipe:?} on {version}/{freemkv}"
+            );
             assert_eq!(m.verbs(), vec![Verb::Identity as u8], "{recipe:?}");
         }
     }
@@ -779,7 +770,7 @@ fn arm_refuses_legacy_07_firmware() {
     legacy.resize(MEMREAD_LEN, 0);
     let mut t = MockTransport::always(Reply::good(legacy));
     let r = FirmwareControl::new(&mut t).arm(ArmRecipe::BypassBd);
-    assert!(r.is_err());
+    assert_eq!(r, Err(FirmwareError::UnsupportedFirmware));
     assert_eq!(t.calls(), 1);
 }
 

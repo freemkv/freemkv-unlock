@@ -848,6 +848,19 @@ impl<'a> FirmwareControl<'a> {
     }
 }
 
+/// Test fixture: the fw 0.9.x IDENTITY wire shape (core.rs `identity_blob` +
+/// handler): `freemkv <ver>` with NO NUL, then the 6 raw flag bytes
+/// `flag[0x01..=0x06]`, then zero padding to the 64-byte window.
+#[cfg(test)]
+pub(crate) fn identity_reply(version: &str, flags: [u8; 6]) -> Vec<u8> {
+    let mut p = RESP_MAGIC.to_vec();
+    p.push(b' ');
+    p.extend_from_slice(version.as_bytes());
+    p.extend_from_slice(&flags);
+    p.resize(MEMREAD_LEN, 0);
+    p
+}
+
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;

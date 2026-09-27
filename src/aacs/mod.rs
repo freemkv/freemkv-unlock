@@ -418,9 +418,9 @@ mod tests {
             let verb = cdb[CDB_VERB];
             let f = (cdb[CDB_FEATURE] as usize).min(6);
             if verb == Verb::Identity as u8 {
-                let mut p = b"freemkv ".to_vec();
-                p.extend_from_slice(self.version.as_bytes());
-                p.extend_from_slice(&self.flags[1..]);
+                let mut flags = [0u8; 6];
+                flags.copy_from_slice(&self.flags[1..]);
+                let mut p = crate::firmware::identity_reply(self.version, flags);
                 p.resize(data.len(), 0);
                 data.copy_from_slice(&p[..data.len()]);
                 return status(0, data.len());
@@ -490,6 +490,28 @@ mod tests {
             assert_eq!(out.vid, Some([0x42; 16]), "{recipe:?}");
             assert_eq!(out.bus_key, None, "{recipe:?}: no double bus-decrypt");
             assert!(!t.ran_cert_ake(), "{recipe:?}");
+        }
+    }
+
+    /// Armed Encryption=off, then the bare VID read: a dead bus there aborts
+    /// with Transport; a drive rejection is still an unlock, just without a VID.
+    #[test]
+    fn encryption_off_arm_then_bare_vid_failure() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        for (reply, want) in [
+            (Reply::TransportFault, Err(UnlockError::Transport)),
+            (Reply::illegal_request(), Ok(Some((None, None)))),
+            (Reply::illegal_request_as_err(), Ok(Some((None, None)))),
+        ] {
+            let mut t = FwFront::new(MockTransport::always(reply));
+            let id = id();
+            let got = AacsUnlocker::new(vec![host_cert()])
+                .arm_before_unlock(ArmRecipe::BypassBd)
+                .unlock(&mut t, &aacs_ctx(&id))
+                .map(|o| o.map(|u| (u.vid, u.bus_key)));
+            assert_eq!(got, want);
+            assert!(t.sent_a_set(), "the drive was armed first");
+            assert!(!t.ran_cert_ake());
         }
     }
 

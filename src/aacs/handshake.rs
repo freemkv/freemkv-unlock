@@ -4769,6 +4769,39 @@ pub(crate) mod tests {
         );
     }
 
+    /// With P-256 enabled, a v2 cert shorter than 132 bytes is not usable v2
+    /// creds: with a dead v1 pairing it is skipped up front, burns no wedge-guard
+    /// attempt, and a later valid cert is still reached.
+    #[test]
+    fn short_v2_cert_is_skipped_up_front_under_p256() {
+        let short_v2 = || {
+            let mut hc = with_v2_creds(mispaired_host_cert());
+            hc.certificate_v2.as_mut().expect("v2 cert").truncate(100);
+            hc
+        };
+        let mut drive = HybridDrive::new();
+        let (l1x, l1y) = (drive.la1_x, drive.la1_y);
+        let (l2x, l2y) = (drive.la2_x, drive.la2_y);
+        let mut certs = vec![short_v2(), short_v2(), short_v2()];
+        certs.push(with_v2_creds(mispaired_host_cert()));
+        let ch =
+            run_cert_handshake_with_anchors(&mut drive, &certs, (&l1x, &l1y), (&l2x, &l2y), true)
+                .expect("the valid 4th cert is reached and completes P-256");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let err = run_cert_handshake_with_anchors(
+            &mut t,
+            &[short_v2()],
+            (&l1x, &l1y),
+            (&l2x, &l2y),
+            true,
+        )
+        .expect_err("a short v2 cert cannot authenticate");
+        assert_eq!(err, crate::UnlockError::NoUsableHostCert);
+        assert_eq!(t.calls(), 0);
+    }
+
     /// A non-Bus-Encryption-Capable drive (drive cert byte 1 bit 0 clear) is
     /// never asked for the read data key: `read_data_key` is None and, since
     /// nothing failed, `read_data_key_err` is None too (libaacs parity).
