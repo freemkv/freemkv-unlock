@@ -76,6 +76,7 @@ impl Error {
     }
 
     /// The parsed sense for a CHECK CONDITION SCSI error, else `None`.
+    #[cfg(test)]
     pub fn scsi_sense(&self) -> Option<ScsiSense> {
         match self {
             Error::Scsi { sense, .. } => *sense,
