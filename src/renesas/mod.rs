@@ -6,7 +6,7 @@
 //! Renesas drive is named honestly. It does not modify drive state; AACS bus
 //! decryption is handled by the host cert.
 
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
 
 /// READ_BUFFER mode 0x02, buffer 0xF1 — the Renesas vendor identity buffer.
@@ -37,7 +37,7 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
         // Only a senseless transport-failure status is a dead bus; anything
         // else the transport reports as `Err` is the drive refusing.
         Err(e) => {
-            if crate::scsi::is_dead_bus(&e) {
+            if is_dead_bus(&e) {
                 tracing::warn!(
                     target: "freemkv::disc",
                     phase = "renesas_probe_transport_fault",
@@ -86,7 +86,7 @@ impl Renesas {
         // fire-and-forget (payload-less); its own status is not the signal.
         match scsi.execute(&KNOCK_A5AAAA_CDB, DataDirection::None, &mut [], 5_000) {
             Ok(_) => {}
-            Err(e) if crate::scsi::is_dead_bus(&e) => return Err(UnlockError::Transport),
+            Err(e) if is_dead_bus(&e) => return Err(UnlockError::Transport),
             Err(_) => {} // a drive that refuses the knock still gets the B read tried
         }
         read_is_good(scsi, &RB_B0_500000_CDB)
@@ -104,7 +104,7 @@ fn read_is_good(
     match scsi.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000) {
         Ok(r) => Ok(r.status == 0),
         Err(e) => {
-            if crate::scsi::is_dead_bus(&e) {
+            if is_dead_bus(&e) {
                 return Err(UnlockError::Transport);
             }
             Ok(false)
@@ -386,6 +386,26 @@ mod tests {
             .position(|c| c.get(2) == Some(&0xB0) && c.get(3) == Some(&0x50))
             .expect("B read issued");
         assert!(a < knock && knock < b, "knock must run between A and B");
+    }
+
+    /// A dead bus only at the knock (recovered afterwards) still aborts with
+    /// Transport: the B read must never be sent.
+    #[test]
+    fn dead_bus_at_the_knock_aborts_before_the_b_read() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let script = vec![
+            Reply::good(renesas_payload()),
+            Reply::illegal_request(),
+            Reply::TransportFault,
+        ];
+        let mut t = MockTransport::scripted(script, Reply::good(vec![0u8; 164]));
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert_eq!(
+            Renesas::new().unlock(&mut t, &ctx).unwrap_err(),
+            UnlockError::Transport
+        );
+        assert_eq!(t.calls(), 3, "no B read after the dead knock");
     }
 
     // A recognized Renesas drive that REFUSES the vendor open read must

@@ -4769,14 +4769,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// With P-256 enabled, a v2 cert shorter than 132 bytes is not usable v2
-    /// creds: with a dead v1 pairing it is skipped up front, burns no wedge-guard
-    /// attempt, and a later valid cert is still reached.
+    /// With P-256 enabled, a v2 cert shorter than 132 bytes (131 here) is not
+    /// usable v2 creds: with a dead v1 pairing it is skipped up front, burns no
+    /// wedge-guard attempt, and a later valid 132-byte cert is still tried.
     #[test]
     fn short_v2_cert_is_skipped_up_front_under_p256() {
         let short_v2 = || {
             let mut hc = with_v2_creds(mispaired_host_cert());
-            hc.certificate_v2.as_mut().expect("v2 cert").truncate(100);
+            hc.certificate_v2.as_mut().expect("v2 cert").truncate(131);
             hc
         };
         let mut drive = HybridDrive::new();
@@ -4784,9 +4784,10 @@ pub(crate) mod tests {
         let (l2x, l2y) = (drive.la2_x, drive.la2_y);
         let mut certs = vec![short_v2(), short_v2(), short_v2()];
         certs.push(with_v2_creds(mispaired_host_cert()));
+        assert_eq!(certs[3].certificate_v2.as_ref().map(Vec::len), Some(132));
         let ch =
             run_cert_handshake_with_anchors(&mut drive, &certs, (&l1x, &l1y), (&l2x, &l2y), true)
-                .expect("the valid 4th cert is reached and completes P-256");
+                .expect("the 132-byte 4th cert is tried and completes P-256");
         assert_eq!(ch.volume_id, [0x5Au8; 16]);
 
         let mut t = MockTransport::always(Reply::illegal_request());
