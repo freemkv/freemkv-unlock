@@ -22,7 +22,7 @@ mod css;
 // drive to raw reads (freemkv / MT1959 / Renesas). See `vid`.
 mod vid;
 // The bare best-effort AACS Volume ID read (`0xAD` fmt `0x80`) — public so a
-// harness armed `Ake=null` can read the VID with NO cert AKE and prove no
+// harness armed `Encryption=off` can read the VID with NO cert AKE and prove no
 // SEND KEY crossed the bus.
 pub use vid::read_aacs_vid;
 // `ld` is public only for its drive-profile catalog + (under `emulation`) the handshake wire
@@ -125,8 +125,8 @@ impl<'a> UnlockCtx<'a> {
 /// even on success) and, for the cert route, the bus key the read path applies
 /// to de-bus content. Returned inside the `Some` of [`Unlocker::unlock`]; there
 /// is no `drive_unlocked` flag — "unlocked" is simply `unlock()` returning
-/// `Some`, uniformly for every route.
-#[derive(Clone, Default)]
+/// `Some`, uniformly for every route. Both fields are wiped on drop.
+#[derive(Clone, Default, zeroize::ZeroizeOnDrop)]
 pub struct Unlocked {
     pub vid: Option<[u8; 16]>,
     pub bus_key: Option<[u8; 16]>,
@@ -280,6 +280,14 @@ mod tests {
         assert!(s.contains("[redacted]"), "must mark redaction: {s}");
         // Presence (Some/None) stays observable.
         assert!(s.contains("Some"), "must still show a key WAS present: {s}");
+    }
+
+    // `vid`/`bus_key` leave the crate in `Unlocked`; wipe them (and every
+    // clone) on drop. Fails to compile if the derive is removed.
+    #[test]
+    fn unlocked_zeroizes_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Unlocked>();
     }
 
     // `private_key`/`private_key_v2` are the raw host private keys; `Debug` must

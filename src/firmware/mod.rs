@@ -17,7 +17,7 @@
 //! DumpAll instead encodes a 32-bit address in `cdb[5..9]` and returns MEMREAD_LEN bytes.
 //! Features default to passthrough. Reset selects OEM, built-in defaults or saved flash state.
 
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 
 // ── Wire constants (mirror of abi.rs) ────────────────────────────────────────
 
@@ -34,6 +34,12 @@ pub const KNOCK: [u8; 2] = [0xC0, 0xDE];
 pub const DEBUG_KNOCK: [u8; 2] = [0xDE, 0xB9];
 /// Response-framing magic leading the [`Verb::Identity`] reply (`b"freemkv"`).
 pub const RESP_MAGIC: &[u8] = b"freemkv";
+
+/// Oldest firmware `(major, minor)` whose grammar this mirror speaks: 0.9 made
+/// wire id `0x06` the consolidated `Encryption` lever. Released 0.8.x (`0x06` =
+/// `Ake`, bus encryption on the separate `0x07`) and 0.7.x (sub-function
+/// grammar) answer the same knock but not this grammar, so they are refused.
+pub const MIN_FW_VERSION: (u32, u32) = (0, 9);
 
 /// Length of a freemkv (READ BUFFER) CDB.
 pub const CDB_LEN: usize = 10;
@@ -123,7 +129,8 @@ pub const RESET_TO_OEM: u8 = 0xFF;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Verb {
-    /// Status/ping — returns [`RESP_MAGIC`] + version + the feature-state table.
+    /// Status/ping — returns `freemkv <version>` (no NUL), then the raw
+    /// feature-flag bytes `flag[0x01..=0x06]`, zero-padded to the window.
     Identity = 0x01,
     /// Set one feature (`cdb[5]`) to a state (`cdb[6]`).
     Set = 0x02,
@@ -191,11 +198,12 @@ pub enum Feature {
     /// [`REGION_BD_A`]/`_B`/`_C` (`0x0A`/`0x0B`/`0x0C`) = force BD region A/B/C;
     /// [`REGION_FREE`] (`0x0F`) = region-free (any disc plays).
     Region = 0x02,
-    /// Unrestricted (BD/UHD) capability widen gate — fw 0.9.2 unified the former
-    /// separate BD/UHD accept gates. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM;
-    /// [`STATE_OFF`] (`0x00`) = No (currently no-op on byte-extraction classifiers
-    /// like BU40N, pending RE); [`STATE_ON`] (`0x01`) = Yes (accept BD/UHD).
-    /// Wire id `0x04` (was `Bd`) is retired: unused/reserved, fw treats as no-op.
+    /// Unrestricted (BD/UHD) capability widen gate. [`STATE_PASSTHROUGH`]
+    /// (`0xFF`) = OEM; [`STATE_OFF`] (`0x00`) = No (currently no-op on
+    /// byte-extraction classifiers like BU40N, pending RE); [`STATE_ON`] (`0x01`)
+    /// = Yes. fw 0.9.2 folds BD into this gate by name only: its BD-refuse detour
+    /// still reads wire id `0x04` (`Bd`, deprecated), which this mirror does not
+    /// expose, so on 0.9.2 this lever governs UHD acceptance.
     Unrestricted = 0x03,
     /// Host Revocation List handling on the cert path. [`STATE_PASSTHROUGH`]
     /// (`0xFF`) = OEM enforce; [`STATE_OFF`] (`0x00`) = off (skip the HRL lookup —
@@ -212,8 +220,8 @@ pub enum Feature {
     Encryption = 0x06,
 }
 
-/// The set of all features, in the canonical order the IDENTITY feature-state
-/// table serialises them (and the order [`FirmwareControl::states`] probes).
+/// Every exposed feature, in wire-id order (the order [`FirmwareControl::states`]
+/// probes). The IDENTITY flag table also carries the unexposed `0x04` slot.
 pub const ALL_FEATURES: [Feature; 5] = [
     Feature::Speed,
     Feature::Region,
@@ -390,6 +398,11 @@ pub enum FirmwareError {
     /// The drive rejected the command (CHECK CONDITION / vendor refusal). Not a
     /// freemkv drive, or the feature/state is unsupported.
     Rejected,
+    /// IDENTITY did not report freemkv firmware at or above [`MIN_FW_VERSION`];
+    /// a recipe was refused before any SET/RESET was sent.
+    UnsupportedFirmware,
+    /// A caller argument was out of range; nothing was sent to the drive.
+    InvalidArgument,
     /// A verify-after-set (`SET` then `GET`) read back a state that did not
     /// match what was written. Carries `(feature, wanted, got)`.
     VerifyFailed {
@@ -403,13 +416,6 @@ pub enum FirmwareError {
 
 /// Result of a firmware command.
 pub type Result<T> = std::result::Result<T, FirmwareError>;
-
-/// Whether a transport error is a genuine dead bus (a senseless
-/// transport-failure status) rather than a drive rejection surfaced through a
-/// non-conforming transport (`Err` carrying a sense).
-fn is_dead_bus(e: &crate::scsi::ScsiError) -> bool {
-    e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none()
-}
 
 // ── Parsed replies ───────────────────────────────────────────────────────────
 
@@ -463,29 +469,49 @@ impl FeatureStates {
 }
 
 /// A parsed [`Verb::Identity`] reply. Only present when the reply led with
-/// [`RESP_MAGIC`]. The firmware answers IDENTITY with a human banner
-/// `freemkv <version>` (NUL-padded) — there is NO binary state table in the
-/// reply, so this carries only the version string; read the live feature states
+/// [`RESP_MAGIC`]. The reply is `freemkv <version>` with no terminator, then the
+/// raw feature-flag bytes; only the version is parsed — read the live states
 /// via [`FirmwareControl::states`]/[`get`](FirmwareControl::get).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirmwareIdentity {
-    /// Firmware version string, the banner text after [`RESP_MAGIC`] up to the
-    /// first NUL, trimmed (e.g. `"0.7.1"`).
+    /// The version token after `freemkv ` (printable non-space ASCII), e.g.
+    /// `"0.9.2"`; empty for the 0.7.x binary-version reply. A Speed cap in the
+    /// printable range can append one character after the patch number.
     pub version: String,
 }
 
 impl FirmwareIdentity {
     /// Parse an IDENTITY data-in payload. `None` unless it leads with
-    /// [`RESP_MAGIC`] (i.e. not freemkv firmware). Layout: `RESP_MAGIC` (7) +
-    /// ASCII version banner, NUL-terminated/padded.
+    /// [`RESP_MAGIC`] (i.e. not freemkv firmware).
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         if !verify_response(bytes) {
             return None;
         }
-        let tail = &bytes[RESP_MAGIC.len()..];
-        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-        let version = String::from_utf8_lossy(&tail[..end]).trim().to_string();
+        let version = match bytes[RESP_MAGIC.len()..].split_first() {
+            Some((b' ', rest)) => rest
+                .iter()
+                .take_while(|b| b.is_ascii_graphic())
+                .map(|&b| char::from(b))
+                .collect(),
+            _ => String::new(),
+        };
         Some(FirmwareIdentity { version })
+    }
+
+    /// Whether this firmware speaks the grammar this mirror sends (version at
+    /// or above [`MIN_FW_VERSION`]). `false` for an unparseable version.
+    pub fn is_supported(&self) -> bool {
+        self.major_minor().is_some_and(|v| v >= MIN_FW_VERSION)
+    }
+
+    fn major_minor(&self) -> Option<(u32, u32)> {
+        let mut parts = self.version.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?;
+        let digits = minor
+            .find(|c: char| !c.is_ascii_digit())
+            .map_or(minor, |end| &minor[..end]);
+        Some((major, digits.parse().ok()?))
     }
 }
 
@@ -509,6 +535,17 @@ pub enum ArmRecipe {
     StealthOem,
 }
 
+impl ArmRecipe {
+    /// Whether the recipe sets `Encryption = off`: the drive then acts
+    /// pre-authenticated and serves de-bussed content (no cert AKE needed).
+    pub(crate) fn disables_encryption(self) -> bool {
+        matches!(
+            self,
+            ArmRecipe::OemUhd | ArmRecipe::BypassBd | ArmRecipe::BypassUhd
+        )
+    }
+}
+
 // ── FirmwareControl ──────────────────────────────────────────────────────────
 
 /// A timeout every firmware command uses (ms). Matches the wider unlocker.
@@ -518,13 +555,14 @@ const CMD_TIMEOUT_MS: u32 = 5_000;
 /// [`ScsiTransport`]. Borrows the transport for the lifetime of the control.
 ///
 /// ```no_run
-/// # use freemkv_unlock::firmware::{FirmwareControl, Feature};
-/// # fn demo(scsi: &mut dyn freemkv_unlock::scsi::ScsiTransport) {
+/// # use freemkv_unlock::firmware::{FirmwareControl, FirmwareError};
+/// # fn demo(scsi: &mut dyn freemkv_unlock::scsi::ScsiTransport) -> Result<(), FirmwareError> {
 /// let mut fw = FirmwareControl::new(scsi);
-/// if fw.is_freemkv().unwrap_or(false) {
-///     // Encryption off on a UHD disc, revocation ignored:
-///     let _ = fw.arm_oem_uhd();
-/// }
+/// // Encryption off on a UHD disc, revocation ignored. Refused with
+/// // `UnsupportedFirmware` unless IDENTITY reports a supported freemkv drive;
+/// // `Transport` (dead bus) must abort the caller.
+/// fw.arm_oem_uhd()?;
+/// # Ok(())
 /// # }
 /// ```
 pub struct FirmwareControl<'a> {
@@ -556,9 +594,8 @@ impl<'a> FirmwareControl<'a> {
     }
 
     /// Send IDENTITY and parse the magic + version banner.
-    /// `Ok(None)` if the drive answered but the reply lacked [`RESP_MAGIC`] (not
-    /// freemkv firmware); `Err(Transport)` only on a dead bus, `Err(Rejected)`
-    /// if the drive refused the command outright (also "not freemkv").
+    /// `Ok(None)` if the reply lacked [`RESP_MAGIC`] or the drive refused the
+    /// command (not freemkv firmware); `Err(Transport)` only on a dead bus.
     pub fn identity(&mut self) -> Result<Option<FirmwareIdentity>> {
         let cdb = build_identity_cdb(MEMREAD_LEN as u16);
         match self.exec_in(&cdb) {
@@ -633,7 +670,9 @@ impl<'a> FirmwareControl<'a> {
         self.exec_in(&cdb).map(|_| ())
     }
 
-    /// SET a feature, then GET it back and confirm the state stuck.
+    /// SET a feature, then GET it back and confirm the state stuck. Blind spot:
+    /// fw answers a refused/out-of-range GET with GOOD + zeros, which reads as
+    /// [`STATE_OFF`]; the recipes gate on [`Self::require_supported`] first.
     fn set_verify(&mut self, feature: Feature, state: u8) -> Result<()> {
         self.set(feature, state)?;
         let got = self.get(feature)?;
@@ -645,6 +684,15 @@ impl<'a> FirmwareControl<'a> {
                 wanted: state,
                 got,
             })
+        }
+    }
+
+    /// Refuse (`UnsupportedFirmware`) unless IDENTITY reports a supported
+    /// freemkv firmware; every recipe calls this before its first SET/RESET.
+    fn require_supported(&mut self) -> Result<()> {
+        match self.identity()? {
+            Some(id) if id.is_supported() => Ok(()),
+            _ => Err(FirmwareError::UnsupportedFirmware),
         }
     }
 
@@ -701,11 +749,12 @@ impl<'a> FirmwareControl<'a> {
     pub fn force_region_bd(&mut self, region: BdRegion) -> Result<()> {
         self.set(Feature::Region, region.state())
     }
-    /// Force a specific DVD region (1..=8). Returns [`FirmwareError::Rejected`]
-    /// for an out-of-range region rather than sending a malformed state.
+    /// Force a specific DVD region (1..=8). Returns
+    /// [`FirmwareError::InvalidArgument`] for an out-of-range region without
+    /// touching the drive.
     pub fn force_region_dvd(&mut self, region: u8) -> Result<()> {
         if !(1..=8).contains(&region) {
-            return Err(FirmwareError::Rejected);
+            return Err(FirmwareError::InvalidArgument);
         }
         self.set(Feature::Region, REGION_DVD_BASE + region)
     }
@@ -715,6 +764,8 @@ impl<'a> FirmwareControl<'a> {
     }
 
     // ── Named recipes (the "modes" table) ─────────────────────────────────────
+    // Each recipe first issues IDENTITY and refuses unsupported firmware. A
+    // recipe that fails midway leaves its earlier SETs applied (no rollback).
 
     /// **arm_oem_bd** — OEM-style Blu-ray (AACS 1.0) rip with a REAL AKE, only
     /// revocation disabled.
@@ -724,6 +775,7 @@ impl<'a> FirmwareControl<'a> {
     /// host-cert handshake and returns bus-encrypted content, so the host
     /// performs the AKE and de-busses. Rips: BD with an otherwise-revoked cert.
     pub fn arm_oem_bd(&mut self) -> Result<()> {
+        self.require_supported()?;
         self.set_verify(Feature::Hrl, STATE_OFF)
     }
 
@@ -734,6 +786,7 @@ impl<'a> FirmwareControl<'a> {
     /// (content de-bussed — the consolidated cert/bus bypass). Rips: UHD via
     /// the OEM path.
     pub fn arm_oem_uhd(&mut self) -> Result<()> {
+        self.require_supported()?;
         self.set_verify(Feature::Unrestricted, STATE_ON)?;
         self.set_verify(Feature::Hrl, STATE_OFF)?;
         self.set_verify(Feature::Encryption, STATE_OFF)
@@ -745,6 +798,7 @@ impl<'a> FirmwareControl<'a> {
     /// pre-authenticated, no handshake, content de-bussed) and `Hrl = skip`
     /// (revocation off). Rips: BD with no cert.
     pub fn arm_bypass_bd(&mut self) -> Result<()> {
+        self.require_supported()?;
         self.set_verify(Feature::Hrl, STATE_OFF)?;
         self.set_verify(Feature::Encryption, STATE_OFF)
     }
@@ -755,6 +809,7 @@ impl<'a> FirmwareControl<'a> {
     /// (the consolidated cert/bus bypass), and `Hrl = skip` (revocation off).
     /// Rips: UHD with no cert.
     pub fn arm_bypass_uhd(&mut self) -> Result<()> {
+        self.require_supported()?;
         self.set_verify(Feature::Unrestricted, STATE_ON)?;
         self.set_verify(Feature::Hrl, STATE_OFF)?;
         self.set_verify(Feature::Encryption, STATE_OFF)
@@ -765,6 +820,7 @@ impl<'a> FirmwareControl<'a> {
     /// Issues RESET (every feature → passthrough) and verifies each feature read
     /// back as [`STATE_PASSTHROUGH`]. Rips: nothing — this DISARMS the drive.
     pub fn arm_stealth_oem(&mut self) -> Result<()> {
+        self.require_supported()?;
         self.reset()?;
         for feature in ALL_FEATURES {
             let got = self.get(feature)?;

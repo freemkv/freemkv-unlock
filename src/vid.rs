@@ -11,7 +11,7 @@
 //! supply the key).
 
 use crate::UnlockError;
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 
 /// The 16-byte AACS Volume ID.
 const VID_LEN: usize = 16;
@@ -33,12 +33,6 @@ pub(crate) fn build_vid_cdb() -> [u8; 12] {
     cdb[9] = (VID_STRUCT_LEN & 0xFF) as u8;
     // cdb[10] = agid << 6; AGID 0 on the bare path (no AKE) → 0.
     cdb
-}
-
-/// A senseless transport-failure status is a genuine dead bus, not a drive
-/// rejection surfaced through a non-conforming transport (`Err` with a sense).
-fn is_dead_bus(e: &crate::scsi::ScsiError) -> bool {
-    e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none()
 }
 
 /// Read the AACS VID with the bare `0xAD` fmt `0x80` (valid only after the drive

@@ -1,35 +1,26 @@
 //! Unlock drives that identify themselves as freemkv firmware.
 //!
-//! The vendor IDENTITY response must start with `b"freemkv"`. Commands use the
+//! The vendor IDENTITY response must parse as a [`FirmwareIdentity`] on the
+//! supported grammar ([`FirmwareIdentity::is_supported`]). Commands use the
 //! builders in [`crate::firmware`], which mirror the firmware ABI.
-//! Unlocking sets Region to free, Speed to max, and Encryption to [`crate::firmware::STATE_OFF`].
+//! Unlocking sets Region to free, Speed to max, Unrestricted on, and Encryption
+//! to [`crate::firmware::STATE_OFF`].
 //! Encryption-off disables the certificate/bus barrier; the retired Bus feature
 //! must not be used as a substitute.
 
 use crate::firmware::{
-    Feature, MEMREAD_LEN, MIN_ALLOC_LEN, REGION_FREE, RESP_MAGIC, SPEED_MAX, STATE_OFF,
-    build_identity_cdb, build_memread_cdb, build_set_cdb,
+    Feature, FirmwareIdentity, MEMREAD_LEN, MIN_ALLOC_LEN, REGION_FREE, SPEED_MAX, STATE_OFF,
+    STATE_ON, build_identity_cdb, build_memread_cdb, build_set_cdb,
 };
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
 
-/// The ASCII magic leading the IDENTITY reply — the ENTIRE freemkv-detection
-/// mechanism (no bundled profile database; the firmware self-identifies).
-const IDENTITY_MARKER: &[u8] = RESP_MAGIC;
-
 /// Allocation the IDENTITY / DUMPALL data-in phase reads back (a fixed 64-byte
-/// window, matching [`firmware::MEMREAD_LEN`]).
+/// window, matching [`MEMREAD_LEN`]).
 const RESP_LEN: usize = MEMREAD_LEN;
 
-/// Whether a transport error is a genuine dead bus (a senseless
-/// transport-failure status) rather than a drive rejection surfaced through a
-/// non-conforming transport (`Err` carrying a sense).
-fn is_dead_bus(e: &crate::scsi::ScsiError) -> bool {
-    e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none()
-}
-
-// The freemkv custom-firmware unlocker. Detection: IDENTITY, checking the reply
-// starts "freemkv" — no bundled profile catalog needed, unlike
+// The freemkv custom-firmware unlocker. Detection: IDENTITY on a supported
+// firmware version — no bundled profile catalog needed, unlike
 // crate::ld::LdUnlocker. Stateless: `unlock()` returns what it learned.
 #[derive(Default)]
 pub struct FreemkvUnlocker;
@@ -39,25 +30,28 @@ impl FreemkvUnlocker {
         FreemkvUnlocker
     }
 
-    // Issue IDENTITY: Ok(true) if the reply starts "freemkv", Ok(false) if
-    // rejected/mismatched (not this firmware). A dead bus is Err(Transport) —
-    // this is the FIRST command, so a transport fault must abort.
+    // Issue IDENTITY: Ok(true) only for freemkv firmware on the supported
+    // grammar; Ok(false) if rejected, not freemkv, or too old (0.7.x/0.8.x
+    // answer SETs with GOOD but would not unlock). A dead bus is Err(Transport).
     fn identify(&self, scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
         let cdb = build_identity_cdb(RESP_LEN as u16);
         let mut buf = [0u8; RESP_LEN];
         match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
             Ok(r) => {
-                let matched = r.status == 0
-                    && r.bytes_transferred >= IDENTITY_MARKER.len()
-                    && buf[..IDENTITY_MARKER.len()] == *IDENTITY_MARKER;
-                if !matched {
+                let n = r.bytes_transferred.min(buf.len());
+                let id = (r.status == 0)
+                    .then(|| FirmwareIdentity::parse(&buf[..n]))
+                    .flatten();
+                let supported = id.as_ref().is_some_and(FirmwareIdentity::is_supported);
+                if !supported {
                     tracing::debug!(
                         target: "freemkv::disc",
                         phase = "freemkv_identity_no_match",
-                        "IDENTITY probe did not report freemkv firmware"
+                        version = id.as_ref().map(|i| i.version.as_str()),
+                        "IDENTITY probe did not report supported freemkv firmware"
                     );
                 }
-                Ok(matched)
+                Ok(supported)
             }
             Err(e) => {
                 if is_dead_bus(&e) {
@@ -151,8 +145,8 @@ impl FreemkvUnlocker {
     }
 
     // Full freemkv unlock: IDENTITY (hard gate) → Set(Region,free) →
-    // Set(Speed,max) (best-effort) → Set(Encryption,off) (LOAD-BEARING —
-    // consolidated cert/bus bypass) → bare 0xAD VID (best-effort).
+    // Set(Speed,max) → Set(Unrestricted,on) (best-effort) → Set(Encryption,off)
+    // (LOAD-BEARING — consolidated cert/bus bypass) → bare 0xAD VID (best-effort).
     fn full_unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -182,6 +176,12 @@ impl FreemkvUnlocker {
         // Region-free + riplock lift (best-effort features).
         best_effort(self.set(scsi, Feature::Region, REGION_FREE), "region")?;
         best_effort(self.set(scsi, Feature::Speed, SPEED_MAX), "speed")?;
+        // ABI full-bypass recipe: engage BD/UHD discs rather than rely on the
+        // RAM defaults (RESET_TO_OEM or a saved config may leave it off).
+        best_effort(
+            self.set(scsi, Feature::Unrestricted, STATE_ON),
+            "unrestricted",
+        )?;
         // Encryption = off (LOAD-BEARING): the consolidated cert/bus bypass —
         // drive acts pre-authenticated (bare 0xAD returns the VID with no
         // cert/AKE) AND content returns de-bussed. No fallback.
@@ -216,12 +216,13 @@ impl Unlocker for FreemkvUnlocker {
         "freemkv"
     }
 
-    /// Recognise the drive by its IDENTITY knock, lift riplock/region
-    /// (best-effort), null the AKE (the actual unlock), and read the Volume ID
-    /// with a bare `0xAD` (best-effort). `Some` when the null-AKE set succeeded —
-    /// the drive is unlocked whether or not the VID read did; `None` if it isn't
-    /// a freemkv drive; `Err(Transport)` on a dead bus. `ctx` is unused: this
-    /// unlocker self-identifies rather than matching on drive identity.
+    /// Recognise the drive by its IDENTITY knock, lift riplock/region and open
+    /// Unrestricted (best-effort), set Encryption=off (the actual unlock), and
+    /// read the Volume ID with a bare `0xAD` (best-effort). `Some` when the
+    /// Encryption=off set succeeded — the drive is unlocked whether or not the
+    /// VID read did; `None` if it isn't supported freemkv firmware;
+    /// `Err(Transport)` on a dead bus. `ctx` is unused: this unlocker
+    /// self-identifies rather than matching on drive identity.
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -235,10 +236,7 @@ impl Unlocker for FreemkvUnlocker {
 mod tests {
     use super::*;
     use crate::DiscKind;
-    use crate::firmware::{
-        REGION_FREE, RESET_TO_OEM, STATE_OFF, build_identity_cdb, build_memread_cdb,
-        build_reset_cdb, build_set_cdb,
-    };
+    use crate::firmware::{REGION_FREE, STATE_OFF, build_identity_cdb, build_memread_cdb};
     use crate::scsi::mock::{MockTransport, Reply};
     use crate::scsi::{DataDirection, Result, ScsiResult, ScsiTransport};
 
@@ -246,34 +244,19 @@ mod tests {
         UnlockCtx::new(id, DiscKind::Unknown)
     }
 
-    /// Serves a fixed payload with a GOOD status (used for the Identity probe).
-    struct FakeTransport {
-        payload: Vec<u8>,
-    }
-    impl ScsiTransport for FakeTransport {
-        fn execute(
-            &mut self,
-            _cdb: &[u8],
-            _dir: DataDirection,
-            data: &mut [u8],
-            _timeout_ms: u32,
-        ) -> Result<ScsiResult> {
-            let n = self.payload.len().min(data.len());
-            data[..n].copy_from_slice(&self.payload[..n]);
-            Ok(ScsiResult {
-                status: 0,
-                bytes_transferred: n,
-                sense: [0u8; 32],
-            })
-        }
+    /// The fw IDENTITY wire shape: `freemkv <ver>` (no NUL), the raw flag
+    /// table, then zero padding to the 64-byte window.
+    fn identity_payload(version: &str, flags: &[u8]) -> Vec<u8> {
+        let mut p = b"freemkv ".to_vec();
+        p.extend_from_slice(version.as_bytes());
+        p.extend_from_slice(flags);
+        p.resize(RESP_LEN, 0);
+        p
     }
 
+    /// A fresh-boot fw 0.9.2 drive (DEFAULT_FLAGS: Unrestricted + Bd on).
     fn freemkv_identity_payload() -> Vec<u8> {
-        let mut p = vec![0u8; RESP_LEN];
-        let s = b"freemkv";
-        p[..s.len()].copy_from_slice(s);
-        p[s.len()] = 0x42; // version
-        p
+        identity_payload("0.9.2", &[0xFF, 0xFF, 0x01, 0x01, 0xFF, 0xFF])
     }
 
     /// A well-formed format-0x80 VID structure: 4-byte header, 16-byte VID at
@@ -285,22 +268,16 @@ mod tests {
         p
     }
 
-    // ── CDB shape ────────────────────────────────────────────────────────
-
-    /// IDENTITY builds the pinned knock frame with a 64-byte allocation.
-    #[test]
-    fn identity_cdb_is_the_knock_shape() {
-        assert_eq!(
-            build_identity_cdb(RESP_LEN as u16),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x01, 0x00, 0x00, 0x00, 0x40, 0x00]
-        );
+    fn unlock(t: &mut MockTransport) -> std::result::Result<Option<Unlocked>, UnlockError> {
+        let id = crate::DriveId::default();
+        FreemkvUnlocker::new().unlock(t, &ctx(&id))
     }
 
     /// Regression (BU40N fw 0.8.1): a SET issued WITHOUT the data-in phase its
     /// CDB advertises is aborted by the drive (CHECK CONDITION / Aborted Command),
     /// so the unlocker's `set()` MUST read the MIN_ALLOC_LEN table back like
     /// `FirmwareControl::set` — not send `DataDirection::None`. Before the fix
-    /// the whole freemkv unlock failed at `Set(Ake)` and fell back to AACS.
+    /// the whole freemkv unlock failed at the first SET and fell back to AACS.
     #[test]
     fn set_issues_the_required_data_in_phase() {
         struct DataInContract;
@@ -333,33 +310,10 @@ mod tests {
             .expect("SET must succeed by issuing the data-in phase the firmware requires");
     }
 
-    /// Each unlock SET is `Verb::Set` (02) on the right feature id (cdb[5]) with
-    /// the state at cdb[6]; SET floors its data-in allocation at MIN_ALLOC_LEN
-    /// (0x0040 at cdb[7..9]) — the drive aborts a sub-16-byte transfer (HW-confirmed).
-    #[test]
-    fn unlock_set_cdbs_have_the_new_grammar_shape() {
-        // Region-free is REGION_FREE (0x0F) at cdb[6] — 0x01 now forces DVD region 1.
-        assert_eq!(
-            build_set_cdb(Feature::Region, REGION_FREE),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x02, 0x0F, 0x00, 0x40, 0x00]
-        );
-        // Speed max is SPEED_MAX (0x00) — the limiter-off leg of Speed.
-        assert_eq!(
-            build_set_cdb(Feature::Speed, SPEED_MAX),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x01, 0x00, 0x00, 0x40, 0x00]
-        );
-        // Encryption unlock direction is STATE_OFF (0x00) at cdb[6]; wire id
-        // 0x07 (was `Bus`) is retired.
-        assert_eq!(
-            build_set_cdb(Feature::Encryption, STATE_OFF),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x02, 0x06, 0x00, 0x00, 0x40, 0x00]
-        );
-    }
-
     // ── Detection ────────────────────────────────────────────────────────
 
     #[test]
-    fn identify_true_on_freemkv_marker_and_issues_identity_cdb() {
+    fn identify_true_on_supported_firmware_and_issues_identity_cdb() {
         let mut t = MockTransport::always(Reply::good(freemkv_identity_payload()));
         assert!(FreemkvUnlocker::new().identify(&mut t).expect("no fault"));
         assert_eq!(t.cdbs[0], build_identity_cdb(RESP_LEN as u16));
@@ -367,9 +321,7 @@ mod tests {
 
     #[test]
     fn identify_false_on_non_matching_payload() {
-        let mut t = FakeTransport {
-            payload: vec![0u8; RESP_LEN],
-        };
+        let mut t = MockTransport::always(Reply::good(vec![0u8; RESP_LEN]));
         assert!(!FreemkvUnlocker::new().identify(&mut t).expect("no fault"));
     }
 
@@ -377,6 +329,35 @@ mod tests {
     fn identify_false_on_short_response() {
         let mut t = MockTransport::always(Reply::short(freemkv_identity_payload(), 3));
         assert!(!FreemkvUnlocker::new().identify(&mut t).expect("no fault"));
+    }
+
+    /// The status guard decides: a CHECK CONDITION that nonetheless reports a
+    /// full magic-bearing transfer (residual/echoed buffer) is not freemkv.
+    #[test]
+    fn identify_false_on_check_condition_with_a_magic_buffer() {
+        struct CheckConditionWithData;
+        impl ScsiTransport for CheckConditionWithData {
+            fn execute(
+                &mut self,
+                _cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> Result<ScsiResult> {
+                let p = freemkv_identity_payload();
+                data.copy_from_slice(&p[..data.len()]);
+                Ok(ScsiResult {
+                    status: 2,
+                    bytes_transferred: data.len(),
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        assert!(
+            !FreemkvUnlocker::new()
+                .identify(&mut CheckConditionWithData)
+                .expect("no fault")
+        );
     }
 
     #[test]
@@ -400,33 +381,39 @@ mod tests {
         );
     }
 
+    /// Regression: released fw 0.7.x (binary version byte, old sub-function
+    /// grammar where 0x02 = Speed) answers GOOD to every SET. The unlocker must
+    /// decline it, not claim a drive it never unlocked.
+    #[test]
+    fn declines_legacy_07_firmware_without_sending_a_set() {
+        let mut legacy = b"freemkv".to_vec();
+        legacy.push(0x01);
+        let mut t = MockTransport::always(Reply::good(legacy));
+        assert!(unlock(&mut t).expect("no fault").is_none());
+        assert_eq!(t.calls(), 1, "only the IDENTITY probe");
+    }
+
+    /// Regression: fw 0.8.x — 0x06 is `Ake` there and bus encryption is the
+    /// separate `Bus` (0x07) lever, so Encryption=off would not de-bus.
+    #[test]
+    fn declines_08_firmware_without_sending_a_set() {
+        let flags = [0xFF, 0xFF, 0x01, 0x01, 0xFF, 0xFF, 0xFF];
+        let mut t = MockTransport::always(Reply::good(identity_payload("0.8.3", &flags)));
+        assert!(unlock(&mut t).expect("no fault").is_none());
+        assert_eq!(t.calls(), 1, "only the IDENTITY probe");
+    }
+
     // ── Feature sets ──────────────────────────────────────────────────────
 
     #[test]
-    fn set_region_free_issues_the_set_region_on_cdb() {
-        let mut t = MockTransport::always(Reply::good(vec![]));
-        FreemkvUnlocker::new()
-            .set(&mut t, Feature::Region, REGION_FREE)
-            .expect("ok");
-        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Region, REGION_FREE));
-    }
-
-    #[test]
-    fn set_encryption_off_issues_the_set_encryption_cdb() {
-        let mut t = MockTransport::always(Reply::good(vec![]));
-        FreemkvUnlocker::new()
-            .set(&mut t, Feature::Encryption, STATE_OFF)
-            .expect("ok");
-        assert_eq!(t.cdbs[0], build_set_cdb(Feature::Encryption, STATE_OFF));
-    }
-
-    #[test]
     fn set_drive_rejection_is_not_applicable() {
-        let mut t = MockTransport::always(Reply::illegal_request());
-        let err = FreemkvUnlocker::new()
-            .set(&mut t, Feature::Encryption, STATE_OFF)
-            .unwrap_err();
-        assert_eq!(err, UnlockError::NotApplicable);
+        for reply in [Reply::illegal_request(), Reply::illegal_request_as_err()] {
+            let mut t = MockTransport::always(reply.clone());
+            let err = FreemkvUnlocker::new()
+                .set(&mut t, Feature::Encryption, STATE_OFF)
+                .unwrap_err();
+            assert_eq!(err, UnlockError::NotApplicable, "{reply:?}");
+        }
     }
 
     #[test]
@@ -441,78 +428,94 @@ mod tests {
     // ── full_unlock / unlock ─────────────────────────────────────────────
 
     /// The full unlock runs IDENTITY → Set(Region) → Set(Speed) →
-    /// Set(Encryption) → bare VID in order.
+    /// Set(Unrestricted) → Set(Encryption) → bare VID, with the exact wire
+    /// bytes for every vendor SET.
     #[test]
-    fn full_unlock_issues_identity_region_speed_encryption_then_bare_vid() {
+    fn full_unlock_issues_identity_region_speed_unrestricted_encryption_then_bare_vid() {
         let vid = [0x7Cu8; 16];
         let mut t = MockTransport::scripted(
             vec![
                 Reply::good(freemkv_identity_payload()), // IDENTITY
                 Reply::good(vec![]),                     // Set Region
                 Reply::good(vec![]),                     // Set Speed
+                Reply::good(vec![]),                     // Set Unrestricted
                 Reply::good(vec![]),                     // Set Encryption (load-bearing)
                 Reply::good(vid_ds_response(vid)),       // 0xAD bare VID
             ],
             Reply::TransportFault,
         );
-        let id = crate::DriveId::default();
-        let out = FreemkvUnlocker::new()
-            .unlock(&mut t, &ctx(&id))
+        let out = unlock(&mut t)
             .expect("no fault")
             .expect("encryption off ⇒ unlocked");
         assert_eq!(out.vid, Some(vid));
-        assert_eq!(t.cdbs.len(), 5);
-        // The three vendor SETs land on the right features, in order.
+        assert_eq!(out.bus_key, None);
+        assert_eq!(t.cdbs.len(), 6);
         assert_eq!(t.cdbs[0], build_identity_cdb(RESP_LEN as u16));
-        assert_eq!(t.cdbs[1], build_set_cdb(Feature::Region, REGION_FREE));
-        assert_eq!(t.cdbs[2], build_set_cdb(Feature::Speed, SPEED_MAX));
-        assert_eq!(t.cdbs[3], build_set_cdb(Feature::Encryption, STATE_OFF));
-        assert_eq!(t.cdbs[4][0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
+        let set = |f: u8, s: u8| vec![0x3C, 0x0E, 0xC0, 0xDE, 0x02, f, s, 0x00, 0x40, 0x00];
+        assert_eq!(t.cdbs[1], set(0x02, 0x0F), "Region = free");
+        assert_eq!(t.cdbs[2], set(0x01, 0x00), "Speed = max");
+        assert_eq!(t.cdbs[3], set(0x03, 0x01), "Unrestricted = on");
+        assert_eq!(t.cdbs[4], set(0x06, 0x00), "Encryption = off");
+        assert_eq!(t.cdbs[5][0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
     }
 
-    /// A missing region/speed feature does not fail the unlock (best-effort).
+    /// Missing region/speed/unrestricted features do not fail the unlock
+    /// (best-effort), whichever rejection shape the transport uses.
     #[test]
-    fn full_unlock_tolerates_missing_region_and_speed() {
+    fn full_unlock_tolerates_missing_best_effort_features() {
         let vid = [0x3Cu8; 16];
-        let mut t = MockTransport::scripted(
-            vec![
-                Reply::good(freemkv_identity_payload()), // identity
-                Reply::illegal_request(),                // region unsupported
-                Reply::illegal_request(),                // speed unsupported
-                Reply::good(vec![]),                     // null ake
-                Reply::good(vid_ds_response(vid)),       // bare VID
-            ],
-            Reply::TransportFault,
-        );
-        let id = crate::DriveId::default();
-        let out = FreemkvUnlocker::new()
-            .unlock(&mut t, &ctx(&id))
-            .expect("no fault")
-            .expect("unlocked");
-        assert_eq!(out.vid, Some(vid));
+        for reject in [Reply::illegal_request(), Reply::illegal_request_as_err()] {
+            let mut t = MockTransport::scripted(
+                vec![
+                    Reply::good(freemkv_identity_payload()),
+                    reject.clone(), // region
+                    reject.clone(), // speed
+                    reject.clone(), // unrestricted
+                    Reply::good(vec![]),
+                    Reply::good(vid_ds_response(vid)),
+                ],
+                Reply::TransportFault,
+            );
+            let out = unlock(&mut t).expect("no fault").expect("unlocked");
+            assert_eq!(out.vid, Some(vid), "{reject:?}");
+        }
     }
 
-    /// Set(Encryption, off) is LOAD-BEARING: if the drive rejects it, this
-    /// isn't an unlockable freemkv drive, so `unlock()` declines (`None`) and
-    /// falls through — never a hard error.
+    /// Set(Encryption, off) is LOAD-BEARING: if the drive rejects it (either
+    /// shape), `unlock()` declines (`None`) and falls through.
     #[test]
     fn declines_when_disable_encryption_rejected() {
-        let mut t = MockTransport::scripted(
-            vec![
-                Reply::good(freemkv_identity_payload()), // identity
-                Reply::good(vec![]),                     // region
-                Reply::good(vec![]),                     // speed
-                Reply::illegal_request(),                // Set(Encryption,off) REJECTED
-            ],
-            Reply::TransportFault,
-        );
-        let id = crate::DriveId::default();
-        assert!(
-            FreemkvUnlocker::new()
-                .unlock(&mut t, &ctx(&id))
-                .expect("no fault")
-                .is_none()
-        );
+        for reject in [Reply::illegal_request(), Reply::illegal_request_as_err()] {
+            let mut t = MockTransport::scripted(
+                vec![
+                    Reply::good(freemkv_identity_payload()),
+                    Reply::good(vec![]),
+                    Reply::good(vec![]),
+                    Reply::good(vec![]),
+                    reject.clone(), // Set(Encryption,off) REJECTED
+                ],
+                Reply::TransportFault,
+            );
+            assert!(unlock(&mut t).expect("no fault").is_none(), "{reject:?}");
+            assert_eq!(t.calls(), 5, "no VID read after the refusal");
+        }
+    }
+
+    /// A dead bus at ANY step after IDENTITY aborts with `Transport` (never a
+    /// fall-through): each best-effort SET, the load-bearing SET, the VID read.
+    #[test]
+    fn dead_bus_after_identity_aborts_at_every_step() {
+        for good_before_fault in 0..5 {
+            let mut script = vec![Reply::good(freemkv_identity_payload())];
+            script.extend(std::iter::repeat_n(Reply::good(vec![]), good_before_fault));
+            let mut t = MockTransport::scripted(script, Reply::TransportFault);
+            assert_eq!(
+                unlock(&mut t).unwrap_err(),
+                UnlockError::Transport,
+                "fault after {good_before_fault} SETs"
+            );
+            assert_eq!(t.calls(), good_before_fault + 2, "aborted at the fault");
+        }
     }
 
     /// Best-effort VID: Set(Encryption,off) succeeded (drive unlocked), but the
@@ -522,17 +525,16 @@ mod tests {
     fn unlocks_without_vid_when_bare_read_fails() {
         let mut t = MockTransport::scripted(
             vec![
-                Reply::good(freemkv_identity_payload()), // identity
-                Reply::good(vec![]),                     // region
-                Reply::good(vec![]),                     // speed
-                Reply::good(vec![]),                     // Set(Encryption,off)
-                Reply::illegal_request(),                // bare VID: no medium
+                Reply::good(freemkv_identity_payload()),
+                Reply::good(vec![]),
+                Reply::good(vec![]),
+                Reply::good(vec![]),
+                Reply::good(vec![]),      // Set(Encryption,off)
+                Reply::illegal_request(), // bare VID: no medium
             ],
             Reply::TransportFault,
         );
-        let id = crate::DriveId::default();
-        let out = FreemkvUnlocker::new()
-            .unlock(&mut t, &ctx(&id))
+        let out = unlock(&mut t)
             .expect("no fault")
             .expect("unlocked despite no VID");
         assert_eq!(out.vid, None);
@@ -541,25 +543,13 @@ mod tests {
     #[test]
     fn declines_non_freemkv_drive() {
         let mut t = MockTransport::always(Reply::illegal_request());
-        let id = crate::DriveId::default();
-        assert!(
-            FreemkvUnlocker::new()
-                .unlock(&mut t, &ctx(&id))
-                .expect("no fault")
-                .is_none()
-        );
+        assert!(unlock(&mut t).expect("no fault").is_none());
     }
 
     #[test]
     fn transport_fault_propagates() {
         let mut t = MockTransport::always(Reply::TransportFault);
-        let id = crate::DriveId::default();
-        assert_eq!(
-            FreemkvUnlocker::new()
-                .unlock(&mut t, &ctx(&id))
-                .unwrap_err(),
-            UnlockError::Transport
-        );
+        assert_eq!(unlock(&mut t).unwrap_err(), UnlockError::Transport);
     }
 
     // ── DumpAll ──────────────────────────────────────────────────────────
@@ -573,27 +563,16 @@ mod tests {
             .dump_ram(&mut t, 0x01F8_1234)
             .expect("dump ok");
         assert_eq!(got[0], 0xEE);
-        assert_eq!(
-            t.cdbs[0],
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x09, 0x01, 0xF8, 0x12, 0x34, 0x00]
-        );
+        assert_eq!(t.cdbs[0], build_memread_cdb(0x01F8_1234).to_vec());
     }
 
+    /// A GOOD-status short DUMPALL is not a zero-padded RAM window.
     #[test]
-    fn build_memread_cdb_packs_address_big_endian_at_5_to_9() {
-        let cdb = build_memread_cdb(0xDEAD_BEEF);
-        assert_eq!(cdb[4], crate::firmware::Verb::DumpAll as u8);
-        assert_eq!([cdb[5], cdb[6], cdb[7], cdb[8]], [0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(cdb[9], 0x00);
-    }
-
-    /// RESET builds the pinned all-features-passthrough frame (not issued by the
-    /// unlock flow, but pinned here so the shared builder stays honest).
-    #[test]
-    fn reset_cdb_shape() {
+    fn dump_ram_rejects_a_short_transfer() {
+        let mut t = MockTransport::always(Reply::short(vec![0xAB; MEMREAD_LEN], MEMREAD_LEN - 1));
         assert_eq!(
-            build_reset_cdb(RESET_TO_OEM),
-            [0x3C, 0x0E, 0xC0, 0xDE, 0x04, 0x00, 0xFF, 0x00, 0x40, 0x00]
+            FreemkvUnlocker::new().dump_ram(&mut t, 0).unwrap_err(),
+            UnlockError::NotApplicable
         );
     }
 
