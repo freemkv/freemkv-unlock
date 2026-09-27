@@ -1,0 +1,16 @@
+name: doc-links
+
+# Thin caller -> the canonical reusable doc-links gate in freemkv/.github.
+# freemkv-unlock is the leaf crate: no siblings to check out, no [patch].
+on: [push, pull_request]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  doc-links:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
+    uses: freemkv/.github/.github/workflows/guard-doclinks.yml@v1
+    with:
+      self: freemkv-unlock
