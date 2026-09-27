@@ -37,7 +37,7 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
         // Only a senseless transport-failure status is a dead bus; anything
         // else the transport reports as `Err` is the drive refusing.
         Err(e) => {
-            if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() {
+            if crate::scsi::is_dead_bus(&e) {
                 tracing::warn!(
                     target: "freemkv::disc",
                     phase = "renesas_probe_transport_fault",
@@ -86,11 +86,7 @@ impl Renesas {
         // fire-and-forget (payload-less); its own status is not the signal.
         match scsi.execute(&KNOCK_A5AAAA_CDB, DataDirection::None, &mut [], 5_000) {
             Ok(_) => {}
-            Err(e)
-                if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() =>
-            {
-                return Err(UnlockError::Transport);
-            }
+            Err(e) if crate::scsi::is_dead_bus(&e) => return Err(UnlockError::Transport),
             Err(_) => {} // a drive that refuses the knock still gets the B read tried
         }
         read_is_good(scsi, &RB_B0_500000_CDB)
@@ -108,7 +104,7 @@ fn read_is_good(
     match scsi.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000) {
         Ok(r) => Ok(r.status == 0),
         Err(e) => {
-            if e.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none() {
+            if crate::scsi::is_dead_bus(&e) {
                 return Err(UnlockError::Transport);
             }
             Ok(false)
