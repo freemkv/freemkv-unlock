@@ -740,24 +740,6 @@ mod tests {
         assert_ne!(crypt_key(0, 0, &challenge), crypt_key(0, 1, &challenge));
     }
 
-    // Fix 9: the bounds checks are real `assert!`s, not `debug_assert!`s (stripped
-    // in release), so an out-of-range index is a clean panic in EVERY build.
-    // `catch_unwind` holds regardless of the test's build profile.
-    #[test]
-    fn crypt_key_asserts_out_of_range_indices() {
-        let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        // key_type must be < 3.
-        assert!(
-            std::panic::catch_unwind(|| crypt_key(3, 0, &challenge)).is_err(),
-            "key_type out of range must panic (not index OOB)"
-        );
-        // variant must be < 32.
-        assert!(
-            std::panic::catch_unwind(|| crypt_key(0, 32, &challenge)).is_err(),
-            "variant out of range must panic (not index OOB)"
-        );
-    }
-
     #[test]
     fn crypt_key_varies_by_type() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
@@ -847,19 +829,19 @@ mod tests {
         }
     }
 
-    // crypt_key's `key_type < 3` debug_assert must fire for key_type 3
-    // (which would otherwise index PERM_CHALLENGE out of bounds).
+    // crypt_key's `key_type < 3` assert! (not debug_assert!) must fire in
+    // every profile; `expected` rejects the index-OOB panic that would follow.
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "crypt_key: key_type out of range")]
     fn crypt_key_rejects_out_of_range_key_type() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let _ = crypt_key(3, 0, &challenge);
     }
 
-    // crypt_key's `variant < 32` debug_assert must fire for variant 32
-    // (which would otherwise index VARIANTS/PERM_VARIANT out of bounds).
+    // crypt_key's `variant < 32` assert! must fire in every profile, not
+    // the VARIANTS/PERM_VARIANT index-OOB panic that would follow it.
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "crypt_key: variant out of range")]
     fn crypt_key_rejects_out_of_range_variant() {
         let challenge: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let _ = crypt_key(0, 32, &challenge);
