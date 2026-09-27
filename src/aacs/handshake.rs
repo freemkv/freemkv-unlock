@@ -4713,6 +4713,8 @@ pub(crate) mod tests {
         emu.zero_drive_cert_reads = 1;
         let first = dummy_cert();
         let second = dummy_cert();
+        // dummy_cert draws a fresh random keypair, so the two certs differ.
+        assert_ne!(first.certificate, second.certificate);
         let ch = run_handshake_v1(&mut emu, &[first, second.clone()])
             .expect("the second cert authenticates");
         assert_eq!(ch.volume_id, [0x5Au8; 16]);
