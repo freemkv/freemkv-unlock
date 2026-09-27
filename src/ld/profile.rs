@@ -308,12 +308,12 @@ fn load_from_str(data: &str) -> Result<Profiles> {
 
 /// Find a profile matching a drive's INQUIRY fields, whitespace-trimmed.
 ///
-/// Per platform section (MT1959-A, -B, Renesas): (1) exact match including
-/// `product_id` when the drive reports one; (2) product-id-blind fallback on
-/// the four-field identity (vendor/revision/vendor_specific/firmware_date).
-/// Catalogs store a GENERIC product_id (e.g. "BD-RE") vs a drive's specific one
-/// ("BD-RE BU40N"), so pass 1 misses; pass 2 binds a UNIQUE four-field match —
-/// a shared four-tuple binds only when the drive reported no product_id.
+/// Over ALL platform sections (MT1959-A, -B, Renesas, in order): (1) exact
+/// match including `product_id` when the drive reports one; then (2) a
+/// product-id-blind fallback on vendor/revision/vendor_specific/firmware_date.
+/// Catalogs store a GENERIC product_id ("BD-RE") vs a drive's specific one
+/// ("BD-RE BU40N"), so pass 1 misses; pass 2 binds a four-field match UNIQUE
+/// across all sections — a shared tuple binds only with no product_id.
 pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Option<ProfileMatch> {
     let v = drive_id.vendor_id.trim();
     let prod = drive_id.product_id.trim();
@@ -321,62 +321,45 @@ pub fn find_by_drive_id(profiles: &Profiles, drive_id: &crate::DriveId) -> Optio
     let vs = drive_id.vendor_specific.trim();
     let date = drive_id.firmware_date.trim();
 
-    for (platform, list) in [
+    let sections = [
         (Platform::Mt1959A, &profiles.mt1959_a),
         (Platform::Mt1959B, &profiles.mt1959_b),
         (Platform::Renesas, &profiles.renesas),
-    ] {
-        if !prod.is_empty()
-            && let Some(p) = list.iter().find(|p| {
-                p.identity.vendor_id.trim() == v
-                    && p.identity.product_id.trim() == prod
-                    && p.identity.product_revision.trim() == r
-                    && p.identity.vendor_specific.trim() == vs
-                    && p.identity.firmware_date.trim() == date
-            })
-        {
-            return Some(ProfileMatch {
-                profile: p.clone(),
-                platform,
-            });
-        }
-
-        // Product-id-blind fallback: catalogs store a GENERIC product_id while
-        // drives report a specific one, so the exact pass misses. Match the
-        // four-field identity instead; guard mis-binding on shared tuples below.
-        let four_field: Vec<&DriveProfile> = list
+    ];
+    let four_field = |p: &DriveProfile| {
+        p.identity.vendor_id.trim() == v
+            && p.identity.product_revision.trim() == r
+            && p.identity.vendor_specific.trim() == vs
+            && p.identity.firmware_date.trim() == date
+    };
+    let all = || {
+        sections
             .iter()
-            .filter(|p| {
-                p.identity.vendor_id.trim() == v
-                    && p.identity.product_revision.trim() == r
-                    && p.identity.vendor_specific.trim() == vs
-                    && p.identity.firmware_date.trim() == date
-            })
-            .collect();
-        match four_field.as_slice() {
-            // Exactly one four-field match — unambiguous; bind regardless of
-            // the reported product_id (the common real-drive case, and the
-            // pre-1.7.0 behaviour a UHD-capable LG BU40N relied on).
-            [only] => {
-                return Some(ProfileMatch {
-                    profile: (*only).clone(),
-                    platform,
-                });
-            }
-            // Shared four-tuple: bind only when the drive reported NO
-            // product_id. A non-empty one that missed the exact pass is an
-            // uncataloged variant and must not mis-bind to a sibling.
-            [first, ..] if prod.is_empty() => {
-                return Some(ProfileMatch {
-                    profile: (*first).clone(),
-                    platform,
-                });
-            }
-            _ => {}
-        }
+            .flat_map(|(platform, list)| list.iter().map(move |p| (*platform, p)))
+    };
+
+    if !prod.is_empty()
+        && let Some((platform, p)) =
+            all().find(|(_, p)| four_field(p) && p.identity.product_id.trim() == prod)
+    {
+        return Some(ProfileMatch {
+            profile: p.clone(),
+            platform,
+        });
     }
 
-    None
+    // Unique across all sections: bind regardless of the reported product_id
+    // (the common real-drive case a UHD LG BU40N relies on). A shared tuple
+    // binds only with NO product_id; otherwise it's an uncataloged variant.
+    let mut matches = all().filter(|(_, p)| four_field(p));
+    let (platform, first) = matches.next()?;
+    if matches.next().is_some() && !prod.is_empty() {
+        return None;
+    }
+    Some(ProfileMatch {
+        profile: first.clone(),
+        platform,
+    })
 }
 
 #[cfg(test)]
@@ -471,6 +454,39 @@ mod tests {
             .expect("unique four-field identity must match despite the product_id mismatch");
         assert_eq!(m.profile.signature, [0x12, 0x34, 0x56, 0x78]);
         assert_eq!(m.platform, Platform::Mt1959A);
+    }
+
+    /// An exact product_id match in a LATER section must beat a four-field
+    /// fallback in an earlier one; fallback uniqueness spans all sections.
+    #[test]
+    fn find_by_drive_id_exact_match_beats_earlier_section_fallback() {
+        use serde_json::json;
+        let entry = |prod: &str, sig: &str| {
+            json!({"identity": {"vendor_id":"HL-DT-ST","product_id":prod,
+                "product_revision":"1.03","vendor_specific":"NM00000",
+                "firmware_date":"211810241934"},
+                "signature":sig,"firmware":""})
+        };
+        let profiles: Profiles = serde_json::from_value(json!({
+            "mt1959_a": [entry("BD-RE", "aaaaaaaa")],
+            "mt1959_b": [entry("BD-RE BU40N", "bbbbbbbb")],
+        }))
+        .unwrap();
+
+        let mut id = make_drive_id("HL-DT-ST", "1.03", "NM00000", "211810241934");
+        id.product_id = "BD-RE BU40N".to_string();
+        let m = find_by_drive_id(&profiles, &id).expect("B's exact match");
+        assert_eq!(m.platform, Platform::Mt1959B);
+        assert_eq!(m.profile.signature, [0xbb, 0xbb, 0xbb, 0xbb]);
+
+        // Tuple shared across sections + uncataloged product_id: no match.
+        id.product_id = "BD-RE WH16NS".to_string();
+        assert!(find_by_drive_id(&profiles, &id).is_none());
+
+        // No product_id: shared tuple binds the first section's entry.
+        id.product_id.clear();
+        let m0 = find_by_drive_id(&profiles, &id).expect("empty product_id binds");
+        assert_eq!(m0.platform, Platform::Mt1959A);
     }
 
     #[test]
