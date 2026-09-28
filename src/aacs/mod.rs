@@ -183,7 +183,7 @@ impl Unlocker for AacsUnlocker {
             if h.read_data_key.is_none()
                 && let Some(code) = h.read_data_key_err
             {
-                tracing::warn!(
+                tracing::info!(
                     target: "freemkv::disc",
                     phase = "read_data_key_dropped",
                     error_code = code,

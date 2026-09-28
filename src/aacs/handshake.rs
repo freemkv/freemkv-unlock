@@ -1088,7 +1088,7 @@ fn aacs_authenticate_with_agid(
             return Err(V1Fail::DriveCert);
         }
     } else {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "aacs_cert_unsupported_type",
             cert_type = drive_cert[0],
@@ -1260,7 +1260,7 @@ fn aacs2_authenticate_p256_with_agid(
     // Chain-of-trust gate, mandatory on this live path: (a) reject any non-0x11 cert type
     // outright, (b) treat cert verify failure as FATAL, not logged-and-continued.
     if drive_cert[0] != 0x11 {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "aacs2_cert_unknown_type",
             cert_type = drive_cert[0],
@@ -1269,7 +1269,7 @@ fn aacs2_authenticate_p256_with_agid(
         return Err(Error::AacsCertVerify);
     }
     if !verify_cert_p256(drive_cert, la_x, la_y) {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "aacs2_cert_verify_failed",
             "AACS 2.0 drive certificate failed P-256 LA verification; rejecting"
@@ -1497,7 +1497,7 @@ fn finish_auth(
         Err(e) => {
             let transport = e.is_scsi_transport_failure();
             let vid_mac = matches!(e, Error::AacsVidMac);
-            tracing::warn!(
+            tracing::debug!(
                 target: "freemkv::disc",
                 phase = "handshake_vid_read_failed",
                 cert_index = idx,
@@ -1749,7 +1749,7 @@ pub(crate) fn run_cert_handshake_with_anchors(
         match attempt_one_cert(scsi, hc, idx, la, v1_ok && !v1_drive_dead, has_v2) {
             CertOutcome::Ok(ch) => return Ok(ch),
             CertOutcome::Transport => {
-                tracing::warn!(
+                tracing::debug!(
                     target: "freemkv::disc",
                     phase = "handshake_transport_fault",
                     cert_index = idx,
