@@ -1799,6 +1799,31 @@ pub(crate) mod tests {
         assert_eq!((t.calls(), clock.waits), (1, 0));
     }
 
+    // A Stop during the post-upload readiness poll ends it at the next wait:
+    // the production clock waits via the transport's cancellable `pause`, and
+    // the refusal is the dead-bus shape libfreemkv reclassifies as Halted (§2.3).
+    #[test]
+    fn media_ready_poll_stop_during_wait_ends_it() {
+        use crate::scsi::mock::{Ev, MockTransport, StopFake};
+        let mut t = StopFake::new(MockTransport::always(not_ready(0x04, 0x01)));
+        t.cancel_after = Some(|c| c[0] == SCSI_TEST_UNIT_READY);
+        let t0 = std::time::Instant::now();
+        let e = await_media_ready(&mut t, &mut WallClock::start()).expect_err("stopped");
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "no real sleep after a Stop"
+        );
+        assert!(
+            e.is_transport_failure(),
+            "the refusal shape (Halted in libfreemkv)"
+        );
+        assert_eq!(
+            t.log,
+            vec![Ev::Exec(vec![0u8; 6]), Ev::PauseRefused(READY_POLL)],
+            "the wait itself observed the Stop; no further TUR"
+        );
+    }
+
     /// A Stop that lands during the upload, through `run_init` on `mode`: the
     /// first do_unlock fails generically (so the firmware reloads), and the
     /// cancel arrives once a CDB matching `stop_at` reaches the drive.
