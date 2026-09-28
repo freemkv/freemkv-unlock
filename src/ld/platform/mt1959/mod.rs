@@ -515,6 +515,7 @@ mod tests {
     use super::*;
     use crate::ld::profile::{DriveProfile, Identity};
     use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
+    const SCSI_TEST_UNIT_READY: u8 = 0x00;
 
     /// Minimal mock transport that returns a scripted response to the
     /// next `execute()` call. Only used for verifying that `do_unlock`
@@ -1255,6 +1256,7 @@ mod tests {
             script.extend(upload_ok());
             script.push(Reply::good(unlock_ok.clone())); // load_firmware do_unlock #1
             script.push(Reply::good(unlock_ok.clone())); // do_unlock #2 (best-effort)
+            script.push(Reply::good(vec![])); // TEST UNIT READY: ready at once
             let expected_calls = script.len();
             // Anything past the script is a further retry, which must not happen.
             let mut t = MockTransport::scripted(script, Reply::TransportFault);
@@ -1276,11 +1278,47 @@ mod tests {
                 failed_reloads + 1,
                 "the final upload is still issued"
             );
+            assert_eq!(t.cdbs.last().map(|c| c[0]), Some(SCSI_TEST_UNIT_READY));
             assert!(
                 t0.elapsed() < std::time::Duration::from_secs(5),
-                "no 10 s settle"
+                "no fixed 10 s settle: a ready drive returns at once"
             );
         }
+    }
+
+    // The upload reset the drive: a confirmed unlock does not prove the media is
+    // ready, so run_init polls TEST UNIT READY until it is (coordinator review of
+    // ST-D10; the T6 rule, stop-design-v5 §2.11) before handing the drive back.
+    #[test]
+    fn run_init_waits_for_media_ready_after_upload() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let sig = [0x11, 0x22, 0x33, 0x44];
+        let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+        let becoming_ready = || Reply::Sense {
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense_key: 0x02,
+            asc: 0x04,
+            ascq: 0x01,
+        };
+        let script = vec![
+            Reply::short(vec![0u8; 64], 10), // run_init's do_unlock
+            Reply::good(vec![]),             // WRITE_BUFFER
+            Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]), // 0x45 verify
+            Reply::good(unlock_ok.clone()),  // do_unlock #1
+            Reply::good(unlock_ok),          // do_unlock #2
+            becoming_ready(),                // TUR: 02/04/01
+            becoming_ready(),                // TUR: 02/04/01
+            Reply::good(vec![]),             // TUR: ready
+        ];
+        let expected = script.len();
+        let mut t = MockTransport::scripted(script, Reply::TransportFault);
+        let mut profile = fixture_profile(sig);
+        profile.firmware = vec![0u8; 64];
+        let mut mt = Mt1959::new(profile, false);
+        mt.init(&mut t).expect("ready after two not-ready polls");
+        assert_eq!(t.calls(), expected, "polled until ready, then stopped");
+        let turs = t.cdbs.iter().filter(|c| c[0] == SCSI_TEST_UNIT_READY);
+        assert_eq!(turs.count(), 3, "three TEST UNIT READY polls");
     }
 
     // ── run_probe entry / disc-type detection ───────────────────────────────
