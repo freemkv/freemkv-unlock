@@ -537,6 +537,90 @@ mod tests {
     /// Catches classifying a dead bus as "not this unlocker's drive": the very
     /// first unlock command faulting at the transport layer must abort the
     /// consumer (`Transport`), not fall through to the next unlocker.
+    // Review of ST-D10: after a confirmed firmware upload, a drive whose media never
+    // becomes ready (the same 02/04/01 for 60 s, T6) must still report the unlock,
+    // and probe_disc + the VID read must still run (not `NotApplicable`).
+    #[test]
+    fn readiness_stall_after_upload_keeps_the_unlock() {
+        use crate::scsi::{DataDirection, ScsiResult};
+        use platform::mt1959::tests::{FakeClock, TEST_READY_CLOCK};
+        struct UploadThenNotReady {
+            sig: [u8; 4],
+            unlock_calls: usize,
+            cdbs: Vec<Vec<u8>>,
+        }
+        impl ScsiTransport for UploadThenNotReady {
+            fn execute(
+                &mut self,
+                cdb: &[u8],
+                _dir: DataDirection,
+                data: &mut [u8],
+                _timeout_ms: u32,
+            ) -> crate::scsi::Result<ScsiResult> {
+                self.cdbs.push(cdb.to_vec());
+                let unlock = cdb[0] == 0x3C && matches!(cdb[2], 0x44 | 0x77) && cdb[3] == 0;
+                let (status, n) = if cdb[0] == 0x00 {
+                    let mut sense = [0u8; 32];
+                    (sense[2], sense[12], sense[13]) = (0x02, 0x04, 0x01);
+                    return Ok(ScsiResult {
+                        status: 0x02,
+                        bytes_transferred: 0,
+                        sense,
+                    });
+                } else if unlock && cdb[8] == 64 {
+                    self.unlock_calls += 1;
+                    data.fill(0);
+                    data[0..4].copy_from_slice(&self.sig);
+                    data[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]);
+                    data[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]);
+                    // The first unlock fails short, forcing the firmware upload.
+                    (0, if self.unlock_calls == 1 { 10 } else { 64 })
+                } else {
+                    data.fill(0);
+                    (0, data.len())
+                };
+                Ok(ScsiResult {
+                    status,
+                    bytes_transferred: n,
+                    sense: [0u8; 32],
+                })
+            }
+        }
+        let id = known_vid_drive_id();
+        let sig = profile::find_bundled(&id)
+            .expect("profile")
+            .profile
+            .signature;
+        let mut t = UploadThenNotReady {
+            sig,
+            unlock_calls: 0,
+            cdbs: Vec::new(),
+        };
+        TEST_READY_CLOCK.set(Some(|| Box::new(FakeClock::new())));
+        let r = LdUnlocker::new().unlock(&mut t, &ctx(&id));
+        TEST_READY_CLOCK.set(None);
+        let unlocked = r.expect("no fault");
+        assert!(
+            unlocked.is_some(),
+            "the confirmed unlock stands despite the stall"
+        );
+        let uploaded = t.cdbs.iter().any(|c| matches!(c[0], 0x3B | 0x55));
+        assert!(uploaded, "the firmware upload ran");
+        let last_tur = t
+            .cdbs
+            .iter()
+            .rposition(|c| c[0] == 0x00)
+            .expect("polled TUR");
+        let turs = t.cdbs.iter().filter(|c| c[0] == 0x00).count();
+        assert_eq!(turs, 121, "polled until the 60 s stall (virtual clock)");
+        let capacity = t
+            .cdbs
+            .iter()
+            .rposition(|c| c[0] == 0x25)
+            .expect("probe_disc ran");
+        assert!(capacity > last_tur, "probe_disc runs after the poll");
+    }
+
     #[test]
     fn transport_fault_during_unlock_is_transport_not_not_applicable() {
         use crate::scsi::mock::{MockTransport, Reply};
