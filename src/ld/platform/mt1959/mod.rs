@@ -518,7 +518,8 @@ fn ready_clock() -> Box<dyn ReadyClock> {
     Box::new(WallClock::start())
 }
 
-/// The production clock: real time, a plain sleep between polls.
+/// The production clock: real time, and the transport's cancellable `pause`
+/// between polls (stop-design-v5 §2.3), so a Stop ends the wait at once.
 struct WallClock(std::time::Instant);
 
 impl WallClock {
@@ -531,9 +532,8 @@ impl ReadyClock for WallClock {
     fn elapsed(&self) -> Duration {
         self.0.elapsed()
     }
-    fn wait(&mut self, _scsi: &mut dyn ScsiTransport, d: Duration) -> scsi::Result<()> {
-        std::thread::sleep(d);
-        Ok(())
+    fn wait(&mut self, scsi: &mut dyn ScsiTransport, d: Duration) -> scsi::Result<()> {
+        scsi.pause(d)
     }
 }
 
