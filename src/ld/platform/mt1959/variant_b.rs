@@ -4,7 +4,7 @@
 
 use super::{Mt1959, SCSI_READ_BUFFER, SCSI_WRITE_BUFFER};
 use crate::ld::error::Result;
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{CriticalGuard, DataDirection, ScsiTransport};
 
 const SCSI_MODE_SELECT: u8 = 0x55;
 const FIRMWARE_EXTRA: [u8; 16] = [0; 16];
@@ -77,7 +77,10 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         0x00,
     ];
     let mut data = firmware[..write_len].to_vec();
-    scsi.execute(&mode_select_cdb, DataDirection::ToDevice, &mut data, 30_000)?;
+    // stop-design-v5 §2.3: "MODE SELECT at 30 s …, READ BUFFER, WRITE BUFFER and F1 run
+    // inside a `CriticalGuard`. C_max = 45 s" — a Stop mid-upload waits for all four.
+    let mut span = CriticalGuard::enter(&mut *scsi)?;
+    span.execute(&mode_select_cdb, DataDirection::ToDevice, &mut data, 30_000)?;
 
     // Step 2: Read firmware metadata (READ_BUFFER mode 6, offset 0x3000)
     let read_meta_cdb = [
@@ -95,7 +98,7 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     let mut meta_resp = [0u8; 16];
     trace_step(
         "mt1959b_fw_meta",
-        scsi.execute(
+        span.execute(
             &read_meta_cdb,
             DataDirection::FromDevice,
             &mut meta_resp,
@@ -119,7 +122,7 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     let mut data2 = FIRMWARE_EXTRA.to_vec();
     trace_step(
         "mt1959b_fw_extra",
-        scsi.execute(&write_extra_cdb, DataDirection::ToDevice, &mut data2, 5_000),
+        span.execute(&write_extra_cdb, DataDirection::ToDevice, &mut data2, 5_000),
     )?;
 
     // Step 4: Vendor verify (0xF1 — B-only, not standard SCSI), per-drive.
@@ -127,8 +130,9 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
     let mut dummy = [0u8; 0];
     trace_step(
         "mt1959b_fw_verify",
-        scsi.execute(&verify_cdb, DataDirection::None, &mut dummy, 5_000),
+        span.execute(&verify_cdb, DataDirection::None, &mut dummy, 5_000),
     )?;
+    drop(span); // the span ends here; the unlock retries below stay cancellable
 
     // Step 5: Unlock retries (up to 5, then a final fatal attempt). The
     // confirmation pass after success is intentionally best-effort.

@@ -158,6 +158,17 @@ impl<'a> AgidGuard<'a> {
     }
 }
 
+// Manual Debug: the transport is not `Debug`; the AGID and whether it is still
+// armed (will be released on drop) are what a failure message needs.
+impl std::fmt::Debug for AgidGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgidGuard")
+            .field("agid", &self.agid)
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
 impl Drop for AgidGuard<'_> {
     fn drop(&mut self) {
         if !self.armed {

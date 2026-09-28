@@ -10,7 +10,7 @@
 
 mod error;
 use crate::css::error::{Error, Result, step_err};
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{AgidGuard, DataDirection, ScsiTransport};
 
 // Issue ONE CSS bus-auth CDB, honouring the transport contract: treats a
 // non-zero status as CssAuthFailed and checks bytes_transferred >= min_bytes
@@ -310,12 +310,13 @@ fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()>
 // ── Step 1: Bus Authentication ────────────────────────────────────────────
 
 // Runs the CSS bus-auth handshake to set ASF=1 (invalidate AGIDs, allocate,
-// challenge/response). Returns the AGID; no bus key is derived.
+// challenge/response). Returns the AGID, still held (D9); no bus key is derived.
 fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     // Invalidate all AGIDs via REPORT KEY format 0x3F. This is also what makes
-    // an abandoned AGID self-heal — which is not a reason to abandon one.
+    // an abandoned AGID self-heal — which is not a reason to abandon one. Plain
+    // `execute`: nothing is held yet, so a Stop refuses these (stop-design-v5 §2.3).
     for agid in 0..4u8 {
-        release_agid(scsi, agid);
+        invalidate_agid(scsi, agid);
     }
 
     // Allocate AGID
@@ -329,28 +330,37 @@ fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     )?;
     let agid = (buf[7] >> 6) & 0x03;
 
-    // From here on we hold the AGID; release it on any failure (see
-    // [`release_agid`]) instead of abandoning it.
-    let r = authenticate_with_agid(scsi, agid);
-    if r.is_err() {
-        release_agid(scsi, agid);
-    }
-    r.map(|()| agid)
+    // From here on we hold the AGID: a failure drops the guard, which releases
+    // it even after a Stop (SS-7, evidence: libaacs mmc.c AGID invalidation).
+    let mut guard = AgidGuard::new(scsi, agid, agid_release_cdb(agid));
+    authenticate_with_agid(&mut *guard, agid)?;
+    // D9 (stop-design-v5 §2.3 "defused on success, so it is still held for
+    // `read_disc_key`"): hand the AGID over unreleased.
+    Ok(guard.defuse())
 }
 
-/// Release an AGID (REPORT KEY format 0x3F). Best-effort: a failure to release
-/// is not a failure of the operation that is already failing.
-fn release_agid(scsi: &mut dyn ScsiTransport, agid: u8) {
+/// REPORT KEY key format 0x3F for `agid` (invalidate / release it).
+fn agid_release_cdb(agid: u8) -> [u8; 12] {
     let mut cdb = [0u8; 12];
     cdb[0] = crate::scsi::SCSI_REPORT_KEY;
     cdb[10] = (agid << 6) | 0x3F;
+    cdb
+}
+
+/// Best-effort invalidate of an AGID this session does not hold (the
+/// pre-allocation sweep).
+fn invalidate_agid(scsi: &mut dyn ScsiTransport, agid: u8) {
     let mut buf = [0u8; 8];
-    let _ = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000);
+    let _ = scsi.execute(
+        &agid_release_cdb(agid),
+        DataDirection::FromDevice,
+        &mut buf,
+        5_000,
+    );
 }
 
 /// The challenge-response half of [`establish_authenticated_session`], with the
-/// AGID already allocated. Split out so its caller can release the AGID on any
-/// failure without a Drop guard or a release at each early return.
+/// AGID already allocated and held by the caller's [`AgidGuard`].
 fn authenticate_with_agid(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
     // Host sends challenge. The spec wants a fresh per-session random nonce,
     // not a fixed constant — a predictable challenge weakens the bus-auth

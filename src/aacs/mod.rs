@@ -442,6 +442,27 @@ mod tests {
             }
             status(0, data.len())
         }
+        // Forward the Stop methods (stop-design-v5 §2.3): the defaults would
+        // swallow them, so wrapped tests would stop exercising cancellation.
+        fn pause(&mut self, d: std::time::Duration) -> crate::scsi::Result<()> {
+            self.inner.pause(d)
+        }
+        fn begin_critical(&mut self) -> crate::scsi::Result<()> {
+            self.inner.begin_critical()
+        }
+        fn end_critical(&mut self) {
+            self.inner.end_critical()
+        }
+        fn execute_cleanup(
+            &mut self,
+            cdb: &[u8],
+            dir: crate::scsi::DataDirection,
+            data: &mut [u8],
+            timeout_ms: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            self.cdbs.push(cdb.to_vec());
+            self.inner.execute_cleanup(cdb, dir, data, timeout_ms)
+        }
     }
 
     // UT6 (stop-design-v5 §5.2; §2.3 "The test-only `FwFront<T>` … forwards all
