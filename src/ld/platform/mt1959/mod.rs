@@ -291,8 +291,15 @@ impl Mt1959 {
                     );
                     return Err(e);
                 }
+                // Every exit below returns or overwrites `last_err` with the reload's error.
                 Err(e) => {
-                    last_err = e;
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_unlock_failed_reloading",
+                        attempt,
+                        error = %e,
+                        "unlock failed; reloading firmware"
+                    );
                     let loaded = if self.mode == MODE_A {
                         variant_a::load_firmware(self, scsi)
                     } else {
@@ -320,10 +327,18 @@ impl Mt1959 {
                             last_err = e;
                             continue;
                         }
+                        // D10 (stop-design-v5 §1): "`run_init` must `return Ok(())` as soon as
+                        // `load_firmware` confirms the unlock" — its own do_unlock already did.
+                        // Looping re-ran it after a 10 s settle and discarded it on attempt 2.
                         Ok(()) => {
-                            // Firmware upload resets the drive. Give it time to
-                            // fully recover before retrying unlock.
-                            std::thread::sleep(std::time::Duration::from_secs(10));
+                            tracing::debug!(
+                                target: "freemkv::disc",
+                                phase = "mt1959_unlock_ok_after_upload",
+                                attempt,
+                                unlocked = self.unlocked,
+                                "MT1959 unlock confirmed by the firmware upload"
+                            );
+                            return Ok(());
                         }
                     }
                 }
