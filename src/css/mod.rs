@@ -10,7 +10,7 @@
 
 mod error;
 use crate::css::error::{Error, Result, step_err};
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{AgidGuard, DataDirection, ScsiTransport};
 
 // Issue ONE CSS bus-auth CDB, honouring the transport contract: treats a
 // non-zero status as CssAuthFailed and checks bytes_transferred >= min_bytes
@@ -310,12 +310,13 @@ fn unlock_css_reads_inner(scsi: &mut dyn ScsiTransport, _lba: u32) -> Result<()>
 // ── Step 1: Bus Authentication ────────────────────────────────────────────
 
 // Runs the CSS bus-auth handshake to set ASF=1 (invalidate AGIDs, allocate,
-// challenge/response). Returns the AGID; no bus key is derived.
+// challenge/response). Returns the AGID, still held (D9); no bus key is derived.
 fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     // Invalidate all AGIDs via REPORT KEY format 0x3F. This is also what makes
-    // an abandoned AGID self-heal — which is not a reason to abandon one.
+    // an abandoned AGID self-heal — which is not a reason to abandon one. Plain
+    // `execute`: nothing is held yet, so a Stop refuses these (stop-design-v5 §2.3).
     for agid in 0..4u8 {
-        release_agid(scsi, agid);
+        invalidate_agid(scsi, agid);
     }
 
     // Allocate AGID
@@ -329,28 +330,37 @@ fn establish_authenticated_session(scsi: &mut dyn ScsiTransport) -> Result<u8> {
     )?;
     let agid = (buf[7] >> 6) & 0x03;
 
-    // From here on we hold the AGID; release it on any failure (see
-    // [`release_agid`]) instead of abandoning it.
-    let r = authenticate_with_agid(scsi, agid);
-    if r.is_err() {
-        release_agid(scsi, agid);
-    }
-    r.map(|()| agid)
+    // From here on we hold the AGID: a failure drops the guard, which releases
+    // it even after a Stop (SS-7, evidence: libaacs mmc.c AGID invalidation).
+    let mut guard = AgidGuard::new(scsi, agid, agid_release_cdb(agid));
+    authenticate_with_agid(&mut *guard, agid)?;
+    // D9 (stop-design-v5 §2.3 "defused on success, so it is still held for
+    // `read_disc_key`"): hand the AGID over unreleased.
+    Ok(guard.defuse())
 }
 
-/// Release an AGID (REPORT KEY format 0x3F). Best-effort: a failure to release
-/// is not a failure of the operation that is already failing.
-fn release_agid(scsi: &mut dyn ScsiTransport, agid: u8) {
+/// REPORT KEY key format 0x3F for `agid` (invalidate / release it).
+fn agid_release_cdb(agid: u8) -> [u8; 12] {
     let mut cdb = [0u8; 12];
     cdb[0] = crate::scsi::SCSI_REPORT_KEY;
     cdb[10] = (agid << 6) | 0x3F;
+    cdb
+}
+
+/// Best-effort invalidate of an AGID this session does not hold (the
+/// pre-allocation sweep).
+fn invalidate_agid(scsi: &mut dyn ScsiTransport, agid: u8) {
     let mut buf = [0u8; 8];
-    let _ = scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000);
+    let _ = scsi.execute(
+        &agid_release_cdb(agid),
+        DataDirection::FromDevice,
+        &mut buf,
+        5_000,
+    );
 }
 
 /// The challenge-response half of [`establish_authenticated_session`], with the
-/// AGID already allocated. Split out so its caller can release the AGID on any
-/// failure without a Drop guard or a release at each early return.
+/// AGID already allocated and held by the caller's [`AgidGuard`].
 fn authenticate_with_agid(scsi: &mut dyn ScsiTransport, agid: u8) -> Result<()> {
     // Host sends challenge. The spec wants a fresh per-session random nonce,
     // not a fixed constant — a predictable challenge weakens the bus-auth
@@ -1392,6 +1402,134 @@ mod tests {
             crypt_key(1, 9, &challenge),
             crypt_key(2, 9, &challenge),
             "key_type 1 and 2 must diverge (distinct PERM_VARIANT rows)"
+        );
+    }
+
+    // ── Stop (stop-design-v5 §2.3, ST-U1) ───────────────────────────────────
+
+    /// A drive that completes the CSS bus-auth for real: it answers Key1 for the
+    /// host challenge under `variant`, serves a challenge, and allocates AGID 1.
+    struct CssEmu {
+        variant: u8,
+        host_challenge: [u8; 10],
+        /// Answer Key1 with zeros, which matches no variant → CssAuthFailed.
+        bad_key1: bool,
+    }
+
+    impl ScsiTransport for CssEmu {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _dir: DataDirection,
+            data: &mut [u8],
+            _timeout_ms: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            let mut r = vec![0u8; data.len()];
+            match (cdb[0], cdb[10] & 0x3F) {
+                (crate::scsi::SCSI_REPORT_KEY, 0x00) => r[7] = 1 << 6, // AGID 1
+                (crate::scsi::SCSI_REPORT_KEY, 0x02) if !self.bad_key1 => {
+                    let k = crypt_key(0, self.variant, &self.host_challenge);
+                    (0..5).for_each(|j| r[4 + j] = k[4 - j]);
+                }
+                (crate::scsi::SCSI_SEND_KEY, 0x01) => {
+                    (0..10).for_each(|i| self.host_challenge[i] = data[4 + 9 - i]);
+                }
+                _ => {}
+            }
+            if cdb[0] != crate::scsi::SCSI_SEND_KEY {
+                data.copy_from_slice(&r);
+            }
+            Ok(crate::scsi::ScsiResult {
+                status: 0,
+                bytes_transferred: data.len(),
+                sense: [0u8; 32],
+            })
+        }
+    }
+
+    fn css_emu() -> CssEmu {
+        CssEmu {
+            variant: 7,
+            host_challenge: [0u8; 10],
+            bad_key1: false,
+        }
+    }
+
+    // UT4 / G2 (stop-design-v5 §5.2, D9 "Keep holding it"): on success the AGID is
+    // `defuse`d, so it is still held for `read_disc_key` and never released.
+    // Per design D9; do not change without a design citation proving otherwise.
+    #[test]
+    fn css_success_keeps_agid() {
+        use crate::scsi::mock::{StopFake, agid_ledger, is_agid_release};
+        let mut t = StopFake::new(css_emu());
+        unlock_css_reads(&mut t, 0).expect("the bus-auth completes");
+        let (allocs, held) = agid_ledger(&t.log);
+        assert_eq!(
+            (allocs, held),
+            (1, true),
+            "one AGID, still held after success"
+        );
+        assert!(t.cleanups().is_empty(), "no release on success");
+        let execs = t.execs();
+        let alloc = execs.iter().position(|c| c[0] == 0xA4 && c[10] & 0x3F == 0);
+        let after = &execs[alloc.expect("allocated") + 1..];
+        assert!(
+            !after.iter().any(|c| is_agid_release(c)),
+            "no 0x3F after success"
+        );
+        let disc_key = after.last().expect("the disc-key read follows");
+        assert_eq!(
+            (disc_key[0], disc_key[7]),
+            (0xAD, 0x02),
+            "READ DVD STRUCTURE fmt 2"
+        );
+        assert_eq!(disc_key[10], 1 << 6, "issued under the still-held AGID 1");
+    }
+
+    // SS-7 (evidence): a CSS challenge that fails after allocation releases the
+    // AGID exactly once, through `execute_cleanup`, even when a Stop caused it.
+    #[test]
+    fn css_failed_challenge_releases_agid_once_via_cleanup() {
+        use crate::scsi::mock::{StopFake, agid_ledger};
+        let stop_at_challenge: fn(&[u8]) -> bool =
+            |c| c[0] == crate::scsi::SCSI_SEND_KEY && c[10] & 0x3F == 0x01;
+        for cancel in [false, true] {
+            let mut emu = css_emu();
+            if !cancel {
+                emu.bad_key1 = true;
+            }
+            let mut t = StopFake::new(emu);
+            if cancel {
+                t.cancel_after = Some(stop_at_challenge);
+            }
+            let e = establish_authenticated_session(&mut t).expect_err("auth fails");
+            assert_eq!(e.is_transport_failure(), cancel, "a Stop is a refusal");
+            assert_eq!(agid_ledger(&t.log), (1, false), "cancel={cancel}");
+            assert_eq!(
+                t.cleanups().len(),
+                1,
+                "exactly one release, cancel={cancel}"
+            );
+        }
+    }
+
+    // UT5 (stop-design-v5 §5.2): "zero invalidate CDBs after a cancel" — the
+    // pre-allocation invalidate loop uses `execute`, so a Stop refuses it.
+    #[test]
+    fn invalidate_loops_refused_after_cancel() {
+        use crate::scsi::mock::StopFake;
+        let mut t = StopFake::new(css_emu());
+        t.cancelled = true;
+        let e = establish_authenticated_session(&mut t).expect_err("cancelled");
+        assert!(e.is_transport_failure());
+        assert!(
+            t.execs().is_empty(),
+            "no CDB reached the drive: {:?}",
+            t.log
+        );
+        assert!(
+            t.cleanups().is_empty(),
+            "nothing allocated, nothing released"
         );
     }
 }

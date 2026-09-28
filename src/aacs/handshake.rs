@@ -7,7 +7,7 @@
 //!
 //! Supports AACS 1.0 and AACS 2.0 cert chains.
 use crate::aacs::error::{Error, Result};
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{AgidGuard, DataDirection, ScsiTransport};
 use num_bigint::BigUint;
 use num_traits::{One, Zero};
 use sha1::{Digest, Sha1};
@@ -69,12 +69,11 @@ fn cert_host_id_hex(cert: &[u8]) -> String {
     cert[4..10].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// Release an AGID (REPORT KEY format 0x3F). A drive has only four, so avoid
-// leaving one held between attempts. Best-effort: a release failure isn't a
-// failure of the operation that's already failing.
-fn release_agid(session: &mut dyn ScsiTransport, agid: u8) {
-    let cdb = cdb_report_key(agid, 0x3F, 2);
-    let _ = scsi_read(session, &cdb, 2);
+// Hold an allocated AGID. A drive has only four, so its drop releases it (REPORT KEY
+// format 0x3F) via `execute_cleanup`, so even a Stop frees it: one release per
+// allocation (SS-7, evidence: libaacs mmc.c AGID invalidation; stop-design-v5 §2.3).
+fn agid_guard<'a>(session: &'a mut (dyn ScsiTransport + 'a), agid: u8) -> AgidGuard<'a> {
+    AgidGuard::new(session, agid, cdb_report_key(agid, 0x3F, 2))
 }
 
 // ── AACS 1.0 elliptic curve parameters (160-bit) ───────────────────────────
@@ -982,7 +981,14 @@ fn aacs_authenticate_with_anchor(
     la_x: &[u8; 20],
     la_y: &[u8; 20],
 ) -> Result<AacsAuth> {
-    aacs1_ake(session, host_priv_key, host_cert, la_x, la_y).map_err(V1Fail::into_error)
+    // AKE-only callers read the VID themselves under `auth.agid`, so the AGID is
+    // handed over still held, exactly as before the guard existed.
+    aacs1_ake(session, host_priv_key, host_cert, la_x, la_y)
+        .map(|(auth, guard)| {
+            guard.defuse();
+            auth
+        })
+        .map_err(V1Fail::into_error)
 }
 
 /// Why the 1.0 AKE failed. `DriveCert`: the drive presented a recognised cert
@@ -1008,14 +1014,16 @@ impl V1Fail {
     }
 }
 
-/// [`aacs_authenticate_with_anchor`] keeping the [`V1Fail`] distinction.
-fn aacs1_ake(
-    session: &mut dyn ScsiTransport,
+/// [`aacs_authenticate_with_anchor`] keeping the [`V1Fail`] distinction. On
+/// success the AGID comes back still held in its [`AgidGuard`], which the caller
+/// hands to [`finish_auth`]; on any failure the guard has already released it.
+fn aacs1_ake<'a>(
+    session: &'a mut (dyn ScsiTransport + 'a),
     host_priv_key: &[u8; 20],
     host_cert: &[u8],
     la_x: &[u8; 20],
     la_y: &[u8; 20],
-) -> std::result::Result<AacsAuth, V1Fail> {
+) -> std::result::Result<(AacsAuth, AgidGuard<'a>), V1Fail> {
     if host_cert.len() < 92 {
         return Err(Error::AacsCertShort.into());
     }
@@ -1032,18 +1040,15 @@ fn aacs1_ake(
         scsi_read(session, &cdb, 8).map_err(|e| handshake_err(e, Error::AacsAgidAlloc))?;
     let agid = (response[7] >> 6) & 0x03;
 
-    // From here on we HOLD the AGID. Every failure below used to abandon it
-    // (see [`release_agid`]); release it on the way out instead.
-    let r = aacs_authenticate_with_agid(session, agid, host_priv_key, host_cert, la_x, la_y);
-    if r.is_err() {
-        release_agid(session, agid);
-    }
-    r
+    // From here on we HOLD the AGID: an error below drops the guard, releasing it.
+    let mut guard = agid_guard(session, agid);
+    let auth =
+        aacs_authenticate_with_agid(&mut *guard, agid, host_priv_key, host_cert, la_x, la_y)?;
+    Ok((auth, guard))
 }
 
-/// Steps 3-9 of [`aacs_authenticate`], with the AGID already allocated. Split
-/// out so the single caller can release the AGID on ANY failure without a Drop
-/// guard or a release call at each of the seven early returns.
+/// Steps 3-9 of [`aacs_authenticate`], with the AGID already allocated and held
+/// by the caller's [`AgidGuard`], which releases it on any of the early returns.
 fn aacs_authenticate_with_agid(
     session: &mut dyn ScsiTransport,
     agid: u8,
@@ -1183,16 +1188,16 @@ fn aacs_authenticate_with_agid(
     })
 }
 
-// Native AACS 2.0 handshake (P-256/SHA-256); LA anchor is a parameter so tests drive the full
-// AKE under a test keypair. Its 2.0 cert offsets are PROVISIONAL, so run_cert_handshake gates
-// it off (see AACS2_P256_EXPERIMENTAL).
-fn aacs2_authenticate_p256_with_anchor(
-    session: &mut dyn ScsiTransport,
+// Native AACS 2.0 handshake (P-256/SHA-256), returning the AGID still held in its guard like
+// `aacs1_ake`. LA anchor is a parameter so tests drive the full AKE; its 2.0 cert offsets are
+// PROVISIONAL, so run_cert_handshake gates it off (see AACS2_P256_EXPERIMENTAL).
+fn aacs2_authenticate_p256_with_anchor<'a>(
+    session: &'a mut (dyn ScsiTransport + 'a),
     host_priv_key: &[u8; 32],
     host_cert: &[u8],
     la_x: &[u8; 32],
     la_y: &[u8; 32],
-) -> Result<AacsAuth> {
+) -> Result<(AacsAuth, AgidGuard<'a>)> {
     if host_cert.len() < 132 {
         return Err(Error::AacsCertShort);
     }
@@ -1209,18 +1214,15 @@ fn aacs2_authenticate_p256_with_anchor(
         scsi_read(session, &cdb, 8).map_err(|e| handshake_err(e, Error::AacsAgidAlloc))?;
     let agid = (response[7] >> 6) & 0x03;
 
-    // From here we HOLD the AGID; release on ANY failure below, mirroring
-    // the leak fix (`975315d`) applied to the AACS 1.0 twin.
-    let r = aacs2_authenticate_p256_with_agid(session, agid, host_priv_key, host_cert, la_x, la_y);
-    if r.is_err() {
-        release_agid(session, agid);
-    }
-    r
+    // From here we HOLD the AGID: an error below drops the guard, releasing it.
+    let mut guard = agid_guard(session, agid);
+    let auth =
+        aacs2_authenticate_p256_with_agid(&mut *guard, agid, host_priv_key, host_cert, la_x, la_y)?;
+    Ok((auth, guard))
 }
 
-/// Steps 3-9 of [`aacs2_authenticate_p256_with_anchor`] with the AGID already allocated,
-/// split out so the single caller can release the AGID on any of the seven
-/// fallible exits without a per-return release call or a Drop guard.
+/// Steps 3-9 of [`aacs2_authenticate_p256_with_anchor`] with the AGID already
+/// allocated and held by the caller's [`AgidGuard`].
 fn aacs2_authenticate_p256_with_agid(
     session: &mut dyn ScsiTransport,
     agid: u8,
@@ -1483,15 +1485,17 @@ enum FinishErr {
 }
 
 /// Read the Volume ID + data keys for a completed auth and assemble the finished
-/// [`CertHandshake`]. Releases the AGID on EVERY exit — including the
-/// fully-successful one (previously leaked, slowly draining the drive's 4-AGID
-/// pool across discs), since nothing downstream needs the AGID once the VID and
-/// data keys are read. `idx` is for log correlation only.
+/// [`CertHandshake`]. Takes the AGID's guard and so releases it on EVERY exit,
+/// including success (nothing downstream needs the AGID once the VID and data
+/// keys are read) and before the caller's P-256 fall-through. `idx` is for log
+/// correlation only.
 fn finish_auth(
-    scsi: &mut dyn ScsiTransport,
+    mut guard: AgidGuard<'_>,
     mut auth: AacsAuth,
     idx: usize,
 ) -> std::result::Result<CertHandshake, FinishErr> {
+    debug_assert_eq!(guard.agid(), auth.agid, "the guard holds this auth's AGID");
+    let scsi: &mut dyn ScsiTransport = &mut *guard;
     let volume_id = match read_volume_id(scsi, &mut auth) {
         Ok(vid) => vid,
         Err(e) => {
@@ -1505,10 +1509,7 @@ fn finish_auth(
                 transport_failure = transport,
                 "auth ok but volume ID read failed"
             );
-            // We authenticated, so we hold an AGID; release it before giving up
-            // rather than leaving the drive one short until the next attempt
-            // invalidates all four.
-            release_agid(scsi, auth.agid);
+            // The guard releases the AGID on this return.
             // A dead bus is NOT "the drive has no Volume ID" — that told the
             // consumer to fall through and keep working a transport that is gone.
             return Err(if transport {
@@ -1542,9 +1543,8 @@ fn finish_auth(
             );
             // A dead bus here is NOT "no data key served" — left unclassified it
             // returned a successful-looking unlock with read_data_key: None.
-            // Release AGID, abort like VID.
+            // Abort like VID (the guard releases the AGID).
             if transport {
-                release_agid(scsi, auth.agid);
                 return Err(FinishErr::Transport);
             }
             (None, Some(e.code()))
@@ -1559,10 +1559,9 @@ fn finish_auth(
         has_read_data_key = read_data_key.is_some(),
         "AACS bus-auth handshake complete"
     );
-    // Release the AGID on the fully-successful path too: the VID and data keys
-    // are already read, so nothing downstream needs it, and holding it slowly
-    // leaks the drive's 4-AGID pool across discs.
-    release_agid(scsi, auth.agid);
+    // Release the AGID on the fully-successful path too: nothing downstream needs
+    // it, and holding it slowly leaks the drive's 4-AGID pool across discs.
+    drop(guard);
     Ok(CertHandshake {
         volume_id,
         read_data_key,
@@ -1613,7 +1612,9 @@ fn attempt_one_cert(
     let mut v1_drive_dead = false;
     if try_v1 {
         match aacs1_ake(scsi, &hc.private_key, &hc.certificate, la.0, la.1) {
-            Ok(auth) => match finish_auth(scsi, auth, idx) {
+            // `finish_auth` drops the guard (releasing the 1.0 AGID) on every
+            // return, so it is free before the P-256 fall-through below.
+            Ok((auth, guard)) => match finish_auth(guard, auth, idx) {
                 Ok(ch) => return CertOutcome::Ok(ch),
                 Err(FinishErr::Transport) => return CertOutcome::Transport,
                 // Post-auth VID/MAC failure with v2 creds available: fall through to
@@ -1659,7 +1660,7 @@ fn attempt_one_cert(
         return CertOutcome::VidUnavailable;
     };
     match aacs2_authenticate_p256_with_anchor(scsi, k, c, la.2, la.3) {
-        Ok(auth) => match finish_auth(scsi, auth, idx) {
+        Ok((auth, guard)) => match finish_auth(guard, auth, idx) {
             Ok(ch) => CertOutcome::Ok(ch),
             Err(FinishErr::Transport) => CertOutcome::Transport,
             // A VID failure on the P-256 path is terminal for this cert.
@@ -1742,8 +1743,20 @@ pub(crate) fn run_cert_handshake_with_anchors(
             );
             continue;
         }
-        if drive_attempts > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS));
+        // Halt-aware (stop-design-v5 §2.3 "The per-cert backoff … uses `pause`"): a
+        // Stop ends the wait at once, surfacing as the transport abort it is.
+        if drive_attempts > 0
+            && scsi
+                .pause(std::time::Duration::from_millis(PER_CERT_BACKOFF_MS))
+                .is_err()
+        {
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "cert_backoff_interrupted",
+                cert_index = idx,
+                "per-cert backoff interrupted (operation stopped); aborting"
+            );
+            return Err(UnlockError::Transport);
         }
         drive_attempts += 1;
         match attempt_one_cert(scsi, hc, idx, la, v1_ok && !v1_drive_dead, has_v2) {
@@ -3447,9 +3460,11 @@ pub(crate) mod tests {
         let host_cert = p256_synth_cert(0x11, &host_x, &host_y, &la_priv);
 
         let mut emu = DriveEmuP256::new(drive_lt_priv, cert);
-        let auth =
+        let (auth, guard) =
             aacs2_authenticate_p256_with_anchor(&mut emu, &host_priv, &host_cert, &la_x, &la_y)
                 .expect("a genuine LA-signed 2.0 cert must complete the AKE");
+        assert_eq!(guard.agid(), auth.agid, "the AGID comes back still held");
+        drop(guard);
         assert_ne!(auth.bus_key, [0u8; 16], "a bus key must be derived");
         assert_eq!(
             Some(auth.bus_key),
@@ -4897,6 +4912,277 @@ pub(crate) mod tests {
         assert!(
             emu.bus_key.is_none(),
             "SEND KEY format 0x02 must not have been sent"
+        );
+    }
+
+    // ── Stop (stop-design-v5 §2.3, ST-U1): AGID guard + halt-aware backoff ──
+
+    use crate::scsi::mock::{Ev, StopFake, agid_ledger, is_agid_release};
+
+    /// (case, setup, cancel after this CDB, expected outcome).
+    type AkeCase<S> = (&'static str, S, Option<fn(&[u8]) -> bool>, &'static str);
+
+    fn outcome_name(o: &CertOutcome) -> &'static str {
+        match o {
+            CertOutcome::Ok(_) => "Ok",
+            CertOutcome::Transport => "Transport",
+            CertOutcome::VidUnavailable => "VidUnavailable",
+            CertOutcome::Reject { .. } => "Reject",
+        }
+    }
+
+    fn send_key_fmt(fmt: u8) -> fn(&[u8]) -> bool {
+        match fmt {
+            0x01 => |c| c[0] == crate::scsi::SCSI_SEND_KEY && c[10] & 0x3F == 0x01,
+            _ => |c| c[0] == crate::scsi::SCSI_SEND_KEY && c[10] & 0x3F == 0x02,
+        }
+    }
+
+    fn is_vid_read(c: &[u8]) -> bool {
+        c[0] == crate::scsi::SCSI_READ_DISC_STRUCTURE && c[7] == 0x80
+    }
+
+    /// Asserts one allocation, released exactly once through `execute_cleanup`.
+    fn assert_released_once(case: &str, log: &[Ev]) {
+        let (allocs, held) = agid_ledger(log);
+        assert_eq!(allocs, 1, "{case}: one allocation");
+        assert!(!held, "{case}: the AGID is released on the way out");
+        let rel = log
+            .iter()
+            .filter(|e| matches!(e, Ev::Cleanup(c) if is_agid_release(c)));
+        assert_eq!(
+            rel.count(),
+            1,
+            "{case}: exactly one release, via execute_cleanup"
+        );
+    }
+
+    // UT2 (stop-design-v5 §5.2) per evidence SS-7: "exactly one 0x3F per
+    // allocation, through `execute_cleanup`" for an error at each AACS 1.0 AKE
+    // step, each post-auth read, a Stop mid-AKE / mid-finish, and success.
+    #[test]
+    fn agid_released_exactly_once_on_every_ake_error_v1() {
+        type Setup = fn(&mut DriveEmu);
+        let cases: [AkeCase<Setup>; 9] = [
+            (
+                "step4 cert rejected",
+                |e| e.revoke_cert_sends = 1,
+                None,
+                "Reject",
+            ),
+            (
+                "step5 zero drive cert",
+                |e| e.zero_drive_cert_reads = 1,
+                None,
+                "Reject",
+            ),
+            (
+                "step6 bad signature",
+                |e| e.bad_step6_sig = true,
+                None,
+                "Reject",
+            ),
+            (
+                "stop mid-AKE",
+                |_| {},
+                Some(send_key_fmt(0x01)),
+                "Transport",
+            ),
+            (
+                "VID dead bus",
+                |e| e.fault_on_vid_read = true,
+                None,
+                "Transport",
+            ),
+            ("VID MAC", |e| e.bad_vid_mac = true, None, "VidUnavailable"),
+            ("data-key dead bus", |_| {}, None, "Transport"),
+            (
+                "stop after VID",
+                |e| e.serve_data_keys = true,
+                Some(is_vid_read),
+                "Transport",
+            ),
+            ("success", |e| e.serve_data_keys = true, None, "Ok"),
+        ];
+        let hc = dummy_cert();
+        for (case, setup, cancel_after, want) in cases {
+            let mut emu = DriveEmu::new();
+            setup(&mut emu);
+            let (lx, ly) = (emu.la_x, emu.la_y);
+            let mut t = StopFake::new(emu);
+            t.cancel_after = cancel_after;
+            let o = attempt_one_cert(&mut t, &hc, 0, (&lx, &ly, &[0; 32], &[0; 32]), true, false);
+            assert_eq!(outcome_name(&o), want, "{case}");
+            assert_released_once(case, &t.log);
+        }
+    }
+
+    // UT2, AACS 2.0 half: the same invariant on the native P-256 AKE.
+    #[test]
+    fn agid_released_exactly_once_on_every_ake_error_v2() {
+        type Setup = fn(&mut DriveEmuP256, &mut Vec<u8>);
+        let cases: [AkeCase<Setup>; 7] = [
+            (
+                "step5 bad LA signature",
+                |_, c| c[120] ^= 0xFF,
+                None,
+                "Reject",
+            ),
+            (
+                "step5 unknown cert type",
+                |_, c| c[0] = 0x12,
+                None,
+                "Reject",
+            ),
+            (
+                "step6 off-curve point",
+                |e, _| e.off_curve_point = true,
+                None,
+                "Reject",
+            ),
+            (
+                "step6 bad signature",
+                |e, _| e.bad_step6_sig = true,
+                None,
+                "Reject",
+            ),
+            (
+                "stop mid-AKE",
+                |_, _| {},
+                Some(send_key_fmt(0x01)),
+                "Transport",
+            ),
+            ("VID unavailable", |_, _| {}, None, "VidUnavailable"),
+            (
+                "stop at end of AKE",
+                |_, _| {},
+                Some(send_key_fmt(0x02)),
+                "Transport",
+            ),
+        ];
+        for (case, setup, cancel_after, want) in cases {
+            let (la_priv, la_x, la_y) = generate_host_key_pair_p256();
+            let (lt_priv, lt_x, lt_y) = generate_host_key_pair_p256();
+            let mut cert = p256_synth_cert(0x11, &lt_x, &lt_y, &la_priv);
+            let (host_priv, hx, hy) = generate_host_key_pair_p256();
+            let hc = crate::HostCert {
+                private_key: [0u8; 20],
+                certificate: Vec::new(),
+                private_key_v2: Some(host_priv),
+                certificate_v2: Some(p256_synth_cert(0x11, &hx, &hy, &la_priv)),
+            };
+            let mut emu = DriveEmuP256::new(lt_priv, Vec::new());
+            setup(&mut emu, &mut cert);
+            emu.cert = cert;
+            let mut t = StopFake::new(emu);
+            t.cancel_after = cancel_after;
+            let la = (&[0u8; 20], &[0u8; 20], &la_x, &la_y);
+            let o = attempt_one_cert(&mut t, &hc, 0, la, false, true);
+            assert_eq!(outcome_name(&o), want, "{case}");
+            assert_released_once(case, &t.log);
+        }
+    }
+
+    // UT3 (stop-design-v5 §5.2): "the 0x3F precedes the fallback's first CDB" —
+    // the 1.0 AGID is released right after its failed VID read, before P-256.
+    #[test]
+    fn agid_released_before_p256_fallthrough() {
+        let drive = HybridDrive::new();
+        let (l1, l2) = ((drive.la1_x, drive.la1_y), (drive.la2_x, drive.la2_y));
+        let v1 = dummy_cert();
+        let (hv2_priv, hv2_x, hv2_y) = generate_host_key_pair_p256();
+        let (throwaway_la, _, _) = generate_host_key_pair_p256();
+        let hc = crate::HostCert {
+            private_key: v1.private_key,
+            certificate: v1.certificate.clone(),
+            private_key_v2: Some(hv2_priv),
+            certificate_v2: Some(p256_synth_cert(0x11, &hv2_x, &hv2_y, &throwaway_la)),
+        };
+        let mut t = StopFake::new(drive);
+        let la = (&l1.0, &l1.1, &l2.0, &l2.1);
+        let o = attempt_one_cert(&mut t, &hc, 0, la, true, true);
+        assert_eq!(outcome_name(&o), "Ok", "the P-256 fallback completes");
+        assert!(t.inner.reached_p256);
+        let v = t
+            .log
+            .iter()
+            .position(|e| matches!(e, Ev::Exec(c) if is_vid_read(c)));
+        let v = v.expect("the 1.0 VID read");
+        assert!(
+            matches!(&t.log[v + 1], Ev::Cleanup(c) if is_agid_release(c)),
+            "the 1.0 AGID release must be the very next CDB: {:?}",
+            t.log.get(v + 1)
+        );
+        let (allocs, held) = agid_ledger(&t.log);
+        assert_eq!((allocs, held), (2, false), "one release per allocation");
+    }
+
+    // UT5, AACS half (stop-design-v5 §5.2): "zero invalidate CDBs after a cancel"
+    // — the pre-allocation invalidate loop uses `execute`, so it is refused.
+    #[test]
+    fn aacs_invalidate_loop_refused_after_cancel() {
+        let emu = DriveEmu::new();
+        let (lx, ly) = (emu.la_x, emu.la_y);
+        let mut t = StopFake::new(emu);
+        t.cancelled = true;
+        let r = run_cert_handshake_with_anchors(
+            &mut t,
+            &[dummy_cert()],
+            (&lx, &ly),
+            (&[0; 32], &[0; 32]),
+            false,
+        );
+        assert_eq!(r.unwrap_err(), crate::UnlockError::Transport);
+        assert!(
+            t.execs().is_empty(),
+            "no CDB reached the drive: {:?}",
+            t.log
+        );
+        assert!(
+            t.cleanups().is_empty(),
+            "no AGID was allocated, so none released"
+        );
+        assert!(t.inner.cdbs.is_empty());
+    }
+
+    // UT9, backoff half (stop-design-v5 §5.2): "a cancel during the 1 s backoff
+    // (`aacs/handshake.rs:1746`) … returns ≤ 1 s", via the transport's `pause`.
+    #[test]
+    fn per_cert_backoff_uses_pause() {
+        let mut emu = DriveEmu::new();
+        emu.revoke_cert_sends = 1; // cert 1 rejected, so cert 2 waits the backoff
+        emu.serve_data_keys = true;
+        let (lx, ly) = (emu.la_x, emu.la_y);
+        let mut t = StopFake::new(emu);
+        t.cancel_on_pause = true;
+        let t0 = std::time::Instant::now();
+        let r = run_cert_handshake_with_anchors(
+            &mut t,
+            &[dummy_cert(), dummy_cert()],
+            (&lx, &ly),
+            (&[0; 32], &[0; 32]),
+            false,
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "returns ≤ 1 s"
+        );
+        assert_eq!(
+            r.unwrap_err(),
+            crate::UnlockError::Transport,
+            "a Stop aborts"
+        );
+        let backoff = std::time::Duration::from_millis(1000);
+        assert_eq!(
+            t.log.last(),
+            Some(&Ev::PauseRefused(backoff)),
+            "{:?}",
+            t.log
+        );
+        assert_eq!(
+            t.inner.certs_sent.len(),
+            1,
+            "cert 2 never reached the drive"
         );
     }
 }

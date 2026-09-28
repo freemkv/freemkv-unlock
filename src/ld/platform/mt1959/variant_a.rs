@@ -4,7 +4,7 @@
 
 use super::Mt1959;
 use crate::ld::error::Result;
-use crate::scsi::{DataDirection, ScsiTransport};
+use crate::scsi::{CriticalGuard, DataDirection, ScsiTransport};
 
 use super::SCSI_WRITE_BUFFER;
 
@@ -40,7 +40,10 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         0x00,
     ];
     let mut data = firmware.clone();
-    scsi.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
+    // D8 (stop-design-v5 §2.3): "the WRITE BUFFER at 30 s … and its verify run inside
+    // a `CriticalGuard`. C_max = 35 s" — a Stop mid-upload waits for both CDBs.
+    let mut span = CriticalGuard::enter(&mut *scsi)?;
+    span.execute(&cdb, DataDirection::ToDevice, &mut data, 30_000)?;
 
     // Verify the firmware loaded (non-fatal — different buffer_id 0x45). No
     // documented expected payload exists, so the outcome is traced rather
@@ -58,7 +61,7 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
         0x00,
     ];
     let mut verify_resp = [0u8; super::VALIDATE_RESPONSE_SIZE as usize];
-    match scsi.execute(
+    match span.execute(
         &verify_cdb,
         DataDirection::FromDevice,
         &mut verify_resp,
@@ -95,6 +98,8 @@ pub(super) fn load_firmware(mt: &mut Mt1959, scsi: &mut dyn ScsiTransport) -> Re
             }
         }
     }
+
+    drop(span); // the span ends here; the unlock below stays cancellable
 
     // Double unlock after firmware upload: first is fatal on failure, second
     // is a best-effort confirmation pass (matching variant B) so a benign

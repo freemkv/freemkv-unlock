@@ -442,6 +442,52 @@ mod tests {
             }
             status(0, data.len())
         }
+        // Forward the Stop methods (stop-design-v5 §2.3): the defaults would
+        // swallow them, so wrapped tests would stop exercising cancellation.
+        fn pause(&mut self, d: std::time::Duration) -> crate::scsi::Result<()> {
+            self.inner.pause(d)
+        }
+        fn begin_critical(&mut self) -> crate::scsi::Result<()> {
+            self.inner.begin_critical()
+        }
+        fn end_critical(&mut self) {
+            self.inner.end_critical()
+        }
+        fn execute_cleanup(
+            &mut self,
+            cdb: &[u8],
+            dir: crate::scsi::DataDirection,
+            data: &mut [u8],
+            timeout_ms: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            self.cdbs.push(cdb.to_vec());
+            self.inner.execute_cleanup(cdb, dir, data, timeout_ms)
+        }
+    }
+
+    // UT6 (stop-design-v5 §5.2; §2.3 "The test-only `FwFront<T>` … forwards all
+    // four"): otherwise every FwFront-wrapped test silently stops exercising Stop.
+    #[test]
+    fn fwfront_forwards_new_methods() {
+        use crate::scsi::DataDirection;
+        use crate::scsi::mock::{Ev, MockTransport, Reply, StopFake};
+        let inner = StopFake::new(MockTransport::always(Reply::good(vec![0u8; 2])));
+        let mut t = FwFront::new(inner);
+        let d = std::time::Duration::from_millis(1);
+        t.pause(d).expect("forwarded pause");
+        t.begin_critical().expect("forwarded begin");
+        t.end_critical();
+        let rel = [0xA4, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0x3F, 0];
+        t.execute_cleanup(&rel, DataDirection::FromDevice, &mut [0u8; 2], 5_000)
+            .expect("forwarded cleanup");
+        assert_eq!(
+            t.inner.log,
+            vec![Ev::Pause(d), Ev::Begin, Ev::End, Ev::Cleanup(rel.to_vec())],
+            "all four reach the wrapped transport"
+        );
+        t.inner.cancelled = true;
+        assert!(t.pause(d).is_err(), "a cancel reaches through the wrapper");
+        assert!(t.begin_critical().is_err());
     }
 
     fn vid_reply(vid: [u8; 16]) -> crate::scsi::mock::MockTransport {
