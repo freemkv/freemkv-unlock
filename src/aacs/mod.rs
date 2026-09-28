@@ -444,6 +444,31 @@ mod tests {
         }
     }
 
+    // UT6 (stop-design-v5 §5.2; §2.3 "The test-only `FwFront<T>` … forwards all
+    // four"): otherwise every FwFront-wrapped test silently stops exercising Stop.
+    #[test]
+    fn fwfront_forwards_new_methods() {
+        use crate::scsi::DataDirection;
+        use crate::scsi::mock::{Ev, MockTransport, Reply, StopFake};
+        let inner = StopFake::new(MockTransport::always(Reply::good(vec![0u8; 2])));
+        let mut t = FwFront::new(inner);
+        let d = std::time::Duration::from_millis(1);
+        t.pause(d).expect("forwarded pause");
+        t.begin_critical().expect("forwarded begin");
+        t.end_critical();
+        let rel = [0xA4, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0x3F, 0];
+        t.execute_cleanup(&rel, DataDirection::FromDevice, &mut [0u8; 2], 5_000)
+            .expect("forwarded cleanup");
+        assert_eq!(
+            t.inner.log,
+            vec![Ev::Pause(d), Ev::Begin, Ev::End, Ev::Cleanup(rel.to_vec())],
+            "all four reach the wrapped transport"
+        );
+        t.inner.cancelled = true;
+        assert!(t.pause(d).is_err(), "a cancel reaches through the wrapper");
+        assert!(t.begin_critical().is_err());
+    }
+
     fn vid_reply(vid: [u8; 16]) -> crate::scsi::mock::MockTransport {
         use crate::scsi::mock::{MockTransport, Reply};
         let mut p = vec![0u8; 36];

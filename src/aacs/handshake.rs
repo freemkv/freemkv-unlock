@@ -4899,4 +4899,275 @@ pub(crate) mod tests {
             "SEND KEY format 0x02 must not have been sent"
         );
     }
+
+    // ── Stop (stop-design-v5 §2.3, ST-U1): AGID guard + halt-aware backoff ──
+
+    use crate::scsi::mock::{Ev, StopFake, agid_ledger, is_agid_release};
+
+    /// (case, setup, cancel after this CDB, expected outcome).
+    type AkeCase<S> = (&'static str, S, Option<fn(&[u8]) -> bool>, &'static str);
+
+    fn outcome_name(o: &CertOutcome) -> &'static str {
+        match o {
+            CertOutcome::Ok(_) => "Ok",
+            CertOutcome::Transport => "Transport",
+            CertOutcome::VidUnavailable => "VidUnavailable",
+            CertOutcome::Reject { .. } => "Reject",
+        }
+    }
+
+    fn send_key_fmt(fmt: u8) -> fn(&[u8]) -> bool {
+        match fmt {
+            0x01 => |c| c[0] == crate::scsi::SCSI_SEND_KEY && c[10] & 0x3F == 0x01,
+            _ => |c| c[0] == crate::scsi::SCSI_SEND_KEY && c[10] & 0x3F == 0x02,
+        }
+    }
+
+    fn is_vid_read(c: &[u8]) -> bool {
+        c[0] == crate::scsi::SCSI_READ_DISC_STRUCTURE && c[7] == 0x80
+    }
+
+    /// Asserts one allocation, released exactly once through `execute_cleanup`.
+    fn assert_released_once(case: &str, log: &[Ev]) {
+        let (allocs, held) = agid_ledger(log);
+        assert_eq!(allocs, 1, "{case}: one allocation");
+        assert!(!held, "{case}: the AGID is released on the way out");
+        let rel = log
+            .iter()
+            .filter(|e| matches!(e, Ev::Cleanup(c) if is_agid_release(c)));
+        assert_eq!(
+            rel.count(),
+            1,
+            "{case}: exactly one release, via execute_cleanup"
+        );
+    }
+
+    // UT2 (stop-design-v5 §5.2) per evidence SS-7: "exactly one 0x3F per
+    // allocation, through `execute_cleanup`" for an error at each AACS 1.0 AKE
+    // step, each post-auth read, a Stop mid-AKE / mid-finish, and success.
+    #[test]
+    fn agid_released_exactly_once_on_every_ake_error_v1() {
+        type Setup = fn(&mut DriveEmu);
+        let cases: [AkeCase<Setup>; 9] = [
+            (
+                "step4 cert rejected",
+                |e| e.revoke_cert_sends = 1,
+                None,
+                "Reject",
+            ),
+            (
+                "step5 zero drive cert",
+                |e| e.zero_drive_cert_reads = 1,
+                None,
+                "Reject",
+            ),
+            (
+                "step6 bad signature",
+                |e| e.bad_step6_sig = true,
+                None,
+                "Reject",
+            ),
+            (
+                "stop mid-AKE",
+                |_| {},
+                Some(send_key_fmt(0x01)),
+                "Transport",
+            ),
+            (
+                "VID dead bus",
+                |e| e.fault_on_vid_read = true,
+                None,
+                "Transport",
+            ),
+            ("VID MAC", |e| e.bad_vid_mac = true, None, "VidUnavailable"),
+            ("data-key dead bus", |_| {}, None, "Transport"),
+            (
+                "stop after VID",
+                |e| e.serve_data_keys = true,
+                Some(is_vid_read),
+                "Transport",
+            ),
+            ("success", |e| e.serve_data_keys = true, None, "Ok"),
+        ];
+        let hc = dummy_cert();
+        for (case, setup, cancel_after, want) in cases {
+            let mut emu = DriveEmu::new();
+            setup(&mut emu);
+            let (lx, ly) = (emu.la_x, emu.la_y);
+            let mut t = StopFake::new(emu);
+            t.cancel_after = cancel_after;
+            let o = attempt_one_cert(&mut t, &hc, 0, (&lx, &ly, &[0; 32], &[0; 32]), true, false);
+            assert_eq!(outcome_name(&o), want, "{case}");
+            assert_released_once(case, &t.log);
+        }
+    }
+
+    // UT2, AACS 2.0 half: the same invariant on the native P-256 AKE.
+    #[test]
+    fn agid_released_exactly_once_on_every_ake_error_v2() {
+        type Setup = fn(&mut DriveEmuP256, &mut Vec<u8>);
+        let cases: [AkeCase<Setup>; 7] = [
+            (
+                "step5 bad LA signature",
+                |_, c| c[120] ^= 0xFF,
+                None,
+                "Reject",
+            ),
+            (
+                "step5 unknown cert type",
+                |_, c| c[0] = 0x12,
+                None,
+                "Reject",
+            ),
+            (
+                "step6 off-curve point",
+                |e, _| e.off_curve_point = true,
+                None,
+                "Reject",
+            ),
+            (
+                "step6 bad signature",
+                |e, _| e.bad_step6_sig = true,
+                None,
+                "Reject",
+            ),
+            (
+                "stop mid-AKE",
+                |_, _| {},
+                Some(send_key_fmt(0x01)),
+                "Transport",
+            ),
+            ("VID unavailable", |_, _| {}, None, "VidUnavailable"),
+            (
+                "stop at end of AKE",
+                |_, _| {},
+                Some(send_key_fmt(0x02)),
+                "Transport",
+            ),
+        ];
+        for (case, setup, cancel_after, want) in cases {
+            let (la_priv, la_x, la_y) = generate_host_key_pair_p256();
+            let (lt_priv, lt_x, lt_y) = generate_host_key_pair_p256();
+            let mut cert = p256_synth_cert(0x11, &lt_x, &lt_y, &la_priv);
+            let (host_priv, hx, hy) = generate_host_key_pair_p256();
+            let hc = crate::HostCert {
+                private_key: [0u8; 20],
+                certificate: Vec::new(),
+                private_key_v2: Some(host_priv),
+                certificate_v2: Some(p256_synth_cert(0x11, &hx, &hy, &la_priv)),
+            };
+            let mut emu = DriveEmuP256::new(lt_priv, Vec::new());
+            setup(&mut emu, &mut cert);
+            emu.cert = cert;
+            let mut t = StopFake::new(emu);
+            t.cancel_after = cancel_after;
+            let la = (&[0u8; 20], &[0u8; 20], &la_x, &la_y);
+            let o = attempt_one_cert(&mut t, &hc, 0, la, false, true);
+            assert_eq!(outcome_name(&o), want, "{case}");
+            assert_released_once(case, &t.log);
+        }
+    }
+
+    // UT3 (stop-design-v5 §5.2): "the 0x3F precedes the fallback's first CDB" —
+    // the 1.0 AGID is released right after its failed VID read, before P-256.
+    #[test]
+    fn agid_released_before_p256_fallthrough() {
+        let drive = HybridDrive::new();
+        let (l1, l2) = ((drive.la1_x, drive.la1_y), (drive.la2_x, drive.la2_y));
+        let v1 = dummy_cert();
+        let (hv2_priv, hv2_x, hv2_y) = generate_host_key_pair_p256();
+        let (throwaway_la, _, _) = generate_host_key_pair_p256();
+        let hc = crate::HostCert {
+            private_key: v1.private_key,
+            certificate: v1.certificate.clone(),
+            private_key_v2: Some(hv2_priv),
+            certificate_v2: Some(p256_synth_cert(0x11, &hv2_x, &hv2_y, &throwaway_la)),
+        };
+        let mut t = StopFake::new(drive);
+        let la = (&l1.0, &l1.1, &l2.0, &l2.1);
+        let o = attempt_one_cert(&mut t, &hc, 0, la, true, true);
+        assert_eq!(outcome_name(&o), "Ok", "the P-256 fallback completes");
+        assert!(t.inner.reached_p256);
+        let v = t
+            .log
+            .iter()
+            .position(|e| matches!(e, Ev::Exec(c) if is_vid_read(c)));
+        let v = v.expect("the 1.0 VID read");
+        assert!(
+            matches!(&t.log[v + 1], Ev::Cleanup(c) if is_agid_release(c)),
+            "the 1.0 AGID release must be the very next CDB: {:?}",
+            t.log.get(v + 1)
+        );
+        let (allocs, held) = agid_ledger(&t.log);
+        assert_eq!((allocs, held), (2, false), "one release per allocation");
+    }
+
+    // UT5, AACS half (stop-design-v5 §5.2): "zero invalidate CDBs after a cancel"
+    // — the pre-allocation invalidate loop uses `execute`, so it is refused.
+    #[test]
+    fn aacs_invalidate_loop_refused_after_cancel() {
+        let emu = DriveEmu::new();
+        let (lx, ly) = (emu.la_x, emu.la_y);
+        let mut t = StopFake::new(emu);
+        t.cancelled = true;
+        let r = run_cert_handshake_with_anchors(
+            &mut t,
+            &[dummy_cert()],
+            (&lx, &ly),
+            (&[0; 32], &[0; 32]),
+            false,
+        );
+        assert_eq!(r.unwrap_err(), crate::UnlockError::Transport);
+        assert!(
+            t.execs().is_empty(),
+            "no CDB reached the drive: {:?}",
+            t.log
+        );
+        assert!(
+            t.cleanups().is_empty(),
+            "no AGID was allocated, so none released"
+        );
+        assert!(t.inner.cdbs.is_empty());
+    }
+
+    // UT9, backoff half (stop-design-v5 §5.2): "a cancel during the 1 s backoff
+    // (`aacs/handshake.rs:1746`) … returns ≤ 1 s", via the transport's `pause`.
+    #[test]
+    fn per_cert_backoff_uses_pause() {
+        let mut emu = DriveEmu::new();
+        emu.revoke_cert_sends = 1; // cert 1 rejected, so cert 2 waits the backoff
+        emu.serve_data_keys = true;
+        let (lx, ly) = (emu.la_x, emu.la_y);
+        let mut t = StopFake::new(emu);
+        t.cancel_on_pause = true;
+        let t0 = std::time::Instant::now();
+        let r = run_cert_handshake_with_anchors(
+            &mut t,
+            &[dummy_cert(), dummy_cert()],
+            (&lx, &ly),
+            (&[0; 32], &[0; 32]),
+            false,
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "returns ≤ 1 s"
+        );
+        assert_eq!(
+            r.unwrap_err(),
+            crate::UnlockError::Transport,
+            "a Stop aborts"
+        );
+        let backoff = std::time::Duration::from_millis(1000);
+        assert_eq!(
+            t.log.last(),
+            Some(&Ev::PauseRefused(backoff)),
+            "{:?}",
+            t.log
+        );
+        assert_eq!(
+            t.inner.certs_sent.len(),
+            1,
+            "cert 2 never reached the drive"
+        );
+    }
 }

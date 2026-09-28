@@ -1799,6 +1799,112 @@ pub(crate) mod tests {
         assert_eq!((t.calls(), clock.waits), (1, 0));
     }
 
+    /// A Stop that lands during the upload, through `run_init` on `mode`: the
+    /// first do_unlock fails generically (so the firmware reloads), and the
+    /// cancel arrives once a CDB matching `stop_at` reaches the drive.
+    fn stop_during_upload(
+        is_variant_b: bool,
+        stop_at: fn(&[u8]) -> bool,
+    ) -> (Result<()>, Vec<crate::scsi::mock::Ev>) {
+        use crate::scsi::mock::{MockTransport, Reply, StopFake};
+        let sig = [0x11, 0x22, 0x33, 0x44];
+        let mut profile = fixture_profile(sig);
+        profile.firmware = vec![0u8; 64];
+        let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+        let inner = MockTransport::scripted(
+            vec![Reply::short(vec![0u8; 64], 10)], // run_init's do_unlock
+            Reply::good(unlock_ok),
+        );
+        let mut t = StopFake::new(inner);
+        t.cancel_after = Some(stop_at);
+        let mut mt = Mt1959::new(profile, is_variant_b);
+        let r = mt.init(&mut t);
+        (r, t.log)
+    }
+
+    fn is_unlock_cdb(c: &[u8]) -> bool {
+        c[0] == SCSI_READ_BUFFER && c[2] == BUFFER_ID_A && c[3] == SUB_CMD_UNLOCK
+            || c[0] == SCSI_READ_BUFFER && c[2] == BUFFER_ID_B && c[3] == SUB_CMD_UNLOCK
+    }
+
+    // UT7 (stop-design-v5 §5.2; §2.3 D8 "the WRITE BUFFER at 30 s … and its verify
+    // run inside a `CriticalGuard`. C_max = 35 s"): the verify still executes
+    // after a Stop mid-upload, and the next do_unlock is refused.
+    #[test]
+    fn mt1959_a_upload_completes_after_cancel_then_stops() {
+        use crate::scsi::mock::Ev;
+        let (r, log) = stop_during_upload(false, |c| c[0] == SCSI_WRITE_BUFFER);
+        let e = r.expect_err("the Stop ends the init");
+        assert!(e.is_transport_failure(), "a refusal is the dead-bus shape");
+        let shape: Vec<String> = log
+            .iter()
+            .map(|e| match e {
+                Ev::Exec(c) if is_unlock_cdb(c) => "unlock".into(),
+                Ev::Refused(c) if is_unlock_cdb(c) => "unlock refused".into(),
+                Ev::Exec(c) => format!("{:02X}/{:02X}", c[0], c[2]),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        let want = ["unlock", "Begin", "3B/00", "3C/45", "End", "unlock refused"];
+        assert_eq!(shape, want, "upload + verify complete; then stopped");
+    }
+
+    // UT7, cancel before the span: no WRITE BUFFER is ever started.
+    #[test]
+    fn mt1959_a_stop_before_upload_never_starts_it() {
+        use crate::scsi::mock::Ev;
+        let (r, log) = stop_during_upload(false, is_unlock_cdb);
+        assert!(r.expect_err("stopped").is_transport_failure());
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(
+            log[1],
+            Ev::BeginRefused,
+            "the span refuses to open after a Stop"
+        );
+    }
+
+    // UT8 (stop-design-v5 §5.2; §2.3 "MODE SELECT at 30 s …, READ BUFFER, WRITE
+    // BUFFER and F1 run inside a `CriticalGuard`. C_max = 45 s"), as UT7 for B.
+    #[test]
+    fn mt1959_b_upload_completes_after_cancel_then_stops() {
+        use crate::scsi::mock::Ev;
+        let (r, log) = stop_during_upload(true, |c| c[0] == 0x55);
+        assert!(r.expect_err("stopped").is_transport_failure());
+        let shape: Vec<String> = log
+            .iter()
+            .map(|e| match e {
+                Ev::Exec(c) if is_unlock_cdb(c) => "unlock".into(),
+                Ev::Refused(c) if is_unlock_cdb(c) => "unlock refused".into(),
+                Ev::Exec(c) => format!("{:02X}", c[0]),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        let want = [
+            "unlock",
+            "Begin",
+            "55",
+            "3C",
+            "3B",
+            "F1",
+            "End",
+            "unlock refused",
+        ];
+        assert_eq!(
+            shape, want,
+            "MODE SELECT, READ/WRITE BUFFER, F1; then stopped"
+        );
+    }
+
+    // UT8, cancel before the span: no MODE SELECT is ever started.
+    #[test]
+    fn mt1959_b_stop_before_upload_never_starts_it() {
+        use crate::scsi::mock::Ev;
+        let (r, log) = stop_during_upload(true, is_unlock_cdb);
+        assert!(r.expect_err("stopped").is_transport_failure());
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(log[1], Ev::BeginRefused);
+    }
+
     // ── run_probe entry / disc-type detection ───────────────────────────────
 
     /// `run_probe` called before `init_complete` runs `do_unlock` itself
