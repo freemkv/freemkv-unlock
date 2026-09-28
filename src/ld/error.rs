@@ -14,6 +14,9 @@ pub enum Error {
     UnlockFailed,
     /// A verify/handshake response did not match the expected signature.
     SignatureMismatch { expected: [u8; 4], got: [u8; 4] },
+    /// After a firmware upload the drive stayed not ready with no progress in its
+    /// answers for the stall window; carries its last (sense key, ASC, ASCQ).
+    NotReady { sense_key: u8, asc: u8, ascq: u8 },
     /// A SCSI command failed. `status == SCSI_STATUS_TRANSPORT_FAILURE` with
     /// `sense: None` is a transport-layer fault (bridge crash / disconnect).
     Scsi {
@@ -29,6 +32,15 @@ impl std::fmt::Display for Error {
             Error::ProfileParse => write!(f, "drive profile parse error"),
             Error::UnlockFailed => write!(f, "firmware unlock failed"),
             Error::SignatureMismatch { .. } => write!(f, "signature mismatch"),
+            Error::NotReady {
+                sense_key,
+                asc,
+                ascq,
+            } => write!(
+                f,
+                "drive not ready after firmware upload \
+                 (sense {sense_key:#04x}/{asc:#04x}/{ascq:#04x}, no progress)"
+            ),
             Error::Scsi { opcode, status, .. } => {
                 write!(f, "SCSI error (opcode {opcode:#04x}, status {status:#04x})")
             }
@@ -46,6 +58,7 @@ impl Error {
             Error::ProfileParse => 7101,
             Error::UnlockFailed => 7102,
             Error::SignatureMismatch { .. } => 7103,
+            Error::NotReady { .. } => 7104,
             Error::Scsi { .. } => 7199,
         }
     }
@@ -130,6 +143,11 @@ mod tests {
                 expected: [0; 4],
                 got: [1; 4],
             },
+            Error::NotReady {
+                sense_key: 0x02,
+                asc: 0x04,
+                ascq: 0x01,
+            },
         ] {
             assert!(!e.is_transport_failure(), "{e:?} is not a bus fault");
             assert_eq!(UnlockError::from(e), UnlockError::NotApplicable);
@@ -149,6 +167,15 @@ mod tests {
             }
             .to_string(),
             "signature mismatch"
+        );
+        assert_eq!(
+            Error::NotReady {
+                sense_key: 0x02,
+                asc: 0x04,
+                ascq: 0x01,
+            }
+            .to_string(),
+            "drive not ready after firmware upload (sense 0x02/0x04/0x01, no progress)"
         );
         assert_eq!(
             Error::Scsi {
@@ -192,6 +219,12 @@ mod tests {
                 got: [0; 4],
             }
             .code(),
+            Error::NotReady {
+                sense_key: 0,
+                asc: 0,
+                ascq: 0,
+            }
+            .code(),
             Error::Scsi {
                 opcode: 0,
                 status: 0,
@@ -199,6 +232,6 @@ mod tests {
             }
             .code(),
         ];
-        assert_eq!(codes, [7101, 7102, 7103, 7199]);
+        assert_eq!(codes, [7101, 7102, 7103, 7104, 7199]);
     }
 }
