@@ -1211,6 +1211,63 @@ mod tests {
         );
     }
 
+    // UT10 (stop-design-v5 §5.2, D10): "`run_init` must `return Ok(())` as soon as
+    // `load_firmware` confirms the unlock. The final upload is kept." GUARD G3 too;
+    // per design D10, do not change without a design citation proving otherwise.
+    #[test]
+    fn run_init_returns_ok_once_load_firmware_confirms() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let sig = [0x11, 0x22, 0x33, 0x44];
+        let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+        let short = || Reply::short(vec![0u8; 64], 10); // a generic do_unlock failure
+        let upload_ok = || {
+            vec![
+                Reply::good(vec![]),                                     // WRITE_BUFFER
+                Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]), // 0x45 verify
+            ]
+        };
+        // Case 1: attempt 0 reloads and load_firmware's own do_unlock confirms.
+        // Case 2: attempts 0-1 reload but fail; attempt 2 (the LAST) confirms,
+        // which the retry loop used to discard as `Err(last_err)`.
+        for failed_reloads in [0usize, 2] {
+            let mut script = Vec::new();
+            for _ in 0..failed_reloads {
+                script.push(short()); // run_init's do_unlock
+                script.extend(upload_ok());
+                script.push(short()); // load_firmware's do_unlock fails
+            }
+            script.push(short()); // run_init's do_unlock
+            script.extend(upload_ok());
+            script.push(Reply::good(unlock_ok.clone())); // load_firmware do_unlock #1
+            script.push(Reply::good(unlock_ok.clone())); // do_unlock #2 (best-effort)
+            let expected_calls = script.len();
+            // Anything past the script is a further retry, which must not happen.
+            let mut t = MockTransport::scripted(script, Reply::TransportFault);
+            let mut profile = fixture_profile(sig);
+            profile.firmware = vec![0u8; 64];
+            let mut mt = Mt1959::new(profile, false);
+            let t0 = std::time::Instant::now();
+            mt.init(&mut t)
+                .unwrap_or_else(|e| panic!("{failed_reloads} failed reloads: {e:?}"));
+            assert_eq!(
+                t.calls(),
+                expected_calls,
+                "no retry after a confirmed unlock"
+            );
+            assert!(mt.is_ready() && mt.is_unlocked(), "the unlock is kept");
+            let uploads = t.cdbs.iter().filter(|c| c[0] == SCSI_WRITE_BUFFER).count();
+            assert_eq!(
+                uploads,
+                failed_reloads + 1,
+                "the final upload is still issued"
+            );
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "no 10 s settle"
+            );
+        }
+    }
+
     // ── run_probe entry / disc-type detection ───────────────────────────────
 
     /// `run_probe` called before `init_complete` runs `do_unlock` itself
