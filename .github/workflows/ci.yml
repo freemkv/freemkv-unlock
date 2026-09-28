@@ -15,6 +15,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: no job here writes to the repo.
+permissions:
+  contents: read
+
 # freemkv-unlock is the BASE of the whole ecosystem: libfreemkv path-deps it,
 # bdemu path-deps it with the `emulation` feature, and every other crate pulls
 # it in transitively. It has no freemkv dependencies of its own, so no sibling
@@ -111,6 +115,34 @@ jobs:
       # `emulation` is off by default and is the face bdemu builds against. A
       # feature nothing compiles is a feature that breaks at release time.
       - run: cargo test --tests --features emulation
+      # `--tests` skips doctests; compile/run them so doc examples can't rot.
+      - run: cargo test --doc --all-features
+
+  # This crate's breakage takes every dependent down, so build the two direct
+  # consumers against THIS commit. libfreemkv resolves ../freemkv-unlock by
+  # layout; bdemu (emulation feature) also needs libfreemkv patched to the sibling.
+  consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: freemkv-unlock
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+        with:
+          checkout: libfreemkv bdemu
+          patch: libfreemkv
+          self: bdemu
+      # Dependents track current Rust, not this crate's MSRV.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            libfreemkv
+            bdemu
+      - run: cargo +stable build --all-targets
+        working-directory: libfreemkv
+      - run: cargo +stable build --all-targets
+        working-directory: bdemu
 
   # Coverage is additive and NON-REQUIRED: it uploads to Codecov but never
   # gates a merge (fail_ci_if_error is false, and it is not wired into any

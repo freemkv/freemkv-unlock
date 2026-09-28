@@ -22,11 +22,7 @@ impl Error {
 
     /// True if this is a transport-layer SCSI failure (bus dead).
     pub fn is_transport_failure(&self) -> bool {
-        matches!(
-            self,
-            Error::Scsi(s)
-                if s.status == crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE && s.sense.is_none()
-        )
+        matches!(self, Error::Scsi(s) if crate::scsi::is_dead_bus(s))
     }
 }
 

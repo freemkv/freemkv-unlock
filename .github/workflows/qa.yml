@@ -27,6 +27,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege by default; only rc-tag escalates (job-level contents: write).
+permissions:
+  contents: read
+
 jobs:
   # Single source of truth for the MSRV — see ci.yml. Jobs that build/test AT
   # the MSRV read `needs.resolve-msrv.outputs.v` from Cargo.toml's rust-version;

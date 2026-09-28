@@ -1080,20 +1080,20 @@ fn aacs_authenticate_with_agid(
     drive_nonce.copy_from_slice(&response[4..24]);
     drive_cert.copy_from_slice(&response[24..116]);
 
-    // Verify drive cert against the LA anchor. Only type-0x01 (1.0) is verifiable
-    // here; accepting type-0x11 (2.0) would skip this and the step-6 verify yet run
-    // ECDH (bus-key hole), so reject it — run_cert_handshake routes 0x11 to P-256.
+    // Only a type-0x01 (1.0) cert is verifiable here; accepting 0x11 would skip this and
+    // the step-6 verify yet run ECDH (bus-key hole). 0x11 gets P-256 only when enabled
+    // (AACS2_P256_EXPERIMENTAL, off in production); otherwise the handshake fails.
     if drive_cert[0] == 0x01 {
         if !verify_cert_with_anchor(&drive_cert, la_x, la_y) {
             return Err(V1Fail::DriveCert);
         }
     } else {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "aacs_cert_unsupported_type",
             cert_type = drive_cert[0],
             "drive certificate is not a verifiable AACS 1.0 (type 0x01) cert on the \
-             1.0 path; rejecting (a genuine 0x11 drive is retried on the native P-256 path)"
+             1.0 path; rejecting"
         );
         // 0x11 is a real 2.0 drive; any other type (e.g. a zeroed cert) is unproven.
         return Err(if drive_cert[0] == 0x11 {
@@ -1260,7 +1260,7 @@ fn aacs2_authenticate_p256_with_agid(
     // Chain-of-trust gate, mandatory on this live path: (a) reject any non-0x11 cert type
     // outright, (b) treat cert verify failure as FATAL, not logged-and-continued.
     if drive_cert[0] != 0x11 {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "aacs2_cert_unknown_type",
             cert_type = drive_cert[0],
@@ -1269,7 +1269,7 @@ fn aacs2_authenticate_p256_with_agid(
         return Err(Error::AacsCertVerify);
     }
     if !verify_cert_p256(drive_cert, la_x, la_y) {
-        tracing::warn!(
+        tracing::debug!(
             target: "freemkv::disc",
             phase = "aacs2_cert_verify_failed",
             "AACS 2.0 drive certificate failed P-256 LA verification; rejecting"
@@ -1497,7 +1497,7 @@ fn finish_auth(
         Err(e) => {
             let transport = e.is_scsi_transport_failure();
             let vid_mac = matches!(e, Error::AacsVidMac);
-            tracing::warn!(
+            tracing::debug!(
                 target: "freemkv::disc",
                 phase = "handshake_vid_read_failed",
                 cert_index = idx,
@@ -1749,7 +1749,7 @@ pub(crate) fn run_cert_handshake_with_anchors(
         match attempt_one_cert(scsi, hc, idx, la, v1_ok && !v1_drive_dead, has_v2) {
             CertOutcome::Ok(ch) => return Ok(ch),
             CertOutcome::Transport => {
-                tracing::warn!(
+                tracing::debug!(
                     target: "freemkv::disc",
                     phase = "handshake_transport_fault",
                     cert_index = idx,
@@ -4767,6 +4767,40 @@ pub(crate) mod tests {
             drive.v1_cert_sends, 0,
             "a known-dead v1 pairing is not shipped"
         );
+    }
+
+    /// With P-256 enabled, a v2 cert shorter than 132 bytes (131 here) is not
+    /// usable v2 creds: with a dead v1 pairing it is skipped up front, burns no
+    /// wedge-guard attempt, and a later valid 132-byte cert is still tried.
+    #[test]
+    fn short_v2_cert_is_skipped_up_front_under_p256() {
+        let short_v2 = || {
+            let mut hc = with_v2_creds(mispaired_host_cert());
+            hc.certificate_v2.as_mut().expect("v2 cert").truncate(131);
+            hc
+        };
+        let mut drive = HybridDrive::new();
+        let (l1x, l1y) = (drive.la1_x, drive.la1_y);
+        let (l2x, l2y) = (drive.la2_x, drive.la2_y);
+        let mut certs = vec![short_v2(), short_v2(), short_v2()];
+        certs.push(with_v2_creds(mispaired_host_cert()));
+        assert_eq!(certs[3].certificate_v2.as_ref().map(Vec::len), Some(132));
+        let ch =
+            run_cert_handshake_with_anchors(&mut drive, &certs, (&l1x, &l1y), (&l2x, &l2y), true)
+                .expect("the 132-byte 4th cert is tried and completes P-256");
+        assert_eq!(ch.volume_id, [0x5Au8; 16]);
+
+        let mut t = MockTransport::always(Reply::illegal_request());
+        let err = run_cert_handshake_with_anchors(
+            &mut t,
+            &[short_v2()],
+            (&l1x, &l1y),
+            (&l2x, &l2y),
+            true,
+        )
+        .expect_err("a short v2 cert cannot authenticate");
+        assert_eq!(err, crate::UnlockError::NoUsableHostCert);
+        assert_eq!(t.calls(), 0);
     }
 
     /// A non-Bus-Encryption-Capable drive (drive cert byte 1 bit 0 clear) is

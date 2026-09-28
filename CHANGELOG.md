@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- AACS handshake diagnostics that a scan now reports itself log below WARN: unsupported or unverifiable drive certs, VID read failures and transport faults at DEBUG, `read_data_key_dropped` at INFO.
+
 ## [1.7.7] — 2026-09-26
 
 ### Maintenance

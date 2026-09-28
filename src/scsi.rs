@@ -66,6 +66,13 @@ impl ScsiSense {
 
 /// SCSI status byte for a transport-layer failure (bridge crash / disconnect).
 pub(crate) const SCSI_STATUS_TRANSPORT_FAILURE: u8 = 0xFF;
+/// Whether a transport error is a genuine dead bus (a senseless transport-failure
+/// status) rather than a drive rejection surfaced through a non-conforming
+/// transport (`Err` carrying a sense).
+pub(crate) fn is_dead_bus(e: &ScsiError) -> bool {
+    e.status == SCSI_STATUS_TRANSPORT_FAILURE && e.sense.is_none()
+}
+
 /// SCSI status byte CHECK CONDITION (a drive sense is available). Part of the
 /// status contract; currently referenced only by tests asserting the
 /// transport-vs-check-condition distinction.
