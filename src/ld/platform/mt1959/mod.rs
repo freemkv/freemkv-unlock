@@ -1460,32 +1460,140 @@ mod tests {
         assert_eq!((clock.waits, clock.now), (3, READY_POLL * 3));
     }
 
-    // T6: the SAME not-ready answer for 60 s → the stall error; no total cap
-    // before that, and the failure lands within one poll of the window.
+    // Review of ST-D10: a stall after a confirmed upload must not undo the unlock.
+    // The SAME not-ready answer for 60 s (T6) → warn and return Ok, exactly at 60 s.
     #[test]
-    fn media_ready_poll_fails_after_60s_without_progress() {
+    fn media_ready_poll_stall_keeps_the_unlock() {
         use crate::scsi::mock::MockTransport;
         let mut t = MockTransport::always(not_ready(0x04, 0x01));
         let mut clock = FakeClock::new();
-        let e = await_media_ready(&mut t, &mut clock).expect_err("stalled");
-        assert_eq!(
-            e,
-            Error::NotReady {
-                sense_key: 0x02,
-                asc: 0x04,
-                ascq: 0x01
-            }
-        );
-        assert!(!e.is_transport_failure(), "a stall is not a dead bus");
+        let r = await_media_ready(&mut t, &mut clock);
+        assert!(r.is_ok(), "a stall keeps the unlock: {r:?}");
         assert_eq!(
             clock.now, READY_STALL,
-            "fails exactly at 60 s without progress"
+            "gives up exactly at 60 s without progress"
         );
         assert_eq!(
             t.calls(),
             121,
             "one poll per 500 ms, then the 61st second's poll"
         );
+    }
+
+    // MMC-6 Table F.3 "2 3A 00 MEDIUM NOT PRESENT": 10 consecutive answers (~5 s,
+    // libfreemkv WAIT_READY_MAX_EMPTY_POLLS) with no 04/01 → Ok (empty drive).
+    #[test]
+    fn media_ready_poll_no_medium_returns_after_the_grace() {
+        use crate::scsi::mock::MockTransport;
+        let mut t = MockTransport::always(not_ready(0x3A, 0x00));
+        let mut clock = FakeClock::new();
+        assert!(await_media_ready(&mut t, &mut clock).is_ok());
+        assert_eq!(
+            (t.calls(), clock.waits),
+            (10, 9),
+            "10 × 3A, ~4.5 s of waits"
+        );
+    }
+
+    // Table F.3 "2 04 01 LOGICAL UNIT IS IN PROCESS OF BECOMING READY" seen first:
+    // a later 3A run is not final, so the poll keeps going past 10 × 3A.
+    #[test]
+    fn media_ready_poll_keeps_polling_3a_after_04_01() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let mut script = vec![not_ready(0x04, 0x01)];
+        script.extend((0..20).map(|_| not_ready(0x3A, 0x00)));
+        let mut t = MockTransport::scripted(script, Reply::good(vec![]));
+        let mut clock = FakeClock::new();
+        assert!(await_media_ready(&mut t, &mut clock).is_ok());
+        assert_eq!(t.calls(), 22, "polled through 20 × 3A to ready");
+    }
+
+    // Table F.3 "2 04 02 LOGICAL UNIT NOT READY, INITIALIZING CMD. REQUIRED" →
+    // exactly one START STOP UNIT, Table 633 "0 1 Start the disc and make ready".
+    #[test]
+    fn media_ready_poll_04_02_sends_one_start_unit() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let script = vec![
+            not_ready(0x04, 0x02),
+            not_ready(0x04, 0x02),
+            not_ready(0x04, 0x02),
+        ];
+        let mut t = MockTransport::scripted(script, Reply::good(vec![]));
+        let mut clock = FakeClock::new();
+        assert!(await_media_ready(&mut t, &mut clock).is_ok());
+        let starts: Vec<_> = t.cdbs.iter().filter(|c| c[0] == 0x1B).collect();
+        assert_eq!(
+            starts,
+            vec![&vec![0x1B, 0x00, 0x00, 0x00, 0x01, 0x00]],
+            "one START UNIT"
+        );
+        assert_eq!(t.cdbs[1][0], 0x1B, "sent right after the first 04/02");
+    }
+
+    // Table F.3 "2 30 00 INCOMPATIBLE MEDIUM INSTALLED" never becomes ready:
+    // return Ok at once (the unlock stands), with no wait.
+    #[test]
+    fn media_ready_poll_incompatible_medium_returns_at_once() {
+        use crate::scsi::mock::MockTransport;
+        let mut t = MockTransport::always(not_ready(0x30, 0x00));
+        let mut clock = FakeClock::new();
+        assert!(await_media_ready(&mut t, &mut clock).is_ok());
+        assert_eq!((t.calls(), clock.waits), (1, 0));
+    }
+
+    // Table F.1: "6 29 00 POWER ON, RESET, OR BUS DEVICE RESET OCCURRED" and
+    // "6 28 00 NOT READY TO READY CHANGE…" after the upload's reset: keep polling.
+    #[test]
+    fn media_ready_poll_unit_attention_then_ready() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let ua = |asc| Reply::Sense {
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense_key: 0x06,
+            asc,
+            ascq: 0x00,
+        };
+        let mut t = MockTransport::scripted(vec![ua(0x29), ua(0x28)], Reply::good(vec![]));
+        let mut clock = FakeClock::new();
+        assert!(await_media_ready(&mut t, &mut clock).is_ok());
+        assert_eq!((t.calls(), clock.waits), (3, 2));
+    }
+
+    // MEDIUM ERROR (3), HARDWARE ERROR (4, MMC-6 F.3.8 "reported when SK = HARDWARE
+    // ERROR"), ILLEGAL REQUEST (5, F.3.2) are not readiness answers: Ok at once.
+    #[test]
+    fn media_ready_poll_error_sense_keys_return_at_once() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        for sense_key in [0x03, 0x04, 0x05] {
+            let mut t = MockTransport::always(Reply::Sense {
+                status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+                sense_key,
+                asc: 0x00,
+                ascq: 0x00,
+            });
+            let mut clock = FakeClock::new();
+            assert!(
+                await_media_ready(&mut t, &mut clock).is_ok(),
+                "SK {sense_key}"
+            );
+            assert_eq!((t.calls(), clock.waits), (1, 0), "SK {sense_key}");
+        }
+    }
+
+    // libfreemkv's adapter returns `Err` carrying the sense for a non-zero status:
+    // that is a drive answer, not a dead bus, so the poll must keep going.
+    #[test]
+    fn media_ready_poll_err_with_sense_is_an_answer() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let err_nr = || Reply::ErrWithSense {
+            status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+            sense_key: 0x02,
+            asc: 0x04,
+            ascq: 0x01,
+        };
+        let mut t = MockTransport::scripted(vec![err_nr(), err_nr()], Reply::good(vec![]));
+        let mut clock = FakeClock::new();
+        assert!(await_media_ready(&mut t, &mut clock).is_ok());
+        assert_eq!(t.calls(), 3);
     }
 
     // T6: a NEW answer is progress and re-arms the window, so a drive that keeps
@@ -1504,7 +1612,7 @@ mod tests {
     }
 
     // T6 stricter reading (§2.11): two KNOWN answers alternating is not progress,
-    // so a flapping drive stalls 60 s after its last new answer.
+    // so a flapping drive stalls 60 s after its last new answer (unlock kept).
     #[test]
     fn media_ready_poll_flapping_answers_still_stall() {
         struct Flap(usize);
@@ -1529,8 +1637,8 @@ mod tests {
             }
         }
         let mut clock = FakeClock::new();
-        let e = await_media_ready(&mut Flap(0), &mut clock).expect_err("flapping stalls");
-        assert!(matches!(e, Error::NotReady { .. }));
+        let r = await_media_ready(&mut Flap(0), &mut clock);
+        assert!(r.is_ok(), "stalls, unlock kept: {r:?}");
         assert_eq!(
             clock.now,
             READY_POLL + READY_STALL,
