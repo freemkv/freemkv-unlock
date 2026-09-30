@@ -119,8 +119,8 @@ jobs:
       - run: cargo test --doc --all-features
 
   # This crate's breakage takes every dependent down, so build the two direct
-  # consumers against THIS commit. libfreemkv resolves ../freemkv-unlock by
-  # layout; bdemu (emulation feature) also needs libfreemkv patched to the sibling.
+  # consumers against THIS commit: both dep freemkv-unlock by version, so each
+  # gets a path patch (bdemu also patches libfreemkv to the sibling).
   consumers:
     runs-on: ubuntu-latest
     steps:
@@ -130,8 +130,12 @@ jobs:
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv bdemu
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: bdemu
+      - name: Point libfreemkv at THIS commit
+        run: |
+          mkdir -p libfreemkv/.cargo
+          printf '[patch.crates-io]\nfreemkv-unlock = { path = "../freemkv-unlock" }\n' > libfreemkv/.cargo/config.toml
       # Dependents track current Rust, not this crate's MSRV.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
