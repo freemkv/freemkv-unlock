@@ -46,7 +46,7 @@ jobs:
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -60,7 +60,7 @@ jobs:
   changelog:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Require a CHANGELOG entry for the crate version on main
         shell: bash
         run: |
@@ -81,7 +81,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # fmt runs on the pinned MSRV toolchain; clippy runs on stable. Linting on
       # stable makes new-lint debt a BLOCKING gate the pinned version would
       # otherwise hide. The MSRV pin is installed second so it stays the default
@@ -104,7 +104,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -124,7 +124,7 @@ jobs:
   consumers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
@@ -158,7 +158,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -183,7 +183,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -209,7 +209,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -234,7 +234,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
