@@ -46,7 +46,7 @@ jobs:
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -60,7 +60,7 @@ jobs:
   changelog:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Require a CHANGELOG entry for the crate version on main
         shell: bash
         run: |
@@ -81,7 +81,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # fmt runs on the pinned MSRV toolchain; clippy runs on stable. Linting on
       # stable makes new-lint debt a BLOCKING gate the pinned version would
       # otherwise hide. The MSRV pin is installed second so it stays the default
@@ -104,7 +104,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -119,19 +119,23 @@ jobs:
       - run: cargo test --doc --all-features
 
   # This crate's breakage takes every dependent down, so build the two direct
-  # consumers against THIS commit. libfreemkv resolves ../freemkv-unlock by
-  # layout; bdemu (emulation feature) also needs libfreemkv patched to the sibling.
+  # consumers against THIS commit: both dep freemkv-unlock by version, so each
+  # gets a path patch (bdemu also patches libfreemkv to the sibling).
   consumers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-unlock
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           checkout: libfreemkv bdemu
-          patch: libfreemkv
+          patch: libfreemkv freemkv-unlock
           self: bdemu
+      - name: Point libfreemkv at THIS commit
+        run: |
+          mkdir -p libfreemkv/.cargo
+          printf '[patch.crates-io]\nfreemkv-unlock = { path = "../freemkv-unlock" }\n' > libfreemkv/.cargo/config.toml
       # Dependents track current Rust, not this crate's MSRV.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -154,7 +158,7 @@ jobs:
     needs: resolve-msrv
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -179,7 +183,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -205,7 +209,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -230,7 +234,7 @@ jobs:
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
