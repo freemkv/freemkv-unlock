@@ -31,7 +31,7 @@ rand = "0.10"
 # the redacting Debug impls). `derive` gives ZeroizeOnDrop for the key structs.
 zeroize = { version = "1", features = ["derive"] }
 # Pioneer/Renesas vendor CDB constructors (identity read, gated memory read, knock).
-pioneer-optical = "0.7"
+pioneer-optical = "0.10"
 
 [lints.clippy]
 uninlined_format_args = "allow"

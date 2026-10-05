@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Maintenance
+
+- `pioneer-optical` 0.10 (the 0.7 line is yanked). The vendor CDB bytes are unchanged, and a test pins them.
+
 ## [1.8.0] — 2026-10-05
 
 ### Changed

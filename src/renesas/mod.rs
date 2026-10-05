@@ -10,7 +10,7 @@ use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
 
 /// The Renesas vendor identity block length (READ_BUFFER 0x02/0xF1).
-const RB_F1_LEN: usize = pioneer_optical::IDENTITY_LEN as usize;
+const RB_F1_LEN: usize = pioneer_optical::IDENTITY_LEN;
 /// The ASCII interface marker a Renesas controller returns at `[16..19]`.
 const RENESAS_MARKER: &[u8] = b"SAT";
 const RENESAS_MARKER_OFFSET: usize = 16;
@@ -26,7 +26,7 @@ const RENESAS_MARKER_OFFSET: usize = 16;
 /// `Err(Transport)` on a dead bus.
 pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
     let mut buf = [0u8; RB_F1_LEN];
-    let cdb = pioneer_optical::vendor_identity();
+    let cdb = pioneer_optical::cdb::vendor_identity();
     match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
         Ok(r) => {
             let end = RENESAS_MARKER_OFFSET + RENESAS_MARKER.len();
@@ -73,13 +73,16 @@ impl Renesas {
     // knock + second read (B).
     fn vendor_open(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
         // A: primary open read.
-        if read_is_good(scsi, &pioneer_optical::read_memory(0x04, OPEN_READ_LEN))? {
+        if read_is_good(
+            scsi,
+            &pioneer_optical::cdb::read_memory(0x04, OPEN_READ_LEN),
+        )? {
             return Ok(true);
         }
         // B: MakeMKV's fallback — knock, then the second-window read. The knock is
         // fire-and-forget (payload-less); its own status is not the signal.
         match scsi.execute(
-            &pioneer_optical::knock(),
+            &pioneer_optical::cdb::knock(),
             DataDirection::None,
             &mut [],
             5_000,
@@ -90,7 +93,7 @@ impl Renesas {
         }
         read_is_good(
             scsi,
-            &pioneer_optical::read_memory(0x50_0000, OPEN_READ_LEN),
+            &pioneer_optical::cdb::read_memory(0x50_0000, OPEN_READ_LEN),
         )
     }
 }
@@ -163,6 +166,23 @@ mod tests {
     use super::*;
     use crate::DiscKind;
     use crate::scsi::{DataDirection, Result, ScsiError, ScsiResult, ScsiTransport};
+
+    #[test]
+    fn vendor_cdbs_are_the_wire_bytes() {
+        assert_eq!(
+            pioneer_optical::cdb::vendor_identity(),
+            [0x3C, 0x02, 0xF1, 0, 0, 0, 0, 0, 0x30, 0]
+        );
+        assert_eq!(
+            pioneer_optical::cdb::read_memory(0x50_0000, 0x10),
+            [0x3C, 0x02, 0xB0, 0x50, 0, 0, 0, 0, 0x10, 0]
+        );
+        assert_eq!(
+            pioneer_optical::cdb::knock(),
+            [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0]
+        );
+        assert_eq!(RB_F1_LEN, 48);
+    }
 
     /// Serves a fixed READ_BUFFER payload (Renesas-like) with a Good status.
     struct RenesasTransport {
