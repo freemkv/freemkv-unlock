@@ -4,6 +4,7 @@
 
 ### Changed
 
+- The Renesas/Pioneer unlocker builds its vendor CDBs (identity read, gated memory reads, read-unlock knock) with the `pioneer-optical` crate instead of hard-coded bytes; the commands sent are unchanged.
 - AACS handshake diagnostics that a scan now reports itself log below WARN: unsupported or unverifiable drive certs, VID read failures and transport faults at DEBUG, `read_data_key_dropped` at INFO.
 
 ## [1.7.7] — 2026-09-26

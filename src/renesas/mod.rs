@@ -9,9 +9,8 @@
 use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
 
-/// READ_BUFFER mode 0x02, buffer 0xF1 — the Renesas vendor identity buffer.
-const RB_F1_CDB: [u8; 10] = [0x3C, 0x02, 0xF1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00];
-const RB_F1_LEN: usize = 48;
+/// The Renesas vendor identity block length (READ_BUFFER 0x02/0xF1).
+const RB_F1_LEN: usize = pioneer_optical::IDENTITY_LEN as usize;
 /// The ASCII interface marker a Renesas controller returns at `[16..19]`.
 const RENESAS_MARKER: &[u8] = b"SAT";
 const RENESAS_MARKER_OFFSET: usize = 16;
@@ -27,7 +26,8 @@ const RENESAS_MARKER_OFFSET: usize = 16;
 /// `Err(Transport)` on a dead bus.
 pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
     let mut buf = [0u8; RB_F1_LEN];
-    match scsi.execute(&RB_F1_CDB, DataDirection::FromDevice, &mut buf, 5_000) {
+    let cdb = pioneer_optical::vendor_identity();
+    match scsi.execute(&cdb, DataDirection::FromDevice, &mut buf, 5_000) {
         Ok(r) => {
             let end = RENESAS_MARKER_OFFSET + RENESAS_MARKER.len();
             Ok(r.status == 0
@@ -72,26 +72,31 @@ impl Renesas {
     // MakeMKV's vendor "open" sequence: primary read (A), and on refusal a
     // knock + second read (B).
     fn vendor_open(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
-        const RB_B0_04_CDB: [u8; 10] = [0x3C, 0x02, 0xB0, 0x00, 0x00, 0x04, 0x00, 0x00, 0xA4, 0x00];
-        const KNOCK_A5AAAA_CDB: [u8; 10] =
-            [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00];
-        const RB_B0_500000_CDB: [u8; 10] =
-            [0x3C, 0x02, 0xB0, 0x50, 0x00, 0x00, 0x00, 0x00, 0xA4, 0x00];
-
         // A: primary open read.
-        if read_is_good(scsi, &RB_B0_04_CDB)? {
+        if read_is_good(scsi, &pioneer_optical::read_memory(0x04, OPEN_READ_LEN))? {
             return Ok(true);
         }
         // B: MakeMKV's fallback — knock, then the second-window read. The knock is
         // fire-and-forget (payload-less); its own status is not the signal.
-        match scsi.execute(&KNOCK_A5AAAA_CDB, DataDirection::None, &mut [], 5_000) {
+        match scsi.execute(
+            &pioneer_optical::knock(),
+            DataDirection::None,
+            &mut [],
+            5_000,
+        ) {
             Ok(_) => {}
             Err(e) if is_dead_bus(&e) => return Err(UnlockError::Transport),
             Err(_) => {} // a drive that refuses the knock still gets the B read tried
         }
-        read_is_good(scsi, &RB_B0_500000_CDB)
+        read_is_good(
+            scsi,
+            &pioneer_optical::read_memory(0x50_0000, OPEN_READ_LEN),
+        )
     }
 }
+
+/// The vendor "open" reads' length (0xA4 = 164 bytes).
+const OPEN_READ_LEN: u32 = 0xA4;
 
 /// Issue a 164-byte vendor READ_BUFFER; `Ok(true)` on GOOD status, `Ok(false)`
 /// on CHECK CONDITION (drive refused), `Err(Transport)` on a senseless
@@ -100,7 +105,7 @@ fn read_is_good(
     scsi: &mut dyn ScsiTransport,
     cdb: &[u8; 10],
 ) -> std::result::Result<bool, UnlockError> {
-    let mut buf = [0u8; 164];
+    let mut buf = [0u8; OPEN_READ_LEN as usize];
     match scsi.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000) {
         Ok(r) => Ok(r.status == 0),
         Err(e) => {

@@ -110,6 +110,7 @@ dependencies = [
  "base64",
  "num-bigint",
  "num-traits",
+ "pioneer-optical",
  "rand",
  "serde",
  "serde_json",
@@ -206,6 +207,12 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pioneer-optical"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48a5bdb9e9a07422ceb5133d227fbe4ecce77060007e5a9bac0dda3d82d72911"
 
 [[package]]
 name = "proc-macro2"
