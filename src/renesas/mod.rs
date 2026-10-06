@@ -56,11 +56,8 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
     }
 }
 
-/// The Renesas/Pioneer-platform unlocker. Its vendor "open" CDB puts the drive
-/// in the same raw-read / extended-access state the firmware routes reach (this
-/// is what MakeMKV's LibreDrive does on stock Pioneer firmware), so the Volume
-/// ID is then read with the SAME standard `0xAD` reader as freemkv/MT1959 — no
-/// host cert, no AKE. Stateless: `unlock()` returns what it learned.
+/// The Renesas/Pioneer-platform unlocker. Reads the VID from the vendor
+/// memory window; extended memory access does not enable standard AACS VID reads.
 #[derive(Default)]
 pub struct Renesas;
 
@@ -120,17 +117,50 @@ fn read_is_good(
     }
 }
 
+/// Verified on BDR-UD04 1.14 with two independently known disc VIDs.
+/// Whether this slot is shared across models/firmware is still under research.
+/// This low address does
+/// not need extended-read enable on that drive. The payload has no AD header.
+const VID_ADDR: u32 = 0x2A10;
+
+fn read_memory_vid(
+    scsi: &mut dyn ScsiTransport,
+) -> std::result::Result<Option<[u8; 16]>, UnlockError> {
+    let cdb = pioneer_optical::cdb::read_memory(VID_ADDR, 16);
+    let mut vid = [0u8; 16];
+    tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_request",
+        address = VID_ADDR, ?cdb, requested = 16, "Reading VID from Renesas memory");
+    let result = match scsi.execute(&cdb, DataDirection::FromDevice, &mut vid, 5_000) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_error",
+                address = VID_ADDR, status = e.status, sense = ?e.sense,
+                "Renesas memory VID read failed");
+            return if is_dead_bus(&e) {
+                Err(UnlockError::Transport)
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    let valid = result.status == 0
+        && result.bytes_transferred == vid.len()
+        && vid.iter().any(|&b| b != 0)
+        && vid.iter().any(|&b| b != 0xff);
+    tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_result",
+        address = VID_ADDR, status = result.status,
+        bytes_transferred = result.bytes_transferred, sense = ?result.sense,
+        payload = ?vid, valid, "Renesas memory VID response");
+    Ok(valid.then_some(vid))
+}
+
 impl Unlocker for Renesas {
     fn name(&self) -> &'static str {
         "Renesas"
     }
 
-    /// Gate on the `0xF1` SAT identity, then the vendor open read `0xB0@0x04`
-    /// (LOAD-BEARING — it's the unlock), then read the Volume ID with the shared
-    /// best-effort `0xAD` reader. `Some` once the open succeeds — the drive
-    /// serves clear content whether or not the bonus VID read did; `None` if it
-    /// isn't a Renesas drive or the open is refused; `Err(Transport)` on a dead
-    /// bus.
+    /// Gate on the SAT identity and vendor read probe, then attempt the RAM VID.
+    /// A missing VID preserves the existing unlock result; dead buses propagate.
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -147,15 +177,12 @@ impl Unlocker for Renesas {
             );
             return Ok(None);
         }
-        // The open enabled raw reads (extended-access) — read the VID exactly as
-        // the firmware routes do. Best-effort: a VID miss must not discard the
-        // unlock (only a dead bus propagates via `?`).
-        let vid = crate::vid::read_aacs_vid(scsi)?;
+        let vid = read_memory_vid(scsi)?;
         tracing::debug!(
             target: "freemkv::disc",
             phase = "renesas_opened",
             has_vid = vid.is_some(),
-            "Renesas drive opened (RB 0xB0@0x04 GOOD, raw reads enabled)"
+            "Renesas vendor read probe succeeded"
         );
         Ok(Some(Unlocked { vid, bus_key: None }))
     }
@@ -166,6 +193,45 @@ mod tests {
     use super::*;
     use crate::DiscKind;
     use crate::scsi::{DataDirection, Result, ScsiError, ScsiResult, ScsiTransport};
+
+    #[test]
+    fn memory_vid_uses_exact_slot_and_raw_payload() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        let vid = [0x25; 16];
+        let mut t = MockTransport::scripted(
+            vec![
+                Reply::good(renesas_payload()),
+                Reply::good(vec![0; 164]),
+                Reply::good(vid.to_vec()),
+            ],
+            Reply::TransportFault,
+        );
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert_eq!(
+            Renesas::new().unlock(&mut t, &ctx).unwrap().unwrap().vid,
+            Some(vid)
+        );
+        assert_eq!(t.cdbs.len(), 3);
+        assert_eq!(t.cdbs[2], [0x3c, 0x02, 0xb0, 0, 0x2a, 0x10, 0, 0, 16, 0]);
+    }
+
+    #[test]
+    fn memory_vid_rejects_invalid_responses_and_propagates_dead_bus() {
+        use crate::scsi::mock::{MockTransport, Reply};
+        for reply in [
+            Reply::short(vec![0x25; 16], 15),
+            Reply::good(vec![0; 16]),
+            Reply::good(vec![0xff; 16]),
+            Reply::illegal_request(),
+            Reply::illegal_request_as_err(),
+        ] {
+            let mut t = MockTransport::always(reply);
+            assert_eq!(read_memory_vid(&mut t).unwrap(), None);
+        }
+        let mut t = MockTransport::always(Reply::TransportFault);
+        assert_eq!(read_memory_vid(&mut t).unwrap_err(), UnlockError::Transport);
+    }
 
     #[test]
     fn vendor_cdbs_are_the_wire_bytes() {
@@ -273,13 +339,12 @@ mod tests {
         };
         let id = crate::DriveId::default();
         let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        // Recognized + vendor-open GOOD → unlocked; the open enables raw reads,
-        // so the standard 0xAD VID read returns a (non-zero) VID best-effort.
+        // Recognized + vendor probe GOOD, then a best-effort memory VID read.
         let out = Renesas::new()
             .unlock(&mut t, &ctx)
             .expect("no fault")
             .expect("renesas → unlocked");
-        assert!(out.vid.is_some(), "opened drive yields a VID via 0xAD");
+        assert!(out.vid.is_some(), "opened drive yields a VID via memory");
         assert_eq!(out.bus_key, None, "raw-read route needs no bus key");
     }
 
@@ -358,7 +423,7 @@ mod tests {
                     });
                 }
                 // A read (RB 0xB0@0x04) → refuse with a drive sense.
-                if cdb.get(2) == Some(&0xB0) && cdb.get(3) == Some(&0x00) {
+                if cdb == pioneer_optical::cdb::read_memory(0x04, OPEN_READ_LEN) {
                     let mut sense = [0u8; 32];
                     sense[2] = 0x05; // ILLEGAL REQUEST
                     sense[12] = 0x20;
@@ -367,7 +432,7 @@ mod tests {
                         sense: Some(sense),
                     });
                 }
-                // B read (RB 0xB0@0x50), the knock (0x3B/0x41), and the 0xAD VID
+                // B read (RB 0xB0@0x50), the knock (0x3B/0x41), and the memory VID
                 // read all return GOOD so the open + VID read succeed.
                 let n = data.len().min(36);
                 if !data.is_empty() {

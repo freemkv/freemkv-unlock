@@ -1,9 +1,7 @@
 //! Shared AACS Volume ID read — the standard `READ DISC STRUCTURE` (`0xAD`,
 //! format `0x80`) that returns the VID on a drive whose host-auth / bus has
-//! already been opened by a firmware or vendor CDB unlock (freemkv Raw Read,
-//! MT1959, or a Pioneer/Renesas vendor open). Because those routes put the
-//! drive in the same raw-read state, the VID read is identical across them — so
-//! it lives here once.
+//! already been opened by a compatible firmware unlock (freemkv Raw Read or
+//! MT1959). Renesas uses its separate vendor-memory VID reader.
 //!
 //! BEST-EFFORT: only a dead bus is an `Err(Transport)`. A CHECK CONDITION, a
 //! short response, or an all-zero VID all yield `Ok(None)` — a VID miss must
