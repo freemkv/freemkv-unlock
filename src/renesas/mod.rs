@@ -2,9 +2,10 @@
 //!
 //! Optical drives split into two controller families: MediaTek (handled by
 //! [`crate::ld`]) and Renesas. This module identifies the Renesas side via a
-//! single vendor identity probe (see [`is_renesas`]) and reports the match so a
-//! Renesas drive is named honestly. It does not modify drive state; AACS bus
-//! decryption is handled by the host cert.
+//! single vendor identity probe (see [`is_renesas`]). Renesas drives are
+//! OEM-unlocked: identity establishes unlocked status without a host certificate.
+//! Vendor memory access is used only for optional VID discovery; a discovery
+//! miss preserves unlocked status, while transport faults and cancellation abort.
 
 use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
@@ -31,7 +32,7 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
         Ok(r) => {
             let end = RENESAS_MARKER_OFFSET + RENESAS_MARKER.len();
             Ok(r.status == 0
-                && r.bytes_transferred >= end
+                && (end..=buf.len()).contains(&r.bytes_transferred)
                 && &buf[RENESAS_MARKER_OFFSET..end] == RENESAS_MARKER)
         }
         // Only a senseless transport-failure status is a dead bus; anything
@@ -56,8 +57,8 @@ pub fn is_renesas(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, Unl
     }
 }
 
-/// The Renesas/Pioneer-platform unlocker. Reads the VID from the vendor
-/// memory window; extended memory access does not enable standard AACS VID reads.
+/// Recognizes OEM-unlocked Renesas drives and optionally reads their VID from
+/// vendor memory. Extended memory access does not enable standard AACS VID reads.
 #[derive(Default)]
 pub struct Renesas;
 
@@ -65,76 +66,22 @@ impl Renesas {
     pub fn new() -> Self {
         Renesas
     }
-
-    // MakeMKV's vendor "open" sequence: primary read (A), and on refusal a
-    // knock + second read (B).
-    fn vendor_open(scsi: &mut dyn ScsiTransport) -> std::result::Result<bool, UnlockError> {
-        // A: primary open read.
-        if read_is_good(
-            scsi,
-            &pioneer_optical::cdb::read_memory(0x04, OPEN_READ_LEN),
-        )? {
-            return Ok(true);
-        }
-        // B: MakeMKV's fallback — knock, then the second-window read. The knock is
-        // fire-and-forget (payload-less); its own status is not the signal.
-        match scsi.execute(
-            &pioneer_optical::cdb::knock(),
-            DataDirection::None,
-            &mut [],
-            5_000,
-        ) {
-            Ok(_) => {}
-            Err(e) if is_dead_bus(&e) => return Err(UnlockError::Transport),
-            Err(_) => {} // a drive that refuses the knock still gets the B read tried
-        }
-        read_is_good(
-            scsi,
-            &pioneer_optical::cdb::read_memory(0x50_0000, OPEN_READ_LEN),
-        )
-    }
 }
 
-/// The vendor "open" reads' length (0xA4 = 164 bytes).
-const OPEN_READ_LEN: u32 = 0xA4;
-
-/// Issue a 164-byte vendor READ_BUFFER; `Ok(true)` on GOOD status, `Ok(false)`
-/// on CHECK CONDITION (drive refused), `Err(Transport)` on a senseless
-/// transport failure (dead bus).
-fn read_is_good(
+fn get_vid(
     scsi: &mut dyn ScsiTransport,
-    cdb: &[u8; 10],
-) -> std::result::Result<bool, UnlockError> {
-    let mut buf = [0u8; OPEN_READ_LEN as usize];
-    match scsi.execute(cdb, DataDirection::FromDevice, &mut buf, 5_000) {
-        Ok(r) => Ok(r.status == 0),
-        Err(e) => {
-            if is_dead_bus(&e) {
-                return Err(UnlockError::Transport);
-            }
-            Ok(false)
-        }
-    }
-}
-
-/// Verified on BDR-UD04 1.14 with two independently known disc VIDs.
-/// Whether this slot is shared across models/firmware is still under research.
-/// This low address does
-/// not need extended-read enable on that drive. The payload has no AD header.
-const VID_ADDR: u32 = 0x2A10;
-
-fn read_memory_vid(
-    scsi: &mut dyn ScsiTransport,
+    address: u32,
 ) -> std::result::Result<Option<[u8; 16]>, UnlockError> {
-    let cdb = pioneer_optical::cdb::read_memory(VID_ADDR, 16);
     let mut vid = [0u8; 16];
+    let cdb = pioneer_optical::cdb::read_memory(address, vid.len() as u32);
     tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_request",
-        address = VID_ADDR, ?cdb, requested = 16, "Reading VID from Renesas memory");
+        address = format_args!("{address:#x}"), cdb = format_args!("{cdb:02x?}"), requested = vid.len(), "Reading VID from Renesas memory");
     let result = match scsi.execute(&cdb, DataDirection::FromDevice, &mut vid, 5_000) {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_error",
-                address = VID_ADDR, status = e.status, sense = ?e.sense,
+                address = format_args!("{address:#x}"), status = e.status, sense = ?e.sense,
+                dead_bus = is_dead_bus(&e),
                 "Renesas memory VID read failed");
             return if is_dead_bus(&e) {
                 Err(UnlockError::Transport)
@@ -143,14 +90,25 @@ fn read_memory_vid(
             };
         }
     };
-    let valid = result.status == 0
-        && result.bytes_transferred == vid.len()
-        && vid.iter().any(|&b| b != 0)
-        && vid.iter().any(|&b| b != 0xff);
+    let rejection = if result.status != 0 {
+        Some("scsi_status")
+    } else if result.bytes_transferred != vid.len() {
+        Some("transfer_length")
+    } else if vid.iter().all(|&b| b == 0) {
+        Some("all_zero")
+    } else if vid.iter().all(|&b| b == 0xff) {
+        Some("all_ff")
+    } else {
+        None
+    };
+    let valid = rejection.is_none();
+    // Only show bytes the transport reports receiving, never buffer padding.
+    let payload = &vid[..result.bytes_transferred.min(vid.len())];
     tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_result",
-        address = VID_ADDR, status = result.status,
+        address = format_args!("{address:#x}"), status = result.status,
         bytes_transferred = result.bytes_transferred, sense = ?result.sense,
-        payload = ?vid, valid, "Renesas memory VID response");
+        payload = format_args!("{payload:02x?}"), valid, rejection,
+        "Renesas memory VID response");
     Ok(valid.then_some(vid))
 }
 
@@ -159,8 +117,8 @@ impl Unlocker for Renesas {
         "Renesas"
     }
 
-    /// Gate on the SAT identity and vendor read probe, then attempt the RAM VID.
-    /// A missing VID preserves the existing unlock result; dead buses propagate.
+    /// SAT identity establishes OEM-unlocked status. Extended reads and RAM VID
+    /// discovery are best-effort; a missing VID preserves success, dead buses abort.
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -169,20 +127,15 @@ impl Unlocker for Renesas {
         if !is_renesas(scsi)? {
             return Ok(None);
         }
-        if !Self::vendor_open(scsi)? {
-            tracing::debug!(
-                target: "freemkv::disc",
-                phase = "renesas_open_rejected",
-                "Renesas drive recognized but RB 0xB0@0x04 refused; deferring to next unlocker"
-            );
-            return Ok(None);
-        }
-        let vid = read_memory_vid(scsi)?;
+        let vid = match find_vid_addr(scsi)? {
+            Some(address) => get_vid(scsi, address)?,
+            None => None,
+        };
         tracing::debug!(
             target: "freemkv::disc",
             phase = "renesas_opened",
             has_vid = vid.is_some(),
-            "Renesas vendor read probe succeeded"
+            "Renesas VID discovery completed"
         );
         Ok(Some(Unlocked { vid, bus_key: None }))
     }
@@ -195,42 +148,75 @@ mod tests {
     use crate::scsi::{DataDirection, Result, ScsiError, ScsiResult, ScsiTransport};
 
     #[test]
-    fn memory_vid_uses_exact_slot_and_raw_payload() {
-        use crate::scsi::mock::{MockTransport, Reply};
-        let vid = [0x25; 16];
-        let mut t = MockTransport::scripted(
-            vec![
-                Reply::good(renesas_payload()),
-                Reply::good(vec![0; 164]),
-                Reply::good(vid.to_vec()),
-            ],
-            Reply::TransportFault,
-        );
-        let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        assert_eq!(
-            Renesas::new().unlock(&mut t, &ctx).unwrap().unwrap().vid,
-            Some(vid)
-        );
-        assert_eq!(t.cdbs.len(), 3);
-        assert_eq!(t.cdbs[2], [0x3c, 0x02, 0xb0, 0, 0x2a, 0x10, 0, 0, 16, 0]);
-    }
-
-    #[test]
     fn memory_vid_rejects_invalid_responses_and_propagates_dead_bus() {
         use crate::scsi::mock::{MockTransport, Reply};
         for reply in [
+            Reply::zero_transfer(16),
             Reply::short(vec![0x25; 16], 15),
             Reply::good(vec![0; 16]),
             Reply::good(vec![0xff; 16]),
             Reply::illegal_request(),
             Reply::illegal_request_as_err(),
         ] {
-            let mut t = MockTransport::always(reply);
-            assert_eq!(read_memory_vid(&mut t).unwrap(), None);
+            let mut t = MockTransport::always(reply.clone());
+            assert_eq!(get_vid(&mut t, 0x2a10).unwrap(), None);
         }
         let mut t = MockTransport::always(Reply::TransportFault);
-        assert_eq!(read_memory_vid(&mut t).unwrap_err(), UnlockError::Transport);
+        assert_eq!(get_vid(&mut t, 0x2a10).unwrap_err(), UnlockError::Transport);
+    }
+
+    #[test]
+    fn memory_vid_rejects_failed_status_with_payload_and_impossible_length() {
+        struct Response {
+            status: u8,
+            transferred: usize,
+        }
+        impl ScsiTransport for Response {
+            fn execute(
+                &mut self,
+                _: &[u8],
+                dir: DataDirection,
+                data: &mut [u8],
+                timeout: u32,
+            ) -> Result<ScsiResult> {
+                assert_eq!(dir, DataDirection::FromDevice);
+                assert_eq!(data.len(), 16);
+                assert_eq!(timeout, 5_000);
+                data.fill(0x25);
+                Ok(ScsiResult {
+                    status: self.status,
+                    bytes_transferred: self.transferred,
+                    sense: [0; 32],
+                })
+            }
+        }
+        for (status, transferred) in [(2, 16), (0, 17), (0, usize::MAX)] {
+            assert_eq!(
+                get_vid(
+                    &mut Response {
+                        status,
+                        transferred
+                    },
+                    0x2a10
+                )
+                .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_after_identity_aborts_before_enable() {
+        use crate::scsi::mock::{MockTransport, Reply, StopFake};
+        let mut t = StopFake::new(MockTransport::always(Reply::good(renesas_payload())));
+        t.cancel_after = Some(|cdb| cdb == pioneer_optical::cdb::vendor_identity());
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert_eq!(
+            Renesas::new().unlock(&mut t, &ctx).unwrap_err(),
+            UnlockError::Transport
+        );
+        assert_eq!(t.inner.calls(), 1);
     }
 
     #[test]
@@ -339,12 +325,15 @@ mod tests {
         };
         let id = crate::DriveId::default();
         let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        // Recognized + vendor probe GOOD, then a best-effort memory VID read.
+        // Recognized, but the served bytes do not contain a supported firmware header.
         let out = Renesas::new()
             .unlock(&mut t, &ctx)
             .expect("no fault")
             .expect("renesas → unlocked");
-        assert!(out.vid.is_some(), "opened drive yields a VID via memory");
+        assert!(
+            out.vid.is_none(),
+            "unknown firmware must not fabricate a VID"
+        );
         assert_eq!(out.bus_key, None, "raw-read route needs no bus key");
     }
 
@@ -389,159 +378,348 @@ mod tests {
             UnlockError::Transport
         );
     }
+}
 
-    // A recognized Renesas drive whose A read (RB 0xB0@0x04) is REFUSED but
-    // whose B read (RB 0xB0@0x50) SUCCEEDS after the knock must unlock — and the
-    // knock CDB has to be issued BETWEEN A and B.
-    #[test]
-    fn knock_runs_between_a_and_b_and_b_opens() {
-        // The exact knock CDB the code issues (pinned wire format).
-        const KNOCK_A5AAAA_CDB: [u8; 10] =
-            [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x00];
+const FIRMWARE_BASE: u32 = 0x41_0000;
+const WINDOW_START: u32 = 0x55_a000;
+const WINDOW_LEN: usize = 0x20000;
+const CHUNK: usize = 0x8000;
 
-        struct AFailsBSucceeds {
-            cdbs: Vec<Vec<u8>>,
+/// Locate the source operand of the known 16-byte VID response copy loop.
+/// Uniqueness is within this window; this is not a general H8 disassembler.
+fn find_slot(code: &[u8]) -> Option<u32> {
+    let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+    let mut found = None;
+    for (offset, op) in code.windows(26).enumerate().step_by(2) {
+        if op[..8] != [0x19, 0x33, 0x0d, 0x31, 0x17, 0x71, 0x6e, 0x1c]
+            || op[10..14] != [0x78, 0x10, 0x6a, 0xac]
+            || op[18..] != [0x0b, 0x53, 0x79, 0x23, 0, 0x10, 0x45, 0xe8]
+        {
+            continue;
         }
-        impl ScsiTransport for AFailsBSucceeds {
-            fn execute(
-                &mut self,
-                cdb: &[u8],
-                _dir: DataDirection,
-                data: &mut [u8],
-                _timeout_ms: u32,
-            ) -> Result<ScsiResult> {
-                self.cdbs.push(cdb.to_vec());
-                // Gate 0xF1 → SAT identity.
-                if cdb.get(2) == Some(&0xF1) {
-                    let p = renesas_payload();
-                    let n = p.len().min(data.len());
-                    data[..n].copy_from_slice(&p[..n]);
-                    return Ok(ScsiResult {
-                        status: 0,
-                        bytes_transferred: n,
-                        sense: [0u8; 32],
-                    });
-                }
-                // A read (RB 0xB0@0x04) → refuse with a drive sense.
-                if cdb == pioneer_optical::cdb::read_memory(0x04, OPEN_READ_LEN) {
-                    let mut sense = [0u8; 32];
-                    sense[2] = 0x05; // ILLEGAL REQUEST
-                    sense[12] = 0x20;
-                    return Err(ScsiError {
-                        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
-                        sense: Some(sense),
-                    });
-                }
-                // B read (RB 0xB0@0x50), the knock (0x3B/0x41), and the memory VID
-                // read all return GOOD so the open + VID read succeed.
-                let n = data.len().min(36);
-                if !data.is_empty() {
-                    // Non-zero VID so read_aacs_vid yields Some.
-                    for b in data.iter_mut().take(n) {
-                        *b = 0x5A;
-                    }
-                }
-                Ok(ScsiResult {
-                    status: 0,
-                    bytes_transferred: data.len(),
-                    sense: [0u8; 32],
-                })
+        let address = u16::from_be_bytes([op[8], op[9]]) as u32;
+        let pre = &code[offset.saturating_sub(80)..offset];
+        let post = &code[offset + 26..(offset + 26 + 240).min(code.len())];
+        let work = [0x7a, 0, op[14], op[15], op[16], op[17]];
+        let checks = [
+            pre.windows(12).any(|w| {
+                w[..2] == [0x79, 1] && w[4..] == [0x69, 0xf1, 0x18, 0x99, 0x6e, 0xf9, 0, 2]
+            }),
+            contains(post, &[0x79, 8, 0, 0x10]),
+            contains(post, &work),
+            contains(post, &[0x79, 0x24, 0, 0x20]),
+            contains(post, &[0x7a, 3, 0, 0x22, 0, 0]),
+            contains(post, &[0x1a, 0x80, 0xf8, 0x24, 1, 0, 0x6f, 0xa0, 0, 4]),
+            (1..=0x7ff0).contains(&address),
+        ];
+        tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_signature",
+            offset, address, ?checks, instruction = ?op, before = ?pre, after = ?post);
+        if checks.iter().all(|&v| v) {
+            if found.is_some() {
+                tracing::debug!(target: "freemkv::disc", "Ambiguous Renesas VID signature");
+                return None;
             }
+            found = Some(address);
         }
+    }
+    tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_slot", ?found);
+    found
+}
 
-        let mut t = AFailsBSucceeds { cdbs: Vec::new() };
-        let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        let out = Renesas::new()
-            .unlock(&mut t, &ctx)
-            .expect("no fault")
-            .expect("B read opens the drive → unlocked");
-        assert_eq!(out.bus_key, None);
+fn read_exact(
+    scsi: &mut dyn ScsiTransport,
+    address: u32,
+    buf: &mut [u8],
+) -> Result<bool, UnlockError> {
+    let cdb = pioneer_optical::cdb::read_memory(address, buf.len() as u32);
+    for attempt in 1..=3 {
+        buf.fill(0);
+        let result = scsi.execute(&cdb, DataDirection::FromDevice, buf, 5_000);
+        tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_firmware_read",
+            address, requested = buf.len(), attempt, ?cdb, ?result);
+        match result {
+            Ok(r) if r.status == 0 && r.bytes_transferred == buf.len() => return Ok(true),
+            Ok(r) if r.status == 0 && r.bytes_transferred < buf.len() && attempt < 3 => continue,
+            Err(e) if is_dead_bus(&e) => return Err(UnlockError::Transport),
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
 
-        // The knock must appear, between the A read (0xB0@0x04) and the B read
-        // (0xB0@0x50).
-        let a = t
-            .cdbs
-            .iter()
-            .position(|c| c.get(2) == Some(&0xB0) && c.get(3) == Some(&0x00))
-            .expect("A read issued");
-        let knock = t
-            .cdbs
-            .iter()
-            .position(|c| c.as_slice() == KNOCK_A5AAAA_CDB)
-            .expect("knock CDB issued");
-        let b = t
-            .cdbs
-            .iter()
-            .position(|c| c.get(2) == Some(&0xB0) && c.get(3) == Some(&0x50))
-            .expect("B read issued");
-        assert!(a < knock && knock < b, "knock must run between A and B");
+fn find_vid_addr(scsi: &mut dyn ScsiTransport) -> Result<Option<u32>, UnlockError> {
+    let result = scsi.execute(
+        &pioneer_optical::cdb::knock(),
+        DataDirection::None,
+        &mut [],
+        5_000,
+    );
+    tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_enable", ?result);
+    match result {
+        Ok(r) if r.status == 0 && r.bytes_transferred == 0 => {}
+        Err(e) if is_dead_bus(&e) => return Err(UnlockError::Transport),
+        _ => return Ok(None),
+    }
+    let mut header = [0; 24];
+    if !read_exact(scsi, FIRMWARE_BASE, &mut header)? {
+        return Ok(None);
+    }
+    let length = u32::from_be_bytes(header[20..24].try_into().unwrap());
+    // The advertised image must contain the entire discovery window.
+    let minimum_length = WINDOW_START - FIRMWARE_BASE + WINDOW_LEN as u32;
+    let valid = header[..8] == *b"PIONEER "
+        && (minimum_length..=0x3f0000).contains(&length)
+        && length % 256 == 0;
+    tracing::debug!(target: "freemkv::disc", phase = "renesas_vid_header", ?header, length, valid);
+    if !valid {
+        return Ok(None);
+    }
+    let mut code = vec![0; WINDOW_LEN];
+    for (i, chunk) in code.chunks_mut(CHUNK).enumerate() {
+        if !read_exact(scsi, WINDOW_START + (i * CHUNK) as u32, chunk)? {
+            return Ok(None);
+        }
+    }
+    Ok(find_slot(&code))
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use crate::scsi::mock::{MockTransport, Reply};
+
+    fn fixture(address: u16) -> Vec<u8> {
+        let mut code = vec![0; WINDOW_LEN];
+        let mut block = vec![0x79, 1, 1, 0x3a, 0x69, 0xf1, 0x18, 0x99, 0x6e, 0xf9, 0, 2];
+        block.extend([0x19, 0x33, 0x0d, 0x31, 0x17, 0x71, 0x6e, 0x1c]);
+        block.extend(address.to_be_bytes());
+        block.extend([
+            0x78, 0x10, 0x6a, 0xac, 0, 0xa0, 0x27, 0xf4, 0x0b, 0x53, 0x79, 0x23, 0, 0x10, 0x45,
+            0xe8,
+        ]);
+        block.extend([
+            0x79, 8, 0, 0x10, 0x7a, 0, 0, 0xa0, 0x27, 0xf4, 0x79, 0x24, 0, 0x20, 0x7a, 3, 0, 0x22,
+            0, 0, 0x1a, 0x80, 0xf8, 0x24, 1, 0, 0x6f, 0xa0, 0, 4,
+        ]);
+        // Deliberately straddles a transport chunk boundary.
+        code[CHUNK - 20..CHUNK - 20 + block.len()].copy_from_slice(&block);
+        code
     }
 
-    /// A dead bus only at the knock (recovered afterwards) still aborts with
-    /// Transport: the B read must never be sent.
     #[test]
-    fn dead_bus_at_the_knock_aborts_before_the_b_read() {
-        use crate::scsi::mock::{MockTransport, Reply};
-        let script = vec![
-            Reply::good(renesas_payload()),
-            Reply::illegal_request(),
-            Reply::TransportFault,
-        ];
-        let mut t = MockTransport::scripted(script, Reply::good(vec![0u8; 164]));
+    fn validates_context_and_requires_unique_positive_slot() {
+        for address in [0x2832, 0x2a10, 0x2aa2] {
+            assert_eq!(find_slot(&fixture(address)), Some(address as u32));
+        }
+        for address in [0, 0x8000, 0xfffe] {
+            assert_eq!(find_slot(&fixture(address)), None);
+        }
+        for relative in [10, 38, 42, 48, 52, 58] {
+            let mut code = fixture(0x2a10);
+            code[CHUNK - 20 + relative] ^= 1;
+            assert_eq!(find_slot(&code), None, "context mutation {relative}");
+        }
+        let mut code = fixture(0x2a10);
+        code.copy_within(CHUNK - 20..CHUNK + 100, 1000);
+        assert_eq!(find_slot(&code), None);
+        assert_eq!(find_slot(&[]), None);
+    }
+
+    fn script(vid: [u8; 16]) -> Vec<Reply> {
+        let mut header = vec![0; 24];
+        header[..8].copy_from_slice(b"PIONEER ");
+        header[20..].copy_from_slice(&0x1c7500u32.to_be_bytes());
+        let mut replies = vec![Reply::good(vec![]), Reply::good(header)];
+        replies.extend(
+            fixture(0x2aa2)
+                .chunks(CHUNK)
+                .map(|c| Reply::good(c.to_vec())),
+        );
+        replies.push(Reply::good(vid.to_vec()));
+        replies
+    }
+
+    #[test]
+    fn unlock_discovers_address_then_get_vid_only_reads_ram() {
+        let vid = [0x25; 16];
+        let mut identity = vec![0x20; 48];
+        identity[16..19].copy_from_slice(b"SAT");
+        let mut replies = vec![Reply::good(identity)];
+        replies.extend(script(vid));
+        let mut t = MockTransport::scripted(replies, Reply::TransportFault);
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+        let unlocker = Renesas::new();
+        assert_eq!(
+            unlocker.unlock(&mut t, &ctx).unwrap().unwrap().vid,
+            Some(vid)
+        );
+        assert_eq!(t.cdbs.len(), 8);
+        assert_eq!(t.cdbs[1], pioneer_optical::cdb::knock());
+        for i in 0..4 {
+            assert_eq!(
+                t.cdbs[i + 3],
+                pioneer_optical::cdb::read_memory(WINDOW_START + (i * CHUNK) as u32, CHUNK as u32)
+            );
+        }
+        assert_eq!(t.cdbs[7], pioneer_optical::cdb::read_memory(0x2aa2, 16));
+        let mut t = MockTransport::always(Reply::good(vid.to_vec()));
+        assert_eq!(get_vid(&mut t, 0x2aa2).unwrap(), Some(vid));
+        assert_eq!(t.cdbs, vec![pioneer_optical::cdb::read_memory(0x2aa2, 16)]);
+    }
+
+    #[test]
+    fn discovery_failures_stop_and_short_reads_retry_boundedly() {
+        for step in 0..6 {
+            let mut replies = script([0x25; 16]);
+            replies[step] = Reply::TransportFault;
+            let mut t = MockTransport::scripted(replies, Reply::TransportFault);
+            assert_eq!(find_vid_addr(&mut t).unwrap_err(), UnlockError::Transport);
+            assert_eq!(t.calls(), step + 1);
+            let mut replies = script([0x25; 16]);
+            replies[step] = Reply::illegal_request();
+            assert_eq!(
+                find_vid_addr(&mut MockTransport::scripted(replies, Reply::TransportFault))
+                    .unwrap(),
+                None
+            );
+        }
+        let mut replies = script([0x25; 16]);
+        replies.insert(2, Reply::short(vec![0; CHUNK], 1));
+        let mut t = MockTransport::scripted(replies, Reply::TransportFault);
+        assert!(find_vid_addr(&mut t).unwrap().is_some());
+        assert_eq!(t.calls(), 7);
+        let mut replies = script([0x25; 16]);
+        replies.splice(
+            2..3,
+            [
+                Reply::zero_transfer(CHUNK),
+                Reply::zero_transfer(CHUNK),
+                Reply::zero_transfer(CHUNK),
+            ],
+        );
+        let mut t = MockTransport::scripted(replies, Reply::TransportFault);
+        assert_eq!(find_vid_addr(&mut t).unwrap(), None);
+        assert_eq!(t.calls(), 5);
+    }
+    fn with_identity(replies: Vec<Reply>) -> MockTransport {
+        let mut identity = vec![0; RB_F1_LEN];
+        identity[16..19].copy_from_slice(b"SAT");
+        let mut all = vec![Reply::good(identity)];
+        all.extend(replies);
+        MockTransport::scripted(all, Reply::TransportFault)
+    }
+
+    #[test]
+    fn oem_unlock_survives_rejection_at_every_optional_step() {
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+        for step in 0..7 {
+            for refusal in [Reply::illegal_request(), Reply::illegal_request_as_err()] {
+                let mut replies = script([0x25; 16]);
+                replies[step] = refusal;
+                let mut t = with_identity(replies);
+                let out = Renesas::new()
+                    .unlock(&mut t, &ctx)
+                    .unwrap()
+                    .expect("OEM unlocked");
+                assert_eq!(out.vid, None);
+                assert_eq!(out.bus_key, None);
+                assert_eq!(t.calls(), step + 2, "no commands after rejection at {step}");
+            }
+        }
+        for vid in [[0; 16], [0xff; 16]] {
+            let out = Renesas::new()
+                .unlock(&mut with_identity(script(vid)), &ctx)
+                .unwrap()
+                .unwrap();
+            assert_eq!(out.vid, None);
+        }
+    }
+
+    #[test]
+    fn transport_faults_abort_full_unlock_at_every_optional_step() {
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+        for step in 0..7 {
+            let mut replies = script([0x25; 16]);
+            replies[step] = Reply::TransportFault;
+            let mut t = with_identity(replies);
+            assert_eq!(
+                Renesas::new().unlock(&mut t, &ctx).unwrap_err(),
+                UnlockError::Transport
+            );
+            assert_eq!(t.calls(), step + 2);
+        }
+    }
+
+    #[test]
+    fn cancellation_during_firmware_read_prevents_further_commands() {
+        use crate::scsi::mock::StopFake;
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+        let mut t = StopFake::new(with_identity(script([0x25; 16])));
+        t.cancel_after =
+            Some(|cdb| cdb == pioneer_optical::cdb::read_memory(WINDOW_START, CHUNK as u32));
         assert_eq!(
             Renesas::new().unlock(&mut t, &ctx).unwrap_err(),
             UnlockError::Transport
         );
-        assert_eq!(t.calls(), 3, "no B read after the dead knock");
+        assert_eq!(t.inner.calls(), 4);
     }
 
-    // A recognized Renesas drive that REFUSES the vendor open read must
-    // defer to the next unlocker, not claim the drive.
     #[test]
-    fn open_rejection_defers_to_next_unlocker() {
-        struct GateOkOpenRefused;
-        impl ScsiTransport for GateOkOpenRefused {
-            fn execute(
-                &mut self,
-                cdb: &[u8],
-                _dir: DataDirection,
-                data: &mut [u8],
-                _timeout_ms: u32,
-            ) -> Result<ScsiResult> {
-                if cdb.get(2) == Some(&0xF1) {
-                    // Serve the SAT identity so is_renesas() matches.
-                    let p = renesas_payload();
-                    let n = p.len().min(data.len());
-                    data[..n].copy_from_slice(&p[..n]);
-                    Ok(ScsiResult {
-                        status: 0,
-                        bytes_transferred: n,
-                        sense: [0u8; 32],
-                    })
-                } else {
-                    // RB 0xB0@0x04 (the open read) → CHECK CONDITION.
-                    let mut sense = [0u8; 32];
-                    sense[2] = 0x05; // ILLEGAL REQUEST
-                    sense[12] = 0x20; // invalid command operation code
-                    Err(ScsiError {
-                        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
-                        sense: Some(sense),
-                    })
-                }
-            }
-        }
-        let mut t = GateOkOpenRefused;
+    fn invalid_headers_never_read_firmware_and_preserve_oem_unlock() {
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        assert!(
-            Renesas::new()
-                .unlock(&mut t, &ctx)
-                .expect("open refused → declines, not a hard error")
-                .is_none(),
-            "a refused vendor open must defer to the next unlocker"
-        );
+        let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+        for length in [0, 0x169f00, 0x16a001, 0x3f0100, u32::MAX] {
+            let mut replies = script([0x25; 16]);
+            let mut header = vec![0; 24];
+            header[..8].copy_from_slice(b"PIONEER ");
+            header[20..].copy_from_slice(&length.to_be_bytes());
+            replies[1] = Reply::good(header);
+            let mut t = with_identity(replies);
+            assert!(
+                Renesas::new()
+                    .unlock(&mut t, &ctx)
+                    .unwrap()
+                    .unwrap()
+                    .vid
+                    .is_none()
+            );
+            assert_eq!(t.calls(), 3);
+        }
+    }
+
+    #[test]
+    fn missing_or_ambiguous_signature_preserves_oem_unlock_without_ram_read() {
+        let id = crate::DriveId::default();
+        let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+        let mut ambiguous = fixture(0x2aa2);
+        ambiguous.copy_within(CHUNK - 20..CHUNK + 100, 1000);
+        for code in [vec![0; WINDOW_LEN], ambiguous] {
+            let mut replies = script([0x25; 16]);
+            for (i, chunk) in code.chunks(CHUNK).enumerate() {
+                replies[i + 2] = Reply::good(chunk.to_vec());
+            }
+            let mut t = with_identity(replies);
+            assert!(
+                Renesas::new()
+                    .unlock(&mut t, &ctx)
+                    .unwrap()
+                    .unwrap()
+                    .vid
+                    .is_none()
+            );
+            assert_eq!(t.calls(), 7);
+        }
+    }
+
+    #[test]
+    fn identity_rejects_overreported_transfer() {
+        let mut identity = vec![0; RB_F1_LEN];
+        identity[16..19].copy_from_slice(b"SAT");
+        let mut t = MockTransport::always(Reply::short(identity, RB_F1_LEN + 1));
+        assert!(!is_renesas(&mut t).unwrap());
     }
 }
