@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.2] — Unreleased
+
+### Changed
+
+- Released with freemkv 1.8.2 so every component reports the same version. No changes.
+
 ## [1.8.1] — 2026-10-07
 
 ### Fixed
