@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## [1.8.1] — Unreleased
+
+### Fixed
+
+- Renesas drives: more reliable VID reading from the drive, including drives with an optional VID slot, and a hardened OEM unlock.
 
 ### Maintenance
 
