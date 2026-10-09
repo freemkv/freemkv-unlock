@@ -2,6 +2,7 @@
 //! Backend capabilities select optional settings; encryption activation is required.
 //! Hardware backends provide installation, verification and VID retrieval.
 
+pub mod mediatek;
 pub mod renesas;
 
 use crate::firmware::{
@@ -59,11 +60,23 @@ impl Backend for Preinstalled {
 }
 
 #[derive(Default)]
-pub struct FreemkvUnlocker;
+pub struct FreemkvUnlocker {
+    mediatek_loader: Option<Box<dyn mediatek::LiveLoader>>,
+}
 
 impl FreemkvUnlocker {
     pub fn new() -> Self {
-        FreemkvUnlocker
+        FreemkvUnlocker {
+            mediatek_loader: None,
+        }
+    }
+
+    /// Install the device-specific MediaTek live loader. The loader is only
+    /// called after the common freemkv API probe fails and the drive identity
+    /// identifies a MediaTek device.
+    pub fn with_mediatek_loader(mut self, loader: Box<dyn mediatek::LiveLoader>) -> Self {
+        self.mediatek_loader = Some(loader);
+        self
     }
 
     fn probe(
@@ -186,6 +199,14 @@ impl FreemkvUnlocker {
     }
 
     fn full_unlock(&self, scsi: &mut dyn ScsiTransport) -> BackendResult<Unlocked> {
+        self.full_unlock_with_drive(scsi, &crate::DriveId::default())
+    }
+
+    fn full_unlock_with_drive(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        drive_id: &crate::DriveId,
+    ) -> BackendResult<Unlocked> {
         use crate::protocol::Implementation;
         let identity = self.probe(scsi)?;
         let installed = identity.is_some();
@@ -196,6 +217,24 @@ impl FreemkvUnlocker {
                 })
             }
             Some(_) => Box::new(renesas::Backend::new()),
+            None if self
+                .mediatek_loader
+                .as_ref()
+                .is_some_and(|loader| loader.is_mediatek(drive_id)) =>
+            {
+                let loader = self
+                    .mediatek_loader
+                    .as_ref()
+                    .ok_or(UnlockError::NotApplicable)?;
+                loader.load(scsi)?;
+                let id = self.probe(scsi)?.ok_or(UnlockError::NotApplicable)?;
+                if id.capabilities.implementation() != Implementation::Firmware {
+                    return Err(UnlockError::NotApplicable);
+                }
+                Box::new(Preinstalled {
+                    capabilities: id.capabilities,
+                })
+            }
             None if renesas::is_renesas(scsi)? => Box::new(renesas::Backend::new()),
             None => return Err(UnlockError::NotApplicable),
         };
@@ -265,9 +304,9 @@ impl Unlocker for FreemkvUnlocker {
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
-        _ctx: &UnlockCtx,
+        ctx: &UnlockCtx,
     ) -> std::result::Result<Option<Unlocked>, UnlockError> {
-        crate::fallthrough(self.full_unlock(scsi))
+        crate::fallthrough(self.full_unlock_with_drive(scsi, ctx.drive_id))
     }
 }
 
