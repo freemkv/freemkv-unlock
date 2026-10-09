@@ -52,9 +52,6 @@ pub use firmware::{
 };
 pub use freemkv::FreemkvUnlocker;
 pub use ld::LdUnlocker;
-/// Compatibility name; Pioneer is now handled by the common freemkv unlocker.
-#[deprecated(note = "use FreemkvUnlocker; it also handles Pioneer runtime installation")]
-pub type Renesas = FreemkvUnlocker;
 
 /// Drive identity an unlocker matches against — four raw INQUIRY-derived fields,
 /// filled by the consumer (this crate parses no INQUIRY itself).
