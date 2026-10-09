@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.8.3] — 2026-10-08
+
+### Changed
+
+- Use one freemkv unlocker and SET sequence for preinstalled MediaTek firmware and runtime Pioneer H8S hooks. Discover firmware addresses and memory-layout evidence by signatures and verify resident hooks before reuse.
+- Pioneer Encryption OFF keeps eligibility suppressed; ON and passthrough restore the OEM policy. Every transition waits for the background read engine before OEM reinitialization, restores temporary callbacks, and verifies the resulting state. Optional SETs acknowledge without changing OEM settings; unknown requests return invalid-field sense.
+- Serve Pioneer VID through the standard READ DISC STRUCTURE request using the hardware-ready VID, so flashed and runtime backends share the same VID reader. Preserve OEM handling of other formats and restore both command hooks together on installation failure.
+- Expand discovery to A-only BD and A+B UHD eligibility routines, including older CF stack layouts. Reject missing or inconsistent firmware evidence before installation.
+
 ## [1.8.2] — 2026-10-08
 
 ### Changed

@@ -1,13 +1,11 @@
 use super::*;
 
-// The canonical dispatch order the consumer assembles (freemkv → firmware →
-// Renesas → cert → css). It lives in the consumer now (no factory), but the
+// The canonical dispatch order the consumer assembles (freemkv → LD → cert → css). It lives in the consumer now (no factory), but the
 // types are ours, so pin their names here so a rename is caught crate-local.
 fn canonical_unlockers() -> Vec<Box<dyn Unlocker>> {
     vec![
         Box::new(FreemkvUnlocker::new()),
         Box::new(LdUnlocker::new()),
-        Box::new(Renesas::new()),
         Box::new(AacsUnlocker::new(Vec::new())),
         Box::new(DvdUnlocker::new()),
     ]
@@ -16,7 +14,7 @@ fn canonical_unlockers() -> Vec<Box<dyn Unlocker>> {
 #[test]
 fn unlocker_names_are_stable() {
     let names: Vec<&'static str> = canonical_unlockers().iter().map(|u| u.name()).collect();
-    assert_eq!(names, vec!["freemkv", "LD", "Renesas", "AACS", "DVD"]);
+    assert_eq!(names, vec!["freemkv", "LD", "AACS", "DVD"]);
 }
 
 /// The uniform contract every unlocker obeys, whatever its mechanism: on a

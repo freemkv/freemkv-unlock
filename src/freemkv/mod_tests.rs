@@ -342,3 +342,167 @@ fn dump_ram_rejects_a_short_transfer() {
 fn name_is_freemkv() {
     assert_eq!(FreemkvUnlocker::new().name(), "freemkv");
 }
+
+#[test]
+fn preinstalled_firmware_repeated_unlock_preserves_wire_contract() {
+    struct FlashedDrive {
+        calls: Vec<Vec<u8>>,
+    }
+    impl ScsiTransport for FlashedDrive {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            direction: DataDirection,
+            data: &mut [u8],
+            timeout: u32,
+        ) -> Result<ScsiResult> {
+            assert!(matches!(direction, DataDirection::FromDevice));
+            assert_eq!(timeout, 5_000);
+            let step = self.calls.len() % 6;
+            let response = match step {
+                0 => {
+                    assert_eq!(cdb, build_identity_cdb(64));
+                    identity_payload("0.9.2", &[0, 0x0f, 1, 1, 0xff, 0])
+                }
+                1..=4 => {
+                    let (feature, state) = [
+                        (Feature::Region, REGION_FREE),
+                        (Feature::Speed, SPEED_MAX),
+                        (Feature::Unrestricted, STATE_ON),
+                        (Feature::Encryption, STATE_OFF),
+                    ][step - 1];
+                    assert_eq!(cdb, build_set_cdb(feature, state));
+                    assert_eq!(data.len(), 64);
+                    // Flashed firmware replies with its state table, not runtime zeroes.
+                    let mut states = vec![0; 64];
+                    states[..6].copy_from_slice(&[0, 0x0f, 1, 1, 0xff, 0]);
+                    states
+                }
+                5 => {
+                    assert_eq!(cdb[0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
+                    vid_ds_response([0x7c; 16])
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(data.len(), response.len());
+            data.copy_from_slice(&response);
+            self.calls.push(cdb.to_vec());
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: response.len(),
+                sense: [0; 32],
+            })
+        }
+    }
+    let mut drive = FlashedDrive { calls: Vec::new() };
+    let id = crate::DriveId::default();
+    for _ in 0..2 {
+        let unlocked = FreemkvUnlocker::new()
+            .unlock(&mut drive, &ctx(&id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(unlocked.vid, Some([0x7c; 16]));
+        assert_eq!(unlocked.bus_key, None);
+    }
+    assert_eq!(drive.calls.len(), 12);
+    assert_eq!(drive.calls[..6], drive.calls[6..]);
+}
+
+#[test]
+fn unknown_runtime_descriptor_does_not_select_flashed_backend_or_install() {
+    for offset in 32..40 {
+        let mut identity = crate::protocol::pioneer_identity();
+        identity[offset] ^= 0x80;
+        let mut transport =
+            MockTransport::scripted(vec![Reply::good(identity.to_vec())], Reply::TransportFault);
+        assert!(unlock(&mut transport).unwrap().is_none());
+        assert_eq!(transport.calls(), 1);
+    }
+}
+
+#[test]
+fn pioneer_activation_uses_shared_settings_and_allows_oem_media_reacquisition() {
+    struct Transport {
+        calls: usize,
+    }
+    impl ScsiTransport for Transport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            _: DataDirection,
+            data: &mut [u8],
+            timeout: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            let (feature, state) = [
+                (Feature::Region, REGION_FREE),
+                (Feature::Speed, SPEED_MAX),
+                (Feature::Unrestricted, STATE_ON),
+                (Feature::Encryption, STATE_OFF),
+            ][self.calls];
+            self.calls += 1;
+            assert_eq!(cdb, build_set_cdb(feature, state));
+            assert_eq!(
+                timeout,
+                if feature == Feature::Encryption {
+                    30_000
+                } else {
+                    5_000
+                }
+            );
+            data.fill(0);
+            Ok(crate::scsi::ScsiResult {
+                status: 0,
+                bytes_transferred: data.len(),
+                sense: [0; 32],
+            })
+        }
+    }
+    let mut t = Transport { calls: 0 };
+    FreemkvUnlocker::new()
+        .activate(&mut t, &renesas::Backend::new())
+        .unwrap();
+    assert_eq!(t.calls, 4);
+}
+
+#[test]
+fn cancellation_during_pioneer_preparation_never_enters_critical_span_or_installs() {
+    struct Transport {
+        inner: MockTransport,
+    }
+    impl ScsiTransport for Transport {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            d: DataDirection,
+            data: &mut [u8],
+            timeout: u32,
+        ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+            assert!(
+                !(cdb[0] == 0x3b && !data.is_empty()),
+                "no RAM upload before preparation completes"
+            );
+            self.inner.execute(cdb, d, data, timeout)
+        }
+        fn begin_critical(&mut self) -> crate::scsi::Result<()> {
+            panic!("preparation must remain cancellable")
+        }
+    }
+    let mut vendor = vec![0; 48];
+    vendor[16..19].copy_from_slice(b"SAT");
+    let mut t = Transport {
+        inner: MockTransport::scripted(
+            vec![
+                Reply::illegal_request(),
+                Reply::good(vendor),
+                Reply::good(vec![]),
+                Reply::TransportFault,
+            ],
+            Reply::TransportFault,
+        ),
+    };
+    assert_eq!(
+        FreemkvUnlocker::new().full_unlock(&mut t).unwrap_err(),
+        UnlockError::Transport
+    );
+    assert_eq!(t.inner.calls(), 4);
+}

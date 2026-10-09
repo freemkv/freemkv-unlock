@@ -15,6 +15,7 @@ pub mod scsi;
 // (`freemkv-fw/src/abi.rs`) + the `FirmwareControl` driver. Public so host
 // tooling (freemkv-drivetest) can arm/inspect a freemkv drive directly.
 pub mod firmware;
+pub mod protocol;
 
 mod aacs;
 mod css;
@@ -29,14 +30,14 @@ pub use vid::read_aacs_vid;
 // format bdemu needs; the unlocker impl stays `pub(crate)`.
 pub mod ld;
 // `renesas` is public for its `is_renesas` drive-probe (dead bus vs. "not a Renesas drive");
-// the unlocker impl stays `pub(crate)`.
-pub mod renesas;
-// `freemkv` self-identifies rather than matching a bundled profile, so it stays fully private.
+// its backend is owned by the common freemkv unlocker.
+pub use freemkv::renesas;
+// Common protocol orchestration and hardware backends.
 mod freemkv;
 
 use scsi::ScsiTransport;
 
-// The five unlockers, exposed as concrete types so the consumer assembles its
+// The unlockers, exposed as concrete types so the consumer assembles its
 // own dispatch list and injects each one's deps at construction (certs → AACS)
 // — no central factory to thread another unlocker's config through.
 pub use aacs::AacsUnlocker;
@@ -51,7 +52,9 @@ pub use firmware::{
 };
 pub use freemkv::FreemkvUnlocker;
 pub use ld::LdUnlocker;
-pub use renesas::Renesas;
+/// Compatibility name; Pioneer is now handled by the common freemkv unlocker.
+#[deprecated(note = "use FreemkvUnlocker; it also handles Pioneer runtime installation")]
+pub type Renesas = FreemkvUnlocker;
 
 /// Drive identity an unlocker matches against — four raw INQUIRY-derived fields,
 /// filled by the consumer (this crate parses no INQUIRY itself).

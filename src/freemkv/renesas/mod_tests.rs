@@ -1,4 +1,5 @@
 use super::*;
+use crate::UnlockCtx;
 
 mod tests {
     use super::*;
@@ -18,10 +19,10 @@ mod tests {
         ] {
             let mut t =
                 MockTransport::scripted(vec![Reply::good(vec![2]), reply], Reply::TransportFault);
-            assert_eq!(get_vid(&mut t).unwrap(), None);
+            assert_eq!(read_vid(&mut t).unwrap(), None);
         }
         let mut t = MockTransport::always(Reply::TransportFault);
-        assert_eq!(get_vid(&mut t).unwrap_err(), UnlockError::Transport);
+        assert_eq!(read_vid(&mut t).unwrap_err(), UnlockError::Transport);
     }
 
     #[test]
@@ -59,7 +60,7 @@ mod tests {
         }
         for (status, transferred) in [(2, 16), (0, 17), (0, usize::MAX)] {
             assert_eq!(
-                get_vid(&mut Response {
+                read_vid(&mut Response {
                     status,
                     transferred
                 })
@@ -75,11 +76,8 @@ mod tests {
         let mut t = StopFake::new(MockTransport::always(Reply::good(renesas_payload())));
         t.cancel_after = Some(|cdb| cdb == pioneer_optical::cdb::vendor_identity());
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        assert_eq!(
-            Renesas::new().unlock(&mut t, &ctx).unwrap_err(),
-            UnlockError::Transport
-        );
+        let _ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert_eq!(unlock(&mut t).unwrap_err(), UnlockError::Transport);
         assert_eq!(t.inner.calls(), 1);
     }
 
@@ -183,22 +181,13 @@ mod tests {
     }
 
     #[test]
-    fn opened_renesas_reports_unlocked_and_reads_vid() {
+    fn identity_alone_no_longer_reports_unlocked() {
         let mut t = RenesasTransport {
             payload: renesas_payload(),
         };
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        // Recognized, but the hardware status bit is clear.
-        let out = Renesas::new()
-            .unlock(&mut t, &ctx)
-            .expect("no fault")
-            .expect("renesas → unlocked");
-        assert!(
-            out.vid.is_none(),
-            "clear hardware status must not fabricate a VID"
-        );
-        assert_eq!(out.bus_key, None, "raw-read route needs no bus key");
+        let _ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert!(unlock(&mut t).unwrap().is_none());
     }
 
     /// A drive REJECTION (ILLEGAL REQUEST, with a sense) is "not a Renesas
@@ -207,13 +196,8 @@ mod tests {
     fn declines_non_renesas() {
         let mut t = RejectingTransport;
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        assert!(
-            Renesas::new()
-                .unlock(&mut t, &ctx)
-                .expect("non-renesas declines")
-                .is_none()
-        );
+        let _ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert!(unlock(&mut t).expect("non-renesas declines").is_none());
     }
 
     // Same rejection via a CONFORMING transport (`Ok` + CHECK CONDITION);
@@ -236,11 +220,8 @@ mod tests {
 
         let mut t = MockTransport::always(Reply::TransportFault);
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, DiscKind::Unknown);
-        assert_eq!(
-            Renesas::new().unlock(&mut t, &ctx).unwrap_err(),
-            UnlockError::Transport
-        );
+        let _ctx = UnlockCtx::new(&id, DiscKind::Unknown);
+        assert_eq!(unlock(&mut t).unwrap_err(), UnlockError::Transport);
     }
 }
 
@@ -259,8 +240,8 @@ mod hardware_tests {
             ],
             Reply::TransportFault,
         );
-        assert_eq!(get_vid(&mut t).unwrap(), Some([0x25; 16]));
-        assert_eq!(get_vid(&mut t).unwrap(), Some([0x42; 16]));
+        assert_eq!(read_vid(&mut t).unwrap(), Some([0x25; 16]));
+        assert_eq!(read_vid(&mut t).unwrap(), Some([0x42; 16]));
         assert_eq!(
             t.cdbs,
             vec![
@@ -283,56 +264,35 @@ mod hardware_tests {
             Reply::illegal_request_as_err(),
         ] {
             let mut t = MockTransport::scripted(vec![reply], Reply::TransportFault);
-            assert_eq!(get_vid(&mut t).unwrap(), None);
+            assert_eq!(read_vid(&mut t).unwrap(), None);
             assert_eq!(t.calls(), 1);
         }
     }
 
     #[test]
-    fn unlock_preserves_oem_success_on_rejections_and_aborts_transport_faults() {
+    fn preparation_rejection_declines_and_transport_failure_aborts() {
         let mut identity = vec![0; 48];
         identity[16..19].copy_from_slice(b"SAT");
         let id = crate::DriveId::default();
-        let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
-        for step in 1..=2 {
-            for reply in [
-                Reply::illegal_request(),
-                Reply::illegal_request_as_err(),
-                Reply::TransportFault,
-            ] {
-                let fault = matches!(reply, Reply::TransportFault);
-                let mut replies = vec![
-                    Reply::good(identity.clone()),
-                    Reply::good(vec![2]),
-                    Reply::good(vec![0x25; 16]),
-                ];
-                replies[step] = reply;
-                let mut t = MockTransport::scripted(replies, Reply::TransportFault);
-                let result = Renesas::new().unlock(&mut t, &ctx);
-                if fault {
-                    assert_eq!(result.unwrap_err(), UnlockError::Transport);
-                } else {
-                    let out = result.unwrap().unwrap();
-                    assert_eq!(out.vid, None);
-                    assert_eq!(out.bus_key, None);
-                }
-                assert_eq!(t.calls(), step + 1);
-            }
-        }
-        let mut t = MockTransport::scripted(
-            vec![
-                Reply::good(identity),
-                Reply::good(vec![2]),
-                Reply::good(vec![0x25; 16]),
-            ],
+        let _ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+        for reply in [
+            Reply::illegal_request(),
+            Reply::illegal_request_as_err(),
             Reply::TransportFault,
-        );
-        assert_eq!(
-            Renesas::new().unlock(&mut t, &ctx).unwrap().unwrap().vid,
-            Some([0x25; 16])
-        );
-        assert_eq!(t.calls(), 3);
-        assert!(t.cdbs.iter().all(|cdb| cdb[0] == 0x3c));
+        ] {
+            let fault = matches!(reply, Reply::TransportFault);
+            let mut t = MockTransport::scripted(
+                vec![Reply::good(identity.clone()), reply],
+                Reply::TransportFault,
+            );
+            let result = unlock(&mut t);
+            if fault {
+                assert_eq!(result.unwrap_err(), UnlockError::Transport);
+            } else {
+                assert!(result.unwrap().is_none());
+            }
+            assert_eq!(t.calls(), 2);
+        }
     }
 
     #[test]
@@ -340,7 +300,7 @@ mod hardware_tests {
         use crate::scsi::mock::StopFake;
         let mut t = StopFake::new(MockTransport::always(Reply::good(vec![2])));
         t.cancel_after = Some(|cdb| cdb == VID_STATUS_CDB);
-        assert_eq!(get_vid(&mut t).unwrap_err(), UnlockError::Transport);
+        assert_eq!(read_vid(&mut t).unwrap_err(), UnlockError::Transport);
         assert_eq!(t.inner.calls(), 1);
     }
 }

@@ -1,7 +1,7 @@
 //! Shared AACS Volume ID read — the standard `READ DISC STRUCTURE` (`0xAD`,
 //! format `0x80`) that returns the VID on a drive whose host-auth / bus has
 //! already been opened by a compatible firmware unlock (freemkv Raw Read or
-//! MT1959). Renesas uses its separate vendor-memory VID reader.
+//! MT1959). The Pioneer runtime hook implements the same response layout.
 //!
 //! BEST-EFFORT: only a dead bus is an `Err(Transport)`. A CHECK CONDITION, a
 //! short response, or an all-zero VID all yield `Ok(None)` — a VID miss must
@@ -80,13 +80,12 @@ pub fn read_aacs_vid(
     }
     let mut vid = [0u8; VID_LEN];
     vid.copy_from_slice(&buf[4..4 + VID_LEN]);
-    // An all-zero VID is what a permissive stub or an unfilled response leaves
-    // behind — reject it rather than pass a bogus key downstream.
-    if vid.iter().all(|&b| b == 0) {
+    // Preserve both backends' rejection of empty/unavailable hardware values.
+    if vid.iter().all(|&b| b == 0) || vid.iter().all(|&b| b == 0xff) {
         tracing::debug!(
             target: "freemkv::disc",
-            phase = "vid_all_zero",
-            "bare VID read returned an all-zero Volume ID"
+            phase = "vid_uniform",
+            "bare VID read returned an unavailable Volume ID"
         );
         return Ok(None);
     }

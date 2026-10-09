@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-unlock"
-version = "1.8.2"
+version = "1.8.3"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -31,7 +31,9 @@ rand = "0.10"
 # the redacting Debug impls). `derive` gives ZeroizeOnDrop for the key structs.
 zeroize = { version = "1", features = ["derive"] }
 # Pioneer/Renesas vendor CDB constructors (identity read, gated memory read, knock).
-pioneer-optical = "0.10"
+pioneer-optical = { version = "0.12.3", features = ["firmware-info", "drive"] }
+h8-asm = "0.5"
+anyhow = "1"
 
 [lints.clippy]
 uninlined_format_args = "allow"

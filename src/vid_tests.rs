@@ -61,9 +61,11 @@ fn check_condition_is_none() {
 
 /// An all-zero VID (permissive stub / unfilled response) → `Ok(None)`.
 #[test]
-fn all_zero_is_none() {
-    let mut t = MockTransport::always(Reply::good(vid_ds_response([0u8; 16])));
-    assert_eq!(read_aacs_vid(&mut t).expect("no fault"), None);
+fn unavailable_uniform_vid_is_none() {
+    for value in [0, 0xff] {
+        let mut t = MockTransport::always(Reply::good(vid_ds_response([value; 16])));
+        assert_eq!(read_aacs_vid(&mut t).expect("no fault"), None);
+    }
 }
 
 /// A rejection surfaced as `Err` WITH a sense (a non-conforming transport)
