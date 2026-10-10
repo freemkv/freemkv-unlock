@@ -230,14 +230,7 @@ impl FreemkvUnlocker {
                     .mediatek_loader
                     .as_ref()
                     .ok_or(UnlockError::NotApplicable)?;
-                loader.load(scsi)?;
-                let id = self.probe(scsi)?.ok_or(UnlockError::NotApplicable)?;
-                if id.capabilities.implementation() != Implementation::Firmware {
-                    return Err(UnlockError::NotApplicable);
-                }
-                Box::new(Preinstalled {
-                    capabilities: id.capabilities,
-                })
+                return self.load_mediatek(scsi, loader.as_ref());
             }
             None if renesas::is_renesas(scsi)? => Box::new(renesas::Backend::new()),
             None => return Err(UnlockError::NotApplicable),
@@ -255,10 +248,7 @@ impl FreemkvUnlocker {
                         return Err(UnlockError::NotApplicable);
                     }
                 }
-                self.activate(scsi, &*backend)?;
-                backend.verify(scsi)?;
-                let vid = backend.get_vid(scsi)?;
-                Ok(Unlocked { vid, bus_key: None })
+                self.activate_backend(scsi, &*backend)
             })();
             backend.finish(scsi, result.is_ok())?;
             result
@@ -266,6 +256,45 @@ impl FreemkvUnlocker {
         scsi.pause(std::time::Duration::ZERO)
             .map_err(|_| UnlockError::Transport)?;
         result
+    }
+
+    fn load_mediatek(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        loader: &dyn mediatek::LiveLoader,
+    ) -> BackendResult<Unlocked> {
+        let result = {
+            let mut critical =
+                crate::scsi::CriticalGuard::enter(scsi).map_err(|_| UnlockError::Transport)?;
+            let scsi = &mut *critical;
+            (|| {
+                loader.load(scsi)?;
+                let id = self.probe(scsi)?.ok_or(UnlockError::NotApplicable)?;
+                if id.capabilities.implementation() != crate::protocol::Implementation::Firmware {
+                    return Err(UnlockError::NotApplicable);
+                }
+                self.activate_backend(
+                    scsi,
+                    &Preinstalled {
+                        capabilities: id.capabilities,
+                    },
+                )
+            })()
+        };
+        scsi.pause(std::time::Duration::ZERO)
+            .map_err(|_| UnlockError::Transport)?;
+        result
+    }
+
+    fn activate_backend(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        backend: &dyn Backend,
+    ) -> BackendResult<Unlocked> {
+        self.activate(scsi, backend)?;
+        backend.verify(scsi)?;
+        let vid = backend.get_vid(scsi)?;
+        Ok(Unlocked { vid, bus_key: None })
     }
 
     fn activate(&self, scsi: &mut dyn ScsiTransport, backend: &dyn Backend) -> BackendResult<()> {
@@ -303,8 +332,8 @@ impl Unlocker for FreemkvUnlocker {
     /// read the Volume ID with a bare `0xAD` (best-effort). `Some` when the
     /// Encryption=off set succeeded — the drive is unlocked whether or not the
     /// VID read did; `None` if it isn't supported freemkv firmware;
-    /// `Err(Transport)` on a dead bus. `ctx` is unused: this unlocker
-    /// self-identifies rather than matching on drive identity.
+    /// `Err(Transport)` on a dead bus. A configured MediaTek loader uses
+    /// `ctx.drive_id` only when the initial protocol probe finds no identity.
     fn unlock(
         &self,
         scsi: &mut dyn ScsiTransport,
@@ -317,3 +346,7 @@ impl Unlocker for FreemkvUnlocker {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mediatek_tests.rs"]
+mod mediatek_tests;

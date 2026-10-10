@@ -10,5 +10,11 @@ use crate::{DriveId, UnlockError};
 
 pub trait LiveLoader: Send + Sync {
     fn is_mediatek(&self, drive: &DriveId) -> bool;
+
+    /// Called inside the unlocker's critical span; do not open a nested span.
+    /// Cancellation before entry prevents loading; cancellation during loading
+    /// is deferred until post-load identity validation and activation finish.
+    /// On error, restore any partial installation before returning. On success,
+    /// leave a safe resident implementation even if later validation fails.
     fn load(&self, scsi: &mut dyn ScsiTransport) -> Result<(), UnlockError>;
 }
