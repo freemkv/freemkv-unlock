@@ -198,6 +198,10 @@ impl FreemkvUnlocker {
         }
     }
 
+    // Kept as a focused test seam for the legacy default-drive path. The
+    // production unlock entry point carries the real drive identity through
+    // `full_unlock_with_drive`.
+    #[cfg(test)]
     fn full_unlock(&self, scsi: &mut dyn ScsiTransport) -> BackendResult<Unlocked> {
         self.full_unlock_with_drive(scsi, &crate::DriveId::default())
     }
