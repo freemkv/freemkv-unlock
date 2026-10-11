@@ -77,10 +77,9 @@ impl FreemkvUnlocker {
         }
     }
 
-    /// Install the device-specific MediaTek live loader. The loader is only
-    /// called after the common freemkv API probe fails and the drive identity
-    /// identifies a MediaTek device.
-    // The MediaTek seam is not wired to a production caller yet.
+    /// Install the device-specific MediaTek live loader: `claims_in` asks it
+    /// `is_mediatek` (no probe); it loads only after the common probe fails.
+    /// Not wired to a production caller yet.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_mediatek_loader(mut self, loader: Box<MediatekLoader>) -> Self {
         self.mediatek_loader = Some(loader);
