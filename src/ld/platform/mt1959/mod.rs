@@ -3,9 +3,8 @@
 mod variant_a;
 mod variant_b;
 
-use super::PlatformDriver;
 use crate::ld::error::{Error, Result};
-use crate::ld::profile::DriveProfile;
+use crate::ld::profile::{DriveProfile, Platform};
 use crate::scsi::{self, DataDirection, ScsiSense, ScsiTransport};
 use std::time::Duration;
 
@@ -91,20 +90,22 @@ pub struct Mt1959 {
 }
 
 impl Mt1959 {
-    pub fn new(profile: DriveProfile, is_variant_b: bool) -> Self {
-        let (mode, buffer_id) = if is_variant_b {
-            (MODE_B, BUFFER_ID_B)
-        } else {
-            (MODE_A, BUFFER_ID_A)
+    /// A driver for `profile` on its catalog `platform`; `None` for a
+    /// non-MT1959 platform (Renesas is freemkv's).
+    pub fn new(profile: DriveProfile, platform: Platform) -> Option<Self> {
+        let (mode, buffer_id) = match platform {
+            Platform::Mt1959A => (MODE_A, BUFFER_ID_A),
+            Platform::Mt1959B => (MODE_B, BUFFER_ID_B),
+            Platform::Renesas => return None,
         };
-        Mt1959 {
+        Some(Mt1959 {
             profile,
             mode,
             buffer_id,
             init_complete: false,
             unlocked: false,
             probed: false,
-        }
+        })
     }
 
     // ── SCSI helpers (shared by both variants) ─────────────────────────
@@ -677,17 +678,20 @@ fn await_media_ready(
     unreachable!("the poll returns from inside the loop")
 }
 
-// ── PlatformDriver trait ───────────────────────────────────────────────
+// ── Unlock entry points ───────────────────────────────────────────────
 
-impl PlatformDriver for Mt1959 {
-    fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
+impl Mt1959 {
+    /// Unlock the drive, uploading firmware if needed. A no-op once complete.
+    pub(crate) fn init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         if self.init_complete {
             return Ok(());
         }
         self.run_init(scsi)
     }
 
-    fn probe_disc(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
+    /// Calibrate the drive for this disc: probes the surface so the firmware
+    /// learns each region's speed. A no-op before `init` or once probed.
+    pub(crate) fn probe_disc(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         if !self.init_complete {
             // Don't retry init here — if init() failed, probing can't work either.
             // Retrying causes repeated USB bus resets on BU40N.
@@ -699,11 +703,9 @@ impl PlatformDriver for Mt1959 {
         self.run_probe(scsi)
     }
 
-    fn is_ready(&self) -> bool {
-        self.init_complete
-    }
-
-    fn is_unlocked(&self) -> bool {
+    /// Whether the drive reached the extended-access state. `init` returning
+    /// `Ok` only means the handshake completed, not that content is clear.
+    pub(crate) fn is_unlocked(&self) -> bool {
         self.unlocked
     }
 }

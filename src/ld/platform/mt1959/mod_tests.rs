@@ -7,7 +7,7 @@ thread_local! {
     pub(crate) static TEST_READY_CLOCK: std::cell::Cell<Option<ClockFactory>> =
         const { std::cell::Cell::new(None) };
 }
-use crate::ld::profile::{DriveProfile, Identity};
+use crate::ld::profile::{DriveProfile, Identity, Platform};
 use crate::scsi::{DataDirection, ScsiResult, ScsiTransport};
 
 /// Minimal mock transport that returns a scripted response to the
@@ -71,7 +71,7 @@ fn variant_b_issues_profile_fw_verify_cdb_not_const() {
     profile.firmware = vec![0u8; 2208]; // a real per-drive length, != old 0x9C0
     profile.fw_verify_cdb = Some(drive_f1);
 
-    let mut mt = Mt1959::new(profile, true);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959B).unwrap();
     let mut t = RecordingTransport { cdbs: Vec::new() };
     let _ = variant_b::load_firmware(&mut mt, &mut t);
 
@@ -99,7 +99,7 @@ fn variant_b_issues_profile_fw_verify_cdb_not_const() {
 fn variant_b_meta_read_and_write_extra_cdbs_are_exact_bytes() {
     let mut profile = fixture_profile([0x11, 0x22, 0x33, 0x44]);
     profile.firmware = vec![0u8; 2208];
-    let mut mt = Mt1959::new(profile, true);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959B).unwrap();
     let mut t = RecordingTransport { cdbs: Vec::new() };
     let _ = variant_b::load_firmware(&mut mt, &mut t);
 
@@ -135,7 +135,7 @@ fn variant_a_uploads_at_the_real_length_and_issues_the_verify_read() {
     let mut profile = fixture_profile([0x11, 0x22, 0x33, 0x44]);
     profile.firmware = vec![0u8; 2208];
 
-    let mut mt = Mt1959::new(profile, false);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     let mut t = RecordingTransport { cdbs: Vec::new() };
     let _ = variant_a::load_firmware(&mut mt, &mut t);
 
@@ -162,7 +162,7 @@ fn variant_a_uploads_at_the_real_length_and_issues_the_verify_read() {
 fn variant_a_write_buffer_and_verify_cdbs_are_exact_bytes() {
     let mut profile = fixture_profile([0x11, 0x22, 0x33, 0x44]);
     profile.firmware = vec![0u8; 2208]; // 0x0008A0
-    let mut mt = Mt1959::new(profile, false);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     let mut t = RecordingTransport { cdbs: Vec::new() };
     let _ = variant_a::load_firmware(&mut mt, &mut t);
 
@@ -194,7 +194,7 @@ fn variant_a_write_buffer_and_verify_cdbs_are_exact_bytes() {
 /// WRITE_BUFFER.
 #[test]
 fn variant_a_refuses_an_empty_firmware_blob() {
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let mut t = RecordingTransport { cdbs: Vec::new() };
     let e = variant_a::load_firmware(&mut mt, &mut t).expect_err("no firmware");
     assert!(matches!(e, Error::UnlockFailed));
@@ -209,7 +209,7 @@ fn do_unlock_rejects_a_zero_length_response() {
     let sig = [0x99, 0x9E, 0xC3, 0x75];
     let mut t =
         crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::zero_transfer(64));
-    let mut mt = Mt1959::new(fixture_profile(sig), false);
+    let mut mt = Mt1959::new(fixture_profile(sig), Platform::Mt1959A).unwrap();
     let e = mt.do_unlock(&mut t).expect_err("no bytes is not an unlock");
     assert!(matches!(e, Error::UnlockFailed));
     assert!(!mt.init_complete);
@@ -224,7 +224,7 @@ fn do_unlock_rejects_a_response_too_short_to_validate() {
     let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
     let mut t =
         crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(response, 19));
-    let mut mt = Mt1959::new(fixture_profile(sig), false);
+    let mut mt = Mt1959::new(fixture_profile(sig), Platform::Mt1959A).unwrap();
     let e = mt
         .do_unlock(&mut t)
         .expect_err("19 bytes cannot carry the markers");
@@ -237,7 +237,7 @@ fn do_unlock_rejects_a_response_too_short_to_validate() {
 fn do_unlock_rejects_a_check_condition() {
     let mut t =
         crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::illegal_request());
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let e = mt
         .do_unlock(&mut t)
         .expect_err("a drive sense is not an unlock");
@@ -251,7 +251,7 @@ fn do_unlock_rejects_a_check_condition() {
 fn short_probe_response_is_not_a_transport_failure() {
     let mut t =
         crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::short(vec![0u8; 4], 2));
-    let mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let mut buf = [0u8; 4];
     let e = mt
         .read_buffer_probe(&mut t, SUB_CMD_PROBE, 0, &mut buf, 4)
@@ -270,7 +270,7 @@ fn short_probe_response_is_not_a_transport_failure() {
 #[test]
 fn transport_fault_on_probe_is_a_transport_failure() {
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
-    let mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let mut buf = [0u8; 4];
     let e = mt
         .read_buffer_probe(&mut t, SUB_CMD_PROBE, 0, &mut buf, 4)
@@ -284,7 +284,7 @@ fn transport_fault_on_probe_is_a_transport_failure() {
 #[test]
 fn run_init_aborts_on_a_transport_fault_without_reloading_firmware() {
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let e = mt.init(&mut t).expect_err("dead bus");
     assert!(e.is_transport_failure());
     assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
@@ -298,7 +298,7 @@ fn run_init_aborts_on_a_transport_fault_without_reloading_firmware() {
 fn probe_passes_do_not_reissue_the_same_addresses() {
     let mut t =
         crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::good(vec![0u8; 8]));
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let _ = mt.run_probe(&mut t);
 
@@ -386,7 +386,7 @@ fn drive_sense_during_pass1_probe_is_unlock_failed_not_transport() {
         }
     }
     let mut t = SenseAtFirstProbe;
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let e = mt
         .run_probe(&mut t)
@@ -401,7 +401,7 @@ fn drive_sense_during_pass1_probe_is_unlock_failed_not_transport() {
 #[test]
 fn transport_fault_during_pass1_probe_stays_a_transport_failure() {
     let mut t = ProbeFaultsTransport { fault_at: 0 };
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let e = mt
         .run_probe(&mut t)
@@ -418,7 +418,7 @@ fn transport_fault_during_pass2_probe_stays_a_transport_failure() {
     let mut t = ProbeFaultsTransport {
         fault_at: PROBE_COARSE_END,
     };
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let e = mt
         .run_probe(&mut t)
@@ -432,7 +432,7 @@ fn transport_fault_during_pass2_probe_stays_a_transport_failure() {
 #[test]
 fn validate_propagates_a_transport_fault_without_retrying() {
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
-    let mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let e = mt.validate(&mut t).expect_err("dead bus");
     assert!(e.is_transport_failure());
     assert_eq!(t.calls(), 1, "abort on the first fault, no 5× retry");
@@ -445,7 +445,7 @@ fn validate_propagates_a_transport_fault_without_retrying() {
 fn validate_drive_sense_exhausts_to_unlock_failed() {
     let mut t =
         crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::illegal_request());
-    let mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let e = mt.validate(&mut t).expect_err("five senses, no pass");
     assert!(!e.is_transport_failure(), "a sense is not a dead bus");
     assert!(matches!(e, Error::UnlockFailed));
@@ -459,7 +459,7 @@ fn validate_drive_sense_exhausts_to_unlock_failed() {
 fn variant_a_verify_read_transport_fault_aborts() {
     let mut profile = fixture_profile([0; 4]);
     profile.firmware = vec![0u8; 64];
-    let mut mt = Mt1959::new(profile, false);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     // call 1 WRITE_BUFFER → good; call 2 verify read → dead bus; later
     // do_unlock calls (only reached if the fix is absent) → good.
     let mut t = crate::scsi::mock::MockTransport::scripted(
@@ -483,7 +483,7 @@ fn variant_a_verify_read_transport_fault_aborts() {
 fn variant_a_refuses_firmware_over_the_24bit_write_buffer_length() {
     let mut profile = fixture_profile([0; 4]);
     profile.firmware = vec![0u8; 0x0100_0000]; // one past WRITE_BUFFER_MAX_LEN
-    let mut mt = Mt1959::new(profile, false);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     let mut t = RecordingTransport { cdbs: Vec::new() };
     let e = variant_a::load_firmware(&mut mt, &mut t).expect_err("blob too large to encode");
     assert!(matches!(e, Error::UnlockFailed));
@@ -498,7 +498,7 @@ fn variant_a_load_firmware_succeeds_end_to_end() {
     let sig = [0x11, 0x22, 0x33, 0x44];
     let mut profile = fixture_profile(sig);
     profile.firmware = vec![0u8; 64];
-    let mut mt = Mt1959::new(profile, false);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     let unlock_response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
     let mut t = crate::scsi::mock::MockTransport::scripted(
         vec![
@@ -520,7 +520,7 @@ fn variant_a_load_firmware_succeeds_end_to_end() {
 fn variant_b_upload_step_transport_fault_aborts() {
     let mut profile = fixture_profile([0; 4]);
     profile.firmware = vec![0u8; 64];
-    let mut mt = Mt1959::new(profile, true);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959B).unwrap();
     // call 1 MODE SELECT → good; call 2 metadata read → dead bus; rest good.
     let mut t = crate::scsi::mock::MockTransport::scripted(
         vec![
@@ -584,7 +584,7 @@ fn do_unlock_sets_unlocked_when_both_markers_present() {
     let sig = [0x99, 0x9E, 0xC3, 0x75];
     let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
     let mut transport = ScriptedTransport { response };
-    let mut mt = Mt1959::new(fixture_profile(sig), false);
+    let mut mt = Mt1959::new(fixture_profile(sig), Platform::Mt1959A).unwrap();
 
     let raw = mt.do_unlock(&mut transport).expect("unlock should succeed");
     assert_eq!(raw.len(), 64);
@@ -603,7 +603,7 @@ fn do_unlock_init_complete_but_not_unlocked_when_id_marker_missing() {
     let sig = [0x99, 0x9E, 0xC3, 0x75];
     let response = build_response(sig, FIRMWARE_ACTIVE_SIG, [0u8; 4]);
     let mut transport = ScriptedTransport { response };
-    let mut mt = Mt1959::new(fixture_profile(sig), false);
+    let mut mt = Mt1959::new(fixture_profile(sig), Platform::Mt1959A).unwrap();
 
     mt.do_unlock(&mut transport).expect("unlock should succeed");
     assert!(mt.init_complete);
@@ -621,7 +621,7 @@ fn do_unlock_rejects_signature_mismatch() {
         FIRMWARE_MODE_SIG,
     );
     let mut transport = ScriptedTransport { response };
-    let mut mt = Mt1959::new(fixture_profile([0x99, 0x9E, 0xC3, 0x75]), false);
+    let mut mt = Mt1959::new(fixture_profile([0x99, 0x9E, 0xC3, 0x75]), Platform::Mt1959A).unwrap();
 
     let err = mt.do_unlock(&mut transport).unwrap_err();
     assert!(matches!(err, Error::SignatureMismatch { .. }));
@@ -642,7 +642,7 @@ fn run_init_signature_mismatch_aborts_without_retry() {
         FIRMWARE_MODE_SIG,
     );
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::good(response));
-    let mut mt = Mt1959::new(fixture_profile([0x99, 0x9E, 0xC3, 0x75]), false);
+    let mut mt = Mt1959::new(fixture_profile([0x99, 0x9E, 0xC3, 0x75]), Platform::Mt1959A).unwrap();
     let e = mt.init(&mut t).expect_err("signature mismatch");
     assert!(matches!(e, Error::UnlockFailed));
     assert_eq!(t.calls(), 1, "must not retry a signature mismatch");
@@ -659,7 +659,7 @@ fn run_init_exhausts_after_three_generic_failures() {
     ));
     // Empty firmware -> variant_a::load_firmware fails immediately with
     // no CDB, so each attempt costs exactly one do_unlock call.
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let e = mt.init(&mut t).expect_err("never validates, never uploads");
     assert!(matches!(e, Error::UnlockFailed));
     assert!(!e.is_transport_failure());
@@ -679,7 +679,7 @@ fn run_init_exhausts_after_three_generic_failures_mode_b() {
         vec![0u8; 64],
         10,
     ));
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), true);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959B).unwrap();
     let e = mt.init(&mut t).expect_err("never validates, never uploads");
     assert!(matches!(e, Error::UnlockFailed));
     assert!(!e.is_transport_failure());
@@ -701,7 +701,7 @@ fn run_init_firmware_reload_transport_fault_aborts() {
         vec![crate::scsi::mock::Reply::short(vec![0u8; 64], 10)], // do_unlock: generic fail
         crate::scsi::mock::Reply::TransportFault,                 // WRITE_BUFFER: dead bus
     );
-    let mut mt = Mt1959::new(profile, false);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     let e = mt
         .init(&mut t)
         .expect_err("dead bus during firmware reload");
@@ -749,7 +749,7 @@ fn run_init_returns_ok_once_load_firmware_confirms() {
         let mut t = MockTransport::scripted(script, Reply::TransportFault);
         let mut profile = fixture_profile(sig);
         profile.firmware = vec![0u8; 64];
-        let mut mt = Mt1959::new(profile, false);
+        let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
         let t0 = std::time::Instant::now();
         mt.init(&mut t)
             .unwrap_or_else(|e| panic!("{failed_reloads} failed reloads: {e:?}"));
@@ -758,7 +758,7 @@ fn run_init_returns_ok_once_load_firmware_confirms() {
             expected_calls,
             "no retry after a confirmed unlock"
         );
-        assert!(mt.is_ready() && mt.is_unlocked(), "the unlock is kept");
+        assert!(mt.init_complete && mt.is_unlocked(), "the unlock is kept");
         let uploads = t.cdbs.iter().filter(|c| c[0] == SCSI_WRITE_BUFFER).count();
         assert_eq!(
             uploads,
@@ -801,7 +801,7 @@ fn run_init_waits_for_media_ready_after_upload() {
     let mut t = MockTransport::scripted(script, Reply::TransportFault);
     let mut profile = fixture_profile(sig);
     profile.firmware = vec![0u8; 64];
-    let mut mt = Mt1959::new(profile, false);
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     mt.init(&mut t).expect("ready after two not-ready polls");
     assert_eq!(t.calls(), expected, "polled until ready, then stopped");
     let turs = t.cdbs.iter().filter(|c| c[0] == SCSI_TEST_UNIT_READY);
@@ -1110,7 +1110,7 @@ fn media_ready_poll_stop_during_wait_ends_it() {
 /// first do_unlock fails generically (so the firmware reloads), and the
 /// cancel arrives once a CDB matching `stop_at` reaches the drive.
 fn stop_during_upload(
-    is_variant_b: bool,
+    platform: Platform,
     stop_at: fn(&[u8]) -> bool,
 ) -> (Result<()>, Vec<crate::scsi::mock::Ev>) {
     use crate::scsi::mock::{MockTransport, Reply, StopFake};
@@ -1124,7 +1124,7 @@ fn stop_during_upload(
     );
     let mut t = StopFake::new(inner);
     t.cancel_after = Some(stop_at);
-    let mut mt = Mt1959::new(profile, is_variant_b);
+    let mut mt = Mt1959::new(profile, platform).unwrap();
     let r = mt.init(&mut t);
     (r, t.log)
 }
@@ -1140,7 +1140,7 @@ fn is_unlock_cdb(c: &[u8]) -> bool {
 #[test]
 fn mt1959_a_upload_completes_after_cancel_then_stops() {
     use crate::scsi::mock::Ev;
-    let (r, log) = stop_during_upload(false, |c| c[0] == SCSI_WRITE_BUFFER);
+    let (r, log) = stop_during_upload(Platform::Mt1959A, |c| c[0] == SCSI_WRITE_BUFFER);
     let e = r.expect_err("the Stop ends the init");
     assert!(e.is_transport_failure(), "a refusal is the dead-bus shape");
     let shape: Vec<String> = log
@@ -1160,7 +1160,7 @@ fn mt1959_a_upload_completes_after_cancel_then_stops() {
 #[test]
 fn mt1959_a_stop_before_upload_never_starts_it() {
     use crate::scsi::mock::Ev;
-    let (r, log) = stop_during_upload(false, is_unlock_cdb);
+    let (r, log) = stop_during_upload(Platform::Mt1959A, is_unlock_cdb);
     assert!(r.expect_err("stopped").is_transport_failure());
     assert_eq!(log.len(), 2, "{log:?}");
     assert_eq!(
@@ -1175,7 +1175,7 @@ fn mt1959_a_stop_before_upload_never_starts_it() {
 #[test]
 fn mt1959_b_upload_completes_after_cancel_then_stops() {
     use crate::scsi::mock::Ev;
-    let (r, log) = stop_during_upload(true, |c| c[0] == 0x55);
+    let (r, log) = stop_during_upload(Platform::Mt1959B, |c| c[0] == 0x55);
     assert!(r.expect_err("stopped").is_transport_failure());
     let shape: Vec<String> = log
         .iter()
@@ -1206,7 +1206,7 @@ fn mt1959_b_upload_completes_after_cancel_then_stops() {
 #[test]
 fn mt1959_b_stop_before_upload_never_starts_it() {
     use crate::scsi::mock::Ev;
-    let (r, log) = stop_during_upload(true, is_unlock_cdb);
+    let (r, log) = stop_during_upload(Platform::Mt1959B, is_unlock_cdb);
     assert!(r.expect_err("stopped").is_transport_failure());
     assert_eq!(log.len(), 2, "{log:?}");
     assert_eq!(log[1], Ev::BeginRefused);
@@ -1221,7 +1221,7 @@ fn run_probe_runs_do_unlock_when_not_yet_initialized() {
     let sig = [0x99, 0x9E, 0xC3, 0x75];
     let response = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::good(response));
-    let mut mt = Mt1959::new(fixture_profile(sig), false);
+    let mut mt = Mt1959::new(fixture_profile(sig), Platform::Mt1959A).unwrap();
     assert!(!mt.init_complete);
     let r = mt.run_probe(&mut t);
     assert!(r.is_ok(), "probe completes: {r:?}");
@@ -1260,7 +1260,7 @@ fn run_probe_capacity_check_condition_falls_back_to_zero_sectors() {
         }
     }
     let mut t = CapacitySenseTransport;
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let r = mt.run_probe(&mut t);
     assert!(
@@ -1312,7 +1312,7 @@ fn run_probe_selects_uhd_init_addr_for_a_large_disc() {
     let mut t = BigDiscTransport {
         init_addr_seen: std::cell::RefCell::new(None),
     };
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let _ = mt.run_probe(&mut t);
     assert_eq!(
@@ -1361,7 +1361,7 @@ fn run_probe_pass2_ends_early_on_a_rejected_probe_without_failing() {
     let mut t = Pass2RejectsTransport {
         fault_at: PROBE_COARSE_END as u32,
     };
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let r = mt.run_probe(&mut t);
     assert!(
@@ -1371,13 +1371,13 @@ fn run_probe_pass2_ends_early_on_a_rejected_probe_without_failing() {
     assert!(mt.probed);
 }
 
-// ── PlatformDriver trait guard clauses ──────────────────────────────────
+// ── init / probe_disc guard clauses ──────────────────────────────────
 
 /// `init()` is a no-op once `init_complete` is already set — it must not
 /// re-run the handshake.
 #[test]
 fn init_is_a_noop_once_already_complete() {
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
     assert!(mt.init(&mut t).is_ok());
@@ -1388,7 +1388,7 @@ fn init_is_a_noop_once_already_complete() {
 /// retry of init): it must return `Ok(())` without touching the bus.
 #[test]
 fn probe_disc_is_a_noop_before_init_completes() {
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
     assert!(mt.probe_disc(&mut t).is_ok());
     assert_eq!(t.calls(), 0);
@@ -1397,7 +1397,7 @@ fn probe_disc_is_a_noop_before_init_completes() {
 /// `probe_disc()` is a no-op once already probed.
 #[test]
 fn probe_disc_is_a_noop_once_already_probed() {
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
     mt.init_complete = true;
     mt.probed = true;
     let mut t = crate::scsi::mock::MockTransport::always(crate::scsi::mock::Reply::TransportFault);
@@ -1405,13 +1405,14 @@ fn probe_disc_is_a_noop_once_already_probed() {
     assert_eq!(t.calls(), 0);
 }
 
-/// `is_ready()` mirrors `init_complete`.
+/// Only the MT1959 sections have a driver; Renesas is freemkv's.
 #[test]
-fn is_ready_mirrors_init_complete() {
-    let mut mt = Mt1959::new(fixture_profile([0; 4]), false);
-    assert!(!mt.is_ready());
-    mt.init_complete = true;
-    assert!(mt.is_ready());
+fn new_builds_a_driver_only_for_mt1959_platforms() {
+    let a = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
+    let b = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959B).unwrap();
+    assert_eq!((a.mode, a.buffer_id), (MODE_A, BUFFER_ID_A));
+    assert_eq!((b.mode, b.buffer_id), (MODE_B, BUFFER_ID_B));
+    assert!(Mt1959::new(fixture_profile([0; 4]), Platform::Renesas).is_none());
 }
 
 #[test]
@@ -1422,7 +1423,7 @@ fn do_unlock_rejects_inactive_mode_marker() {
     let sig = [0x99, 0x9E, 0xC3, 0x75];
     let response = build_response(sig, [0u8; 4], FIRMWARE_MODE_SIG);
     let mut transport = ScriptedTransport { response };
-    let mut mt = Mt1959::new(fixture_profile(sig), false);
+    let mut mt = Mt1959::new(fixture_profile(sig), Platform::Mt1959A).unwrap();
 
     let err = mt.do_unlock(&mut transport).unwrap_err();
     assert!(matches!(err, Error::UnlockFailed));

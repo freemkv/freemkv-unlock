@@ -134,13 +134,10 @@ impl LdUnlocker {
         let Some(m) = profile::find_bundled(id) else {
             return Err(UnlockError::NotApplicable);
         };
-        if matches!(m.platform, profile::Platform::Renesas) {
-            // Renesas is a different platform (handled by the Renesas unlocker).
+        // Renesas is a different platform (handled by the freemkv unlocker).
+        let Some(mut mt) = platform::mt1959::Mt1959::new(m.profile.clone(), m.platform) else {
             return Err(UnlockError::NotApplicable);
-        }
-        let is_variant_b = matches!(m.platform, profile::Platform::Mt1959B);
-        use platform::PlatformDriver;
-        let mut mt = platform::mt1959::Mt1959::new(m.profile.clone(), is_variant_b);
+        };
         // A transport fault → UnlockError::Transport; any other firmware failure
         // → NotApplicable (via From<error::Error>).
         mt.init(scsi)?;
