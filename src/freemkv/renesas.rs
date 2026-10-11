@@ -184,9 +184,7 @@ impl super::Backend for Backend {
         }
     }
     fn capabilities(&self) -> crate::protocol::Capabilities {
-        crate::protocol::ProtocolIdentity::parse(&crate::protocol::pioneer_identity())
-            .unwrap()
-            .capabilities
+        crate::protocol::Capabilities::PIONEER_RUNTIME
     }
     fn verify(&self, scsi: &mut dyn ScsiTransport) -> Result<(), UnlockError> {
         let p = self.prepared.as_ref().ok_or(UnlockError::NotApplicable)?;

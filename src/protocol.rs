@@ -433,6 +433,10 @@ pub struct Capabilities {
     implementation: Implementation,
 }
 impl Capabilities {
+    /// The Pioneer runtime's requests: what [`pioneer_identity`] parses to.
+    pub(crate) const PIONEER_RUNTIME: Self = Self {
+        implementation: Implementation::PioneerRuntime,
+    };
     /// Implementation selected by the validated identity descriptor.
     pub fn implementation(self) -> Implementation {
         self.implementation
@@ -507,6 +511,7 @@ mod tests {
     #[test]
     fn runtime_support_is_distinct_from_state() {
         let id = ProtocolIdentity::parse(&pioneer_identity()).unwrap();
+        assert_eq!(id.capabilities, Capabilities::PIONEER_RUNTIME);
         assert_eq!(
             id.capabilities.implementation(),
             Implementation::PioneerRuntime
