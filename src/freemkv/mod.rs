@@ -5,9 +5,11 @@
 pub mod mediatek;
 pub mod renesas;
 
+#[cfg(test)]
+use crate::firmware::build_memread_cdb;
 use crate::firmware::{
     Feature, FirmwareIdentity, MEMREAD_LEN, MIN_ALLOC_LEN, REGION_FREE, SPEED_MAX, STATE_OFF,
-    STATE_ON, build_identity_cdb, build_memread_cdb, build_set_cdb,
+    STATE_ON, build_identity_cdb, build_set_cdb,
 };
 use crate::scsi::{DataDirection, ScsiTransport, is_dead_bus};
 use crate::{UnlockCtx, UnlockError, Unlocked, Unlocker};
@@ -177,7 +179,7 @@ impl FreemkvUnlocker {
 
     /// DumpAll diagnostic RAM read (DUMPALL): return the 64-byte window at
     /// `addr`. A host-side diagnostic path only — not used by the unlock flow.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn dump_ram(
         &self,
         scsi: &mut dyn ScsiTransport,
