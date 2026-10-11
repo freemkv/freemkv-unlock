@@ -332,3 +332,9 @@ fn regression_non_mediatek_drive_never_calls_loader_and_reaches_renesas_probe() 
         "flow must reach the Renesas probe"
     );
 }
+
+#[test]
+fn freemkv_unlocker_stays_unwind_safe() {
+    fn assert_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+    assert_traits::<FreemkvUnlocker>();
+}

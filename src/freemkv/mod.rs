@@ -61,9 +61,13 @@ impl Backend for Preinstalled {
     }
 }
 
+/// Boxed live loader; unwind-safe so `FreemkvUnlocker` keeps the auto traits
+/// it had as a unit struct.
+type MediatekLoader = dyn mediatek::LiveLoader + std::panic::RefUnwindSafe + std::panic::UnwindSafe;
+
 #[derive(Default)]
 pub struct FreemkvUnlocker {
-    mediatek_loader: Option<Box<dyn mediatek::LiveLoader>>,
+    mediatek_loader: Option<Box<MediatekLoader>>,
 }
 
 impl FreemkvUnlocker {
@@ -76,7 +80,9 @@ impl FreemkvUnlocker {
     /// Install the device-specific MediaTek live loader. The loader is only
     /// called after the common freemkv API probe fails and the drive identity
     /// identifies a MediaTek device.
-    pub fn with_mediatek_loader(mut self, loader: Box<dyn mediatek::LiveLoader>) -> Self {
+    // The MediaTek seam is not wired to a production caller yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_mediatek_loader(mut self, loader: Box<MediatekLoader>) -> Self {
         self.mediatek_loader = Some(loader);
         self
     }
