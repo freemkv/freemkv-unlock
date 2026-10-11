@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking
+
+- `FreemkvUnlocker` is no longer a unit struct: construct it with `FreemkvUnlocker::new()`.
+
+### Added
+
+- `Unlocker::claims` (default false) so exactly one unlocker claims a catalogued drive.
+
+### Changed
+
+- `unlocker_name` reports the first claiming unlocker. Renesas-catalogued drives would no longer be reported as LD; the bundled catalog has none today.
+
 ## [1.8.3] — 2026-10-08
 
 ### Changed

@@ -264,3 +264,71 @@ fn regression_mediatek_preinstalled_firmware_skips_loader() {
     assert!(!drive.events.iter().any(|(op, _)| matches!(op, 0xe0..=0xe2)));
     assert_eq!((drive.begins, drive.ends), (1, 1));
 }
+
+struct LoggingLoader {
+    log: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl mediatek::LiveLoader for LoggingLoader {
+    fn is_mediatek(&self, _: &crate::DriveId) -> bool {
+        self.log.lock().unwrap().push("is_mediatek");
+        false
+    }
+
+    fn load(&self, _: &mut dyn ScsiTransport) -> BackendResult<()> {
+        self.log.lock().unwrap().push("load");
+        Ok(())
+    }
+}
+
+/// Answers every command with 64 zero bytes (no freemkv identity, no Renesas
+/// marker) and records each CDB.
+#[derive(Default)]
+struct BlankDrive {
+    cdbs: Vec<Vec<u8>>,
+}
+
+impl ScsiTransport for BlankDrive {
+    fn execute(
+        &mut self,
+        cdb: &[u8],
+        _: DataDirection,
+        data: &mut [u8],
+        _: u32,
+    ) -> crate::scsi::Result<ScsiResult> {
+        self.cdbs.push(cdb.to_vec());
+        data.fill(0);
+        Ok(ScsiResult {
+            status: 0,
+            bytes_transferred: data.len().min(64),
+            sense: [0; 32],
+        })
+    }
+}
+
+/// Pins the `is_mediatek` gate: a loader that says "not MediaTek" must never be
+/// asked to load, and the flow must fall through to the Renesas probe and decline.
+#[test]
+fn regression_non_mediatek_drive_never_calls_loader_and_reaches_renesas_probe() {
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut drive = BlankDrive::default();
+    let id = crate::DriveId::default();
+    let ctx = UnlockCtx::new(&id, crate::DiscKind::Unknown);
+    let result = FreemkvUnlocker::new()
+        .with_mediatek_loader(Box::new(LoggingLoader { log: log.clone() }))
+        .unlock(&mut drive, &ctx);
+    assert!(
+        result.unwrap().is_none(),
+        "non-MediaTek blank drive declines"
+    );
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["is_mediatek"],
+        "load never called"
+    );
+    let renesas_probe = pioneer_optical::cdb::vendor_identity();
+    assert!(
+        drive.cdbs.iter().any(|c| c[..] == renesas_probe[..]),
+        "flow must reach the Renesas probe"
+    );
+}
