@@ -58,11 +58,13 @@ impl LdUnlocker {
     }
 }
 
-/// The firmware-unlocker name for a drive that has a bundled profile (for
-/// drive-info "is this drive supported?" display), or `None`. A pure profile
-/// lookup — does NOT touch the drive or unlock anything.
-pub(crate) fn firmware_name(id: &DriveId) -> Option<&'static str> {
-    profile::find_bundled(id).map(|_| "LD")
+impl LdUnlocker {
+    // LD owns the MT1959 sections of `catalog`; the Renesas section is freemkv's.
+    pub(crate) fn claims_in(catalog: &Profiles, id: &DriveId) -> bool {
+        catalog
+            .get(id)
+            .is_some_and(|m| matches!(m.platform, Platform::Mt1959A | Platform::Mt1959B))
+    }
 }
 
 impl LdUnlocker {
@@ -183,6 +185,10 @@ impl LdUnlocker {
 impl Unlocker for LdUnlocker {
     fn name(&self) -> &'static str {
         "LD"
+    }
+
+    fn claims(&self, id: &DriveId) -> bool {
+        profiles().is_some_and(|c| Self::claims_in(c, id))
     }
 
     /// Match the drive against the bundled profile database and run the firmware

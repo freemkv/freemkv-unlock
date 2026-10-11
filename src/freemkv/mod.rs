@@ -322,9 +322,31 @@ impl FreemkvUnlocker {
     }
 }
 
+impl FreemkvUnlocker {
+    // freemkv owns the Renesas section of `catalog`, plus MediaTek drives its
+    // configured live loader recognises.
+    pub(crate) fn claims_in(
+        &self,
+        catalog: Option<&crate::ld::Profiles>,
+        id: &crate::DriveId,
+    ) -> bool {
+        catalog
+            .and_then(|c| c.get(id))
+            .is_some_and(|m| m.platform == crate::ld::Platform::Renesas)
+            || self
+                .mediatek_loader
+                .as_ref()
+                .is_some_and(|loader| loader.is_mediatek(id))
+    }
+}
+
 impl Unlocker for FreemkvUnlocker {
     fn name(&self) -> &'static str {
         "freemkv"
+    }
+
+    fn claims(&self, id: &crate::DriveId) -> bool {
+        self.claims_in(crate::ld::profiles(), id)
     }
 
     /// Recognise the drive by its IDENTITY knock, lift riplock/region and open

@@ -45,6 +45,87 @@ fn unlocker_name_is_a_pure_identity_lookup() {
     assert_eq!(unlocker_name(&DriveId::default()), None);
 }
 
+fn id_of(identity: &ld::Identity) -> DriveId {
+    DriveId {
+        vendor_id: identity.vendor_id.clone(),
+        product_id: identity.product_id.clone(),
+        product_revision: identity.product_revision.clone(),
+        vendor_specific: identity.vendor_specific.clone(),
+        firmware_date: identity.firmware_date.clone(),
+    }
+}
+
+// One MT1959-A and one Renesas drive, distinct identities.
+fn two_platform_catalog() -> ld::Profiles {
+    let entry = |vendor: &str| {
+        serde_json::json!({"identity": {"vendor_id": vendor, "product_id": "BD-RE",
+            "product_revision": "1.00", "vendor_specific": "XX00000",
+            "firmware_date": "200001010000"}, "signature": "aaaaaaaa", "firmware": ""})
+    };
+    serde_json::from_value(serde_json::json!({
+        "mt1959_a": [entry("MTK")], "renesas": [entry("PIONEER")]
+    }))
+    .unwrap()
+}
+
+/// A bundled MT1959 drive is claimed by LD alone, and reported as "LD".
+#[test]
+fn bundled_mt1959_drive_is_claimed_by_ld_only() {
+    let catalog = ld::profiles().expect("bundled catalog parses");
+    for identity in [&catalog.mt1959_a[0].identity, &catalog.mt1959_b[0].identity] {
+        let id = id_of(identity);
+        assert!(LdUnlocker::new().claims(&id));
+        assert!(!FreemkvUnlocker::new().claims(&id));
+        assert_eq!(unlocker_name(&id), Some("LD"));
+    }
+}
+
+/// The Renesas section belongs to freemkv, never LD: the "LD" label for a
+/// Renesas drive was the bug. Each catalogued drive has exactly one claimant.
+#[test]
+fn renesas_profile_is_claimed_by_freemkv_not_ld() {
+    let catalog = two_platform_catalog();
+    let [mtk, renesas] = [&catalog.mt1959_a[0], &catalog.renesas[0]].map(|p| id_of(&p.identity));
+    let fm = FreemkvUnlocker::new();
+    assert!(fm.claims_in(Some(&catalog), &renesas));
+    assert!(!LdUnlocker::claims_in(&catalog, &renesas));
+    assert!(LdUnlocker::claims_in(&catalog, &mtk));
+    assert!(!fm.claims_in(Some(&catalog), &mtk));
+    assert!(!fm.claims_in(Some(&catalog), &DriveId::default()));
+    assert!(!LdUnlocker::claims_in(&catalog, &DriveId::default()));
+}
+
+/// Disc-keyed unlockers claim no drive, whatever its identity.
+#[test]
+fn disc_keyed_unlockers_claim_no_drive() {
+    let catalog = ld::profiles().expect("bundled catalog parses");
+    let id = id_of(&catalog.mt1959_a[0].identity);
+    assert!(!AacsUnlocker::new(Vec::new()).claims(&id));
+    assert!(!DvdUnlocker::new().claims(&id));
+}
+
+/// A configured MediaTek live loader makes freemkv claim the drives it
+/// recognises, even with no catalog.
+#[test]
+fn freemkv_claims_what_its_mediatek_loader_recognises() {
+    struct Loader;
+    impl freemkv::mediatek::LiveLoader for Loader {
+        fn is_mediatek(&self, drive: &DriveId) -> bool {
+            drive.vendor_id == "MTK"
+        }
+        fn load(&self, _: &mut dyn scsi::ScsiTransport) -> Result<(), UnlockError> {
+            Err(UnlockError::NotApplicable)
+        }
+    }
+    let fm = FreemkvUnlocker::new().with_mediatek_loader(Box::new(Loader));
+    let mtk = DriveId {
+        vendor_id: "MTK".into(),
+        ..DriveId::default()
+    };
+    assert!(fm.claims_in(None, &mtk));
+    assert!(!fm.claims_in(None, &DriveId::default()));
+}
+
 // `bus_key`/`vid` are key material; `Debug` must NOT print those bytes.
 // MUTATION: restoring `#[derive(Debug)]` prints the raw byte arrays, so
 // the marker bytes appear in the output and this test goes red.

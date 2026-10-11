@@ -169,10 +169,17 @@ pub enum UnlockError {
 /// here — that is the consumer's concern, not bus removal.
 pub trait Unlocker: Send + Sync {
     /// Short, stable identifier for this unlocker (e.g. "freemkv", "LD",
-    /// "AACS", "DVD", "Renesas"). The ONE place a name lives — apps render the
+    /// "AACS", "DVD"). The ONE place a name lives — apps render the
     /// unlocker report from `name()`, never hardcoding names, so adding/removing
     /// an unlocker updates every report with no app change.
     fn name(&self) -> &'static str;
+
+    /// Whether this unlocker owns `id` by identity alone: a pure lookup that
+    /// touches no drive. A chain reports its first claiming unlocker as the
+    /// drive's unlocker. Disc-keyed unlockers (AACS / CSS) claim no drive.
+    fn claims(&self, _id: &DriveId) -> bool {
+        false
+    }
 
     /// Attempt to unlock the drive, whatever the mechanism (vendor CDB, profile
     /// firmware handshake, AACS cert AKE, CSS auth):
@@ -204,13 +211,16 @@ pub(crate) fn fallthrough(
     }
 }
 
-/// Name of the unlocker that claims this drive by identity (for drive-info "is
-/// this drive supported?" display), or `None`. A pure lookup — does NOT touch
-/// the drive or unlock anything. Only the identity-keyed (drive-prep) unlocker
-/// can answer from a `DriveId` alone; the disc-kind-keyed unlockers (AACS / CSS)
-/// don't claim a drive sight-unseen, so they never match here.
+/// Name of the first firmware unlocker (freemkv, then LD) that
+/// [claims](Unlocker::claims) this drive by identity, or `None`. A pure lookup
+/// — does NOT touch the drive or unlock anything. The disc-kind-keyed
+/// unlockers (AACS / CSS) claim no drive, so they never match here.
 pub fn unlocker_name(drive_id: &DriveId) -> Option<&'static str> {
-    ld::firmware_name(drive_id)
+    let chain: [&dyn Unlocker; 2] = [&FreemkvUnlocker::new(), &LdUnlocker::new()];
+    chain
+        .into_iter()
+        .find(|u| u.claims(drive_id))
+        .map(|u| u.name())
 }
 
 #[cfg(test)]
