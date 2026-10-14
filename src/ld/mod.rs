@@ -156,26 +156,61 @@ impl LdUnlocker {
         // but not silent — an unlogged `let _ =` made a failed calibration
         // indistinguishable from success in the rip log.
         if let Err(e) = mt.probe_disc(scsi) {
-            // A transport fault here is a dead bus, not a calibration miss — most
-            // profiles never touch the bus again, so this was the only dead-bus
-            // signal.
-            if e.is_transport_failure() {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    phase = "probe_disc_transport_fault",
-                    "transport fault during disc speed calibration; aborting"
-                );
-                return Err(UnlockError::Transport);
-            }
             tracing::warn!(
                 target: "freemkv::disc",
                 phase = "probe_disc_failed",
-                transport_failure = false,
-                "disc speed calibration failed; continuing with the drive's default speed table"
+                error = %e,
+                sense = ?e.sense_triple(),
+                transport_failure = e.is_transport_failure(),
+                "disc speed calibration failed; the drive keeps its default speed table, so reads may run below full speed"
             );
+            // Calibration is best-effort, but a transport fault may have reset the drive
+            // (dropping the firmware): keep the unlock only if the drive re-confirms it.
+            if e.is_transport_failure() {
+                Self::reconfirm_after_fault(&mut mt, scsi)?;
+            }
         }
         let vid = self.read_oem_vid(scsi, &m.profile)?;
         Ok(Unlocked { vid, bus_key: None })
+    }
+}
+
+impl LdUnlocker {
+    // After a calibration transport fault: `Ok` if the unlock still holds, `Transport`
+    // if the bus is still dead, `NotApplicable` if the drive lost the extended-access state.
+    fn reconfirm_after_fault(
+        mt: &mut platform::mt1959::Mt1959,
+        scsi: &mut dyn ScsiTransport,
+    ) -> std::result::Result<(), UnlockError> {
+        match mt.reconfirm_unlock(scsi) {
+            Ok(true) => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "unlock_reconfirmed_after_fault",
+                    "drive still unlocked after the calibration fault; continuing without calibration"
+                );
+                Ok(())
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "unlock_lost_after_fault",
+                    "drive left the extended-access state after the calibration fault; not unlocked"
+                );
+                Err(UnlockError::NotApplicable)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "unlock_reconfirm_failed",
+                    error = %e,
+                    sense = ?e.sense_triple(),
+                    transport_failure = e.is_transport_failure(),
+                    "could not re-confirm the unlock after the calibration fault"
+                );
+                Err(UnlockError::from(e))
+            }
+        }
     }
 }
 

@@ -14,6 +14,11 @@
 
 - `unlocker_name` reports the first claiming unlocker. Renesas-catalogued drives would no longer be reported as LD; the bundled catalog has none today.
 
+### Fixed
+
+- MediaTek (LD) drives: a transport fault during disc speed calibration no longer discards an unlock the drive still confirms. The unlock is re-read after the fault and kept if the drive is still in the extended-access state; a still-dead bus remains a transport failure, and a drive that lost the firmware is reported not unlocked. Calibration failures are logged at warn with the error and sense, noting that reads may run below full speed.
+- A transport fault on the calibration init command now aborts calibration instead of running the validate step against the closed device handle.
+
 ## [1.8.3] — 2026-10-08
 
 ### Changed

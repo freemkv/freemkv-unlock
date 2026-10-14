@@ -52,6 +52,14 @@ impl Error {
 
     /// True if this is a transport-layer SCSI failure (bus dead), as opposed to a
     /// drive sense or a logical failure.
+    /// (sense key, ASC, ASCQ) of a drive sense, for logs; `None` without sense data.
+    pub(crate) fn sense_triple(&self) -> Option<(u8, u8, u8)> {
+        match self {
+            Error::Scsi { sense: Some(s), .. } => Some((s[2] & 0x0F, s[12], s[13])),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_transport_failure(&self) -> bool {
         matches!(
             self,

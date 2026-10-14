@@ -231,7 +231,7 @@ impl Mt1959 {
     }
 
     fn validate(&self, scsi: &mut dyn ScsiTransport) -> Result<()> {
-        for _attempt in 0..5 {
+        for attempt in 0..5 {
             let cdb = [
                 0x3C,
                 self.mode,
@@ -249,10 +249,13 @@ impl Mt1959 {
                 // A drive sense arrives as `Ok`; only a GOOD status is a pass.
                 Ok(r) if r.status == 0 => return Ok(()),
                 Ok(r) => {
+                    let s = ScsiSense::from_buf(&r.sense);
                     tracing::debug!(
                         target: "freemkv::disc",
                         phase = "mt1959_validate_check_condition",
+                        attempt,
                         status = r.status,
+                        sense = ?(s.sense_key, s.asc, s.ascq),
                         "validate READ_BUFFER returned a drive sense"
                     );
                 }
@@ -260,15 +263,24 @@ impl Mt1959 {
                 // labelling every other failure "transport" made the consumer
                 // abort rips it could have completed. Propagate the real fault.
                 Err(e) => {
+                    let e = Error::from(e);
                     tracing::warn!(
                         target: "freemkv::disc",
                         phase = "mt1959_validate_transport_fault",
+                        attempt,
+                        error = %e,
+                        sense = ?e.sense_triple(),
                         "transport fault during validate; aborting"
                     );
-                    return Err(Error::from(e));
+                    return Err(e);
                 }
             }
         }
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "mt1959_validate_exhausted",
+            "validate READ_BUFFER never answered GOOD in 5 attempts"
+        );
         Err(Error::UnlockFailed)
     }
 
@@ -414,13 +426,35 @@ impl Mt1959 {
             INIT_ADDR_BD
         };
         let mut init_resp = [0u8; PROBE_RESPONSE_SIZE as usize];
-        let _ = self.read_buffer_probe(
+        // A rejected init reply is tolerated (validate decides); a transport fault is not —
+        // the next command would only meet the handle the fault closed.
+        if let Err(e) = self.read_buffer_probe(
             scsi,
             SUB_CMD_INIT,
             init_addr,
             &mut init_resp,
             PROBE_RESPONSE_SIZE as usize,
-        );
+        ) {
+            if e.is_transport_failure() {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    phase = "mt1959_probe_init_transport_fault",
+                    init_addr,
+                    disc_sectors,
+                    error = %e,
+                    "transport fault on the speed calibration init command; aborting calibration"
+                );
+                return Err(e);
+            }
+            tracing::debug!(
+                target: "freemkv::disc",
+                phase = "mt1959_probe_init_rejected",
+                init_addr,
+                error = %e,
+                sense = ?e.sense_triple(),
+                "speed calibration init command rejected"
+            );
+        }
 
         self.validate(scsi)?;
 
@@ -437,11 +471,12 @@ impl Mt1959 {
                     PROBE_RESPONSE_SIZE as usize,
                 )
                 .inspect_err(|e| {
-                    tracing::debug!(
+                    tracing::warn!(
                         target: "freemkv::disc",
                         phase = "mt1959_probe_failed",
                         addr,
                         error = %e,
+                        sense = ?e.sense_triple(),
                         "coarse speed probe failed"
                     );
                 })
@@ -707,6 +742,14 @@ impl Mt1959 {
     /// `Ok` only means the handshake completed, not that content is clear.
     pub(crate) fn is_unlocked(&self) -> bool {
         self.unlocked
+    }
+
+    /// Re-run the unlock read after a fault: `Ok(true)` only if the drive still
+    /// answers in the extended-access state (a reset drops the firmware).
+    pub(crate) fn reconfirm_unlock(&mut self, scsi: &mut dyn ScsiTransport) -> Result<bool> {
+        self.unlocked = false;
+        self.do_unlock(scsi)?;
+        Ok(self.unlocked)
     }
 }
 

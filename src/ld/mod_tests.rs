@@ -227,55 +227,104 @@ fn fully_unlocked_drive_reports_unlocked() {
     );
 }
 
-// THE probe-disc dead-bus test: bus dies during speed calibration after a
-// full unlock; must abort with Transport, not report a successful unlock.
-#[test]
-fn transport_fault_during_probe_disc_is_transport_not_a_successful_unlock() {
+// What the drive does after the speed probe faults at the transport.
+#[derive(Clone, Copy, PartialEq)]
+enum AfterProbeFault {
+    // The bus recovers and the drive still answers unlocked (the BU40N field case).
+    Recovers,
+    // Every later command faults too: a dead bus.
+    Dead,
+    // The bus recovers but the reset dropped the firmware: the unlock read has no markers.
+    LostFirmware,
+}
+
+// A drive that unlocks fully, then faults on the first speed probe (READ_BUFFER
+// sub 0x14) and behaves per `after` from then on.
+struct ProbeFaultsDrive {
+    resp: Vec<u8>,
+    after: AfterProbeFault,
+    faulted: bool,
+}
+impl ScsiTransport for ProbeFaultsDrive {
+    fn execute(
+        &mut self,
+        cdb: &[u8],
+        _dir: DataDirection,
+        data: &mut [u8],
+        _timeout_ms: u32,
+    ) -> crate::scsi::Result<ScsiResult> {
+        let fault = || crate::scsi::ScsiError {
+            status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        };
+        let is_probe = cdb.first() == Some(&0x3C) && cdb.get(3) == Some(&0x14);
+        if is_probe && !self.faulted {
+            self.faulted = true;
+            return Err(fault());
+        }
+        if self.faulted && self.after == AfterProbeFault::Dead {
+            return Err(fault());
+        }
+        let mut resp = self.resp.clone();
+        if self.faulted && self.after == AfterProbeFault::LostFirmware {
+            resp[12..20].fill(0);
+        }
+        let n = resp.len().min(data.len());
+        data[..n].copy_from_slice(&resp[..n]);
+        Ok(ScsiResult {
+            status: 0,
+            bytes_transferred: n,
+            sense: [0u8; 32],
+        })
+    }
+}
+
+fn probe_fault_unlock(
+    after: AfterProbeFault,
+) -> std::result::Result<Option<Unlocked>, UnlockError> {
     let id = known_vid_drive_id();
     let sig = profile::find_bundled(&id)
         .expect("profile")
         .profile
         .signature;
-
-    // A drive that unlocks fully but whose bus dies on the speed probe.
-    struct ProbeFaultsDrive {
-        resp: Vec<u8>,
-    }
-    impl ScsiTransport for ProbeFaultsDrive {
-        fn execute(
-            &mut self,
-            cdb: &[u8],
-            _dir: DataDirection,
-            data: &mut [u8],
-            _timeout_ms: u32,
-        ) -> crate::scsi::Result<ScsiResult> {
-            // READ_BUFFER (0x3C) / SUB_CMD_PROBE (0x14) is the speed probe.
-            if cdb.first() == Some(&0x3C) && cdb.get(3) == Some(&0x14) {
-                return Err(crate::scsi::ScsiError {
-                    status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
-                    sense: None,
-                });
-            }
-            let n = self.resp.len().min(data.len());
-            data[..n].copy_from_slice(&self.resp[..n]);
-            Ok(ScsiResult {
-                status: 0,
-                bytes_transferred: n,
-                sense: [0u8; 32],
-            })
-        }
-    }
-
     let mut resp = vec![0u8; 64];
     resp[0..4].copy_from_slice(&sig);
     resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]); // primary marker
     resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]); // secondary marker
-    let mut t = ProbeFaultsDrive { resp };
+    let mut t = ProbeFaultsDrive {
+        resp,
+        after,
+        faulted: false,
+    };
+    LdUnlocker::new().unlock(&mut t, &ctx(&id))
+}
 
-    let err = LdUnlocker::new()
-        .unlock(&mut t, &ctx(&id))
-        .expect_err("a dead bus during probe must abort, not report success");
-    assert_eq!(err, UnlockError::Transport);
+// BU40N field report: a transport fault during calibration must not throw away an
+// unlock the drive still confirms, or the scan runs the cert AKE on an unlocked drive.
+#[test]
+fn calibration_transport_fault_keeps_a_reconfirmed_unlock() {
+    assert!(
+        probe_fault_unlock(AfterProbeFault::Recovers)
+            .expect("calibration is best-effort")
+            .is_some()
+    );
+}
+
+#[test]
+fn calibration_transport_fault_on_a_dead_bus_is_transport() {
+    assert_eq!(
+        probe_fault_unlock(AfterProbeFault::Dead).expect_err("dead bus"),
+        UnlockError::Transport
+    );
+}
+
+#[test]
+fn calibration_transport_fault_that_drops_the_firmware_is_not_unlocked() {
+    assert!(
+        probe_fault_unlock(AfterProbeFault::LostFirmware)
+            .expect("not a dead bus")
+            .is_none()
+    );
 }
 
 // A drive-sense (not a dead bus) rejecting the speed probe is a genuine
