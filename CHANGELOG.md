@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.8.5] — 2026-10-19
+
+### Fixed
+
+- MediaTek (LD) drives (#75): after a transport fault during calibration the drive gets 5 s with no commands before the one re-confirm read, which is never followed by a firmware upload. After a firmware upload the drive gets 10 s with no commands, as in 1.7.7, then one re-confirm read before the readiness poll; a drive that dropped the firmware while restarting is uploaded again within the same three attempts, and a transport fault during the poll ends it at once.
+- Drives the LD unlocker claims are no longer sent the Renesas identity probe, so a faulted bus there cannot stop the LD unlock from running (#75).
+
 ## [1.8.4] — 2026-10-11
 
 ### Breaking
@@ -18,8 +25,6 @@
 
 - MediaTek (LD) drives: a transport fault during disc speed calibration no longer discards an unlock the drive still confirms. The unlock is re-read after the fault and kept if the drive is still in the extended-access state; a still-dead bus remains a transport failure, and a drive that lost the firmware is reported not unlocked. Calibration failures are logged at warn with the error and sense, noting that reads may run below full speed.
 - A transport fault on the calibration init command now aborts calibration instead of running the validate step against the closed device handle.
-- MediaTek (LD) drives (#75): after a transport fault during calibration the drive gets 5 s with no commands before the one re-confirm read, which is never followed by a firmware upload. After a firmware upload the drive gets 10 s with no commands, as in 1.7.7, then one re-confirm read before the readiness poll; a drive that dropped the firmware while restarting is uploaded again within the same three attempts, and a transport fault during the poll ends it at once.
-- Drives the LD unlocker claims are no longer sent the Renesas identity probe, so a faulted bus there cannot stop the LD unlock from running (#75).
 
 ## [1.8.3] — 2026-10-08
 

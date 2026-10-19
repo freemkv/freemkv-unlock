@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.8.4"
+version = "1.8.5"
 dependencies = [
  "aes",
  "anyhow",
@@ -481,4 +481,4 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
 name = "libfreemkv"
-version = "1.8.3"
+version = "1.8.5"
