@@ -239,6 +239,18 @@ impl FreemkvUnlocker {
                     .ok_or(UnlockError::NotApplicable)?;
                 return self.load_mediatek(scsi, loader.as_ref());
             }
+            // A drive the LD unlocker claims by identity is not Renesas: it never gets
+            // the Renesas probe, so a faulted bus there cannot stop LD from running (#75).
+            None if crate::ld::profiles()
+                .is_some_and(|c| crate::ld::LdUnlocker::claims_in(c, drive_id)) =>
+            {
+                tracing::info!(
+                    target: "freemkv::disc",
+                    phase = "renesas_probe_skipped",
+                    "drive is claimed by the LD unlocker; not sending the Renesas identity probe"
+                );
+                return Err(UnlockError::NotApplicable);
+            }
             None if renesas::is_renesas(scsi)? => Box::new(renesas::Backend::new()),
             None => return Err(UnlockError::NotApplicable),
         };

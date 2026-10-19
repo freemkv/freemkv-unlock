@@ -167,7 +167,7 @@ impl LdUnlocker {
             // Calibration is best-effort, but a transport fault may have reset the drive
             // (dropping the firmware): keep the unlock only if the drive re-confirms it.
             if e.is_transport_failure() {
-                Self::reconfirm_after_fault(&mut mt, scsi)?;
+                Self::reconfirm_after_fault(&mut mt, scsi, FAULT_SETTLE)?;
             }
         }
         let vid = self.read_oem_vid(scsi, &m.profile)?;
@@ -175,13 +175,27 @@ impl LdUnlocker {
     }
 }
 
+/// Silence after a calibration transport fault before the one re-confirm read: the
+/// same 5 s libfreemkv's `wait_ready` gives a faulted bus.
+const FAULT_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl LdUnlocker {
     // After a calibration transport fault: `Ok` if the unlock still holds, `Transport`
-    // if the bus is still dead, `NotApplicable` if the drive lost the extended-access state.
+    // if the bus is still dead (or a Stop), `NotApplicable` if the drive lost the
+    // extended-access state. #75: a command right after the fault can wedge a USB drive,
+    // so nothing is sent for `settle`, then exactly one unlock read; never an upload.
     fn reconfirm_after_fault(
         mt: &mut platform::mt1959::Mt1959,
         scsi: &mut dyn ScsiTransport,
+        settle: std::time::Duration,
     ) -> std::result::Result<(), UnlockError> {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "unlock_reconfirm_settle",
+            settle_ms = settle.as_millis() as u64,
+            "transport fault during calibration: no commands for the settle, then one re-confirm read"
+        );
+        platform::mt1959::settle(scsi, settle)?;
         match mt.reconfirm_unlock(scsi) {
             Ok(true) => {
                 tracing::warn!(

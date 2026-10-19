@@ -55,6 +55,11 @@ const READY_MAX_EMPTY_POLLS: u32 = 10;
 const START_UNIT: [u8; 6] = [0x1B, 0x00, 0x00, 0x00, 0x01, 0x00];
 /// libfreemkv's START UNIT timeout (T4).
 const START_UNIT_TIMEOUT_MS: u32 = 30_000;
+/// After a confirmed firmware upload the drive restarts: no command for this long,
+/// then one re-confirm read (#75; 1.7.7's 10 s).
+const UPLOAD_SETTLE: Duration = Duration::from_secs(10);
+/// Most firmware uploads one `run_init` makes (1.7.7's three attempts).
+const UNLOCK_ATTEMPTS: usize = 3;
 
 // ── Init address (per disc type) ──────────────────────────────────────
 const INIT_ADDR_BD: u16 = 0x0100;
@@ -288,7 +293,15 @@ impl Mt1959 {
 
     fn run_init(&mut self, scsi: &mut dyn ScsiTransport) -> Result<()> {
         let mut last_err = Error::UnlockFailed;
-        for attempt in 0..3 {
+        // Set once an upload confirmed the unlock and the drive was left to settle:
+        // the next unlock read is the one re-confirm, and readiness is polled after it.
+        let mut settled: Option<Box<dyn ReadyClock>> = None;
+        // Attempt UNLOCK_ATTEMPTS is only the re-confirm read after the last upload
+        // (1.7.7 dropped that confirmed upload; D10 keeps it), never a fourth upload.
+        for attempt in 0..=UNLOCK_ATTEMPTS {
+            if attempt == UNLOCK_ATTEMPTS && settled.is_none() {
+                break;
+            }
             match self.do_unlock(scsi) {
                 Ok(_) => {
                     tracing::debug!(
@@ -296,8 +309,15 @@ impl Mt1959 {
                         phase = "mt1959_unlock_ok",
                         attempt,
                         unlocked = self.unlocked,
+                        reconfirm = settled.is_some(),
                         "MT1959 unlock handshake completed"
                     );
+                    // After an upload the unlock read proves only the vendor path
+                    // answers; hand the drive back once the media is ready (T6). Any
+                    // readiness outcome keeps the unlock; only a dead bus / Stop fails.
+                    if let Some(mut clock) = settled.take() {
+                        await_media_ready(scsi, &mut *clock)?;
+                    }
                     return Ok(());
                 }
                 Err(Error::SignatureMismatch { .. }) => {
@@ -322,6 +342,19 @@ impl Mt1959 {
                 }
                 // Every exit below returns or overwrites `last_err` with the reload's error.
                 Err(e) => {
+                    if settled.take().is_some() {
+                        tracing::warn!(
+                            target: "freemkv::disc",
+                            phase = "mt1959_unlock_lost_after_upload",
+                            attempt,
+                            error = %e,
+                            "the drive dropped the firmware while it restarted"
+                        );
+                    }
+                    if attempt == UNLOCK_ATTEMPTS {
+                        last_err = e;
+                        break;
+                    }
                     tracing::debug!(
                         target: "freemkv::disc",
                         phase = "mt1959_unlock_failed_reloading",
@@ -356,22 +389,21 @@ impl Mt1959 {
                             last_err = e;
                             continue;
                         }
-                        // D10 (stop-design-v5 §1): "`run_init` must `return Ok(())` as soon as
-                        // `load_firmware` confirms the unlock" — its own do_unlock already did.
-                        // Looping re-ran it after a 10 s settle and discarded it on attempt 2.
+                        // The upload confirmed the unlock, then the drive restarts. #75:
+                        // a command into a restarting USB drive can wedge it, so send
+                        // nothing for UPLOAD_SETTLE (Stop-aware), as 1.7.7 did; the next
+                        // attempt's unlock read is the one re-confirm.
                         Ok(()) => {
-                            tracing::debug!(
+                            tracing::warn!(
                                 target: "freemkv::disc",
-                                phase = "mt1959_unlock_ok_after_upload",
+                                phase = "mt1959_upload_settle",
                                 attempt,
-                                unlocked = self.unlocked,
-                                "MT1959 unlock confirmed by the firmware upload"
+                                settle_ms = UPLOAD_SETTLE.as_millis() as u64,
+                                "firmware uploaded: no commands while the drive restarts, then one re-confirm read"
                             );
-                            // The upload reset the drive; the unlock proves only the vendor
-                            // path answers. Hand it back once the media is ready (T6). Any
-                            // readiness outcome keeps the unlock; only a dead bus / Stop fails.
-                            await_media_ready(scsi, &mut *ready_clock())?;
-                            return Ok(());
+                            let mut clock = ready_clock();
+                            clock.wait(scsi, UPLOAD_SETTLE)?;
+                            settled = Some(clock);
                         }
                     }
                 }
@@ -542,6 +574,12 @@ pub(crate) trait ReadyClock {
     fn elapsed(&self) -> Duration;
     /// Wait `d` before the next poll.
     fn wait(&mut self, scsi: &mut dyn ScsiTransport, d: Duration) -> scsi::Result<()>;
+}
+
+/// Send nothing for `d` (Stop-aware): `Err` only when the operation is stopped.
+pub(crate) fn settle(scsi: &mut dyn ScsiTransport, d: Duration) -> Result<()> {
+    ready_clock().wait(scsi, d)?;
+    Ok(())
 }
 
 /// The poll's clock: [`WallClock`], or a test's virtual clock (a per-thread seam,

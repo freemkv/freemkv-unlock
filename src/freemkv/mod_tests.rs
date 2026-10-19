@@ -314,6 +314,62 @@ fn transport_fault_propagates() {
     assert_eq!(unlock(&mut t).unwrap_err(), UnlockError::Transport);
 }
 
+/// The bundled HL-DT-ST (MT1959) profile the LD unlocker claims by identity.
+fn ld_drive_id() -> crate::DriveId {
+    crate::DriveId {
+        vendor_id: "HL-DT-ST".into(),
+        product_revision: "1.01".into(),
+        vendor_specific: "NM00100".into(),
+        firmware_date: "211711202000".into(),
+        ..Default::default()
+    }
+}
+
+/// The Renesas identity READ BUFFER (`3C 02 F1 ...`).
+fn is_renesas_probe(c: &[u8]) -> bool {
+    c.len() >= 3 && c[..3] == [0x3C, 0x02, 0xF1]
+}
+
+// #75: a drive the LD unlocker claims by identity is never sent the Renesas probe.
+// Only the IDENTITY knock reaches it, then freemkv declines and LD runs (as in 1.7.7).
+#[test]
+fn ld_claimed_drive_is_never_sent_the_renesas_probe() {
+    let id = ld_drive_id();
+    assert!(
+        crate::ld::LdUnlocker::new().claims(&id),
+        "fixture must be an LD drive"
+    );
+    let mut t = MockTransport::always(Reply::illegal_request());
+    let r = FreemkvUnlocker::new()
+        .unlock(&mut t, &ctx(&id))
+        .expect("declines, no fault");
+    assert!(r.is_none(), "freemkv declines so LD can run");
+    assert_eq!(
+        t.cdbs,
+        vec![build_identity_cdb(RESP_LEN as u16).to_vec()],
+        "IDENTITY only, no Renesas probe"
+    );
+}
+
+// #75 guard: a drive LD does not claim (Pioneer: the catalog's Renesas section is
+// empty) still gets the Renesas probe after the IDENTITY knock.
+#[test]
+fn unclaimed_drive_still_gets_the_renesas_probe() {
+    let id = crate::DriveId {
+        vendor_id: "PIONEER".into(),
+        product_id: "BD-RW   BDR-XD08".into(),
+        ..Default::default()
+    };
+    assert!(!crate::ld::LdUnlocker::new().claims(&id));
+    let mut t = MockTransport::always(Reply::illegal_request());
+    let r = FreemkvUnlocker::new()
+        .unlock(&mut t, &ctx(&id))
+        .expect("no fault");
+    assert!(r.is_none());
+    assert_eq!(t.calls(), 2, "{:02x?}", t.cdbs);
+    assert!(is_renesas_probe(&t.cdbs[1]), "{:02x?}", t.cdbs);
+}
+
 // ── DumpAll ──────────────────────────────────────────────────────────
 
 #[test]

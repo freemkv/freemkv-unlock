@@ -282,6 +282,18 @@ impl ScsiTransport for ProbeFaultsDrive {
 fn probe_fault_unlock(
     after: AfterProbeFault,
 ) -> std::result::Result<Option<Unlocked>, UnlockError> {
+    probe_fault_unlock_logged(after, false).0
+}
+
+// As `probe_fault_unlock`, behind a cancellable host that records every command and
+// wait (no real sleep); `stop_in_settle` lands a Stop on the first wait.
+fn probe_fault_unlock_logged(
+    after: AfterProbeFault,
+    stop_in_settle: bool,
+) -> (
+    std::result::Result<Option<Unlocked>, UnlockError>,
+    Vec<crate::scsi::mock::Ev>,
+) {
     let id = known_vid_drive_id();
     let sig = profile::find_bundled(&id)
         .expect("profile")
@@ -291,12 +303,83 @@ fn probe_fault_unlock(
     resp[0..4].copy_from_slice(&sig);
     resp[12..16].copy_from_slice(&[0x4D, 0x4D, 0x6B, 0x76]); // primary marker
     resp[16..20].copy_from_slice(&[0x4C, 0x62, 0x44, 0x72]); // secondary marker
-    let mut t = ProbeFaultsDrive {
+    let mut t = crate::scsi::mock::StopFake::new(ProbeFaultsDrive {
         resp,
         after,
         faulted: false,
-    };
-    LdUnlocker::new().unlock(&mut t, &ctx(&id))
+    });
+    t.cancel_on_pause = stop_in_settle;
+    let r = LdUnlocker::new().unlock(&mut t, &ctx(&id));
+    (r, t.log)
+}
+
+// What reached the drive from the faulting speed probe on, as labels.
+fn from_the_fault(log: &[crate::scsi::mock::Ev]) -> Vec<String> {
+    use crate::scsi::mock::Ev;
+    let vid = known_vid_profile().read_vid_cdb.expect("vid cdb");
+    let at = log
+        .iter()
+        .position(|e| matches!(e, Ev::Exec(c) if c[0] == 0x3C && c[3] == 0x14))
+        .expect("the speed probe ran");
+    log[at..]
+        .iter()
+        .map(|e| match e {
+            Ev::Exec(c) if c[0] == 0x3C && c[3] == 0x14 => "probe".into(),
+            Ev::Exec(c) if c[0] == 0x3C && c[3] == 0x00 && c[8] == 64 => "unlock".into(),
+            Ev::Exec(c) if c[..] == vid[..] => "vid".into(),
+            Ev::Exec(c) => format!("{:02X?}", c),
+            Ev::Pause(d) => format!("pause {}ms", d.as_millis()),
+            Ev::PauseRefused(d) => format!("pause refused {}ms", d.as_millis()),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+// #75: after the calibration fault the drive gets 5 s of silence (libfreemkv's
+// dead-bus budget), then exactly one re-confirm read; the unlock stands and the VID
+// is read. 1.8.4 re-sent the unlock read at once into the just-faulted bus.
+#[test]
+fn calibration_fault_settles_quietly_then_reconfirms_once() {
+    let (r, log) = probe_fault_unlock_logged(AfterProbeFault::Recovers, false);
+    assert!(r.expect("best-effort calibration").is_some());
+    assert_eq!(
+        from_the_fault(&log),
+        ["probe", "pause 5000ms", "unlock", "vid"],
+        "silence, one re-confirm read, the VID"
+    );
+}
+
+// #75: a bus still dead after the silence gets the one re-confirm read and nothing
+// else: Transport, as before.
+#[test]
+fn calibration_fault_on_a_dead_bus_sends_one_read_after_the_settle() {
+    let (r, log) = probe_fault_unlock_logged(AfterProbeFault::Dead, false);
+    assert_eq!(r.expect_err("dead bus"), UnlockError::Transport);
+    assert_eq!(from_the_fault(&log), ["probe", "pause 5000ms", "unlock"]);
+}
+
+// #75: a drive that lost the firmware across the fault is not unlocked, and this
+// path never uploads it again.
+#[test]
+fn calibration_fault_that_drops_the_firmware_never_reuploads() {
+    use crate::scsi::mock::Ev;
+    let (r, log) = probe_fault_unlock_logged(AfterProbeFault::LostFirmware, false);
+    assert!(r.expect("not a dead bus").is_none());
+    assert_eq!(from_the_fault(&log), ["probe", "pause 5000ms", "unlock"]);
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e, Ev::Exec(c) if matches!(c[0], 0x3B | 0x55))),
+        "no firmware upload"
+    );
+}
+
+// #75: a Stop during the post-fault silence ends the unlock with no further command
+// (the refusal shape libfreemkv reclassifies as Halted).
+#[test]
+fn stop_during_the_calibration_fault_settle_sends_nothing() {
+    let (r, log) = probe_fault_unlock_logged(AfterProbeFault::Recovers, true);
+    assert_eq!(r.expect_err("stopped"), UnlockError::Transport);
+    assert_eq!(from_the_fault(&log), ["probe", "pause refused 5000ms"]);
 }
 
 // BU40N field report: a transport fault during calibration must not throw away an

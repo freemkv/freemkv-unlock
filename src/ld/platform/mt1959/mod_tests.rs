@@ -719,7 +719,7 @@ fn run_init_firmware_reload_transport_fault_aborts() {
 // per design D10, do not change without a design citation proving otherwise.
 #[test]
 fn run_init_returns_ok_once_load_firmware_confirms() {
-    use crate::scsi::mock::{MockTransport, Reply};
+    use crate::scsi::mock::{Ev, MockTransport, Reply, StopFake};
     let sig = [0x11, 0x22, 0x33, 0x44];
     let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
     let short = || Reply::short(vec![0u8; 64], 10); // a generic do_unlock failure
@@ -743,16 +743,20 @@ fn run_init_returns_ok_once_load_firmware_confirms() {
         script.extend(upload_ok());
         script.push(Reply::good(unlock_ok.clone())); // load_firmware do_unlock #1
         script.push(Reply::good(unlock_ok.clone())); // do_unlock #2 (best-effort)
+        // #75: after the settle, one re-confirm read (as 1.7.7) before the poll.
+        script.push(Reply::good(unlock_ok.clone()));
         script.push(Reply::good(vec![])); // TEST UNIT READY: ready at once
         let expected_calls = script.len();
-        // Anything past the script is a further retry, which must not happen.
-        let mut t = MockTransport::scripted(script, Reply::TransportFault);
+        // Anything past the script is a further retry, which must not happen. #75: the
+        // cancellable host records the post-upload settle instead of sleeping it.
+        let mut t = StopFake::new(MockTransport::scripted(script, Reply::TransportFault));
         let mut profile = fixture_profile(sig);
         profile.firmware = vec![0u8; 64];
         let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
-        let t0 = std::time::Instant::now();
         mt.init(&mut t)
             .unwrap_or_else(|e| panic!("{failed_reloads} failed reloads: {e:?}"));
+        let t_log = t.log;
+        let t = t.inner;
         assert_eq!(
             t.calls(),
             expected_calls,
@@ -766,9 +770,13 @@ fn run_init_returns_ok_once_load_firmware_confirms() {
             "the final upload is still issued"
         );
         assert_eq!(t.cdbs.last().map(|c| c[0]), Some(SCSI_TEST_UNIT_READY));
-        assert!(
-            t0.elapsed() < std::time::Duration::from_secs(5),
-            "no fixed 10 s settle: a ready drive returns at once"
+        // #75 changed this from "no fixed 10 s settle": the confirmed upload now gets
+        // 1.7.7's 10 s of silence, as one cancellable transport wait (not a sleep).
+        let pauses: Vec<_> = t_log.iter().filter(|e| matches!(e, Ev::Pause(_))).collect();
+        assert_eq!(
+            pauses,
+            vec![&Ev::Pause(Duration::from_secs(10))],
+            "one settle, after the confirmed upload only"
         );
     }
 }
@@ -778,7 +786,7 @@ fn run_init_returns_ok_once_load_firmware_confirms() {
 // ST-D10; the T6 rule, stop-design-v5 §2.11) before handing the drive back.
 #[test]
 fn run_init_waits_for_media_ready_after_upload() {
-    use crate::scsi::mock::{MockTransport, Reply};
+    use crate::scsi::mock::{MockTransport, Reply, StopFake};
     let sig = [0x11, 0x22, 0x33, 0x44];
     let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
     let becoming_ready = || Reply::Sense {
@@ -792,20 +800,169 @@ fn run_init_waits_for_media_ready_after_upload() {
         Reply::good(vec![]),             // WRITE_BUFFER
         Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]), // 0x45 verify
         Reply::good(unlock_ok.clone()),  // do_unlock #1
-        Reply::good(unlock_ok),          // do_unlock #2
+        Reply::good(unlock_ok.clone()),  // do_unlock #2
+        Reply::good(unlock_ok),          // #75: re-confirm read after the settle
         becoming_ready(),                // TUR: 02/04/01
         becoming_ready(),                // TUR: 02/04/01
         Reply::good(vec![]),             // TUR: ready
     ];
     let expected = script.len();
-    let mut t = MockTransport::scripted(script, Reply::TransportFault);
+    // #75: the cancellable host records the settle and the poll waits, no sleeping.
+    let mut t = StopFake::new(MockTransport::scripted(script, Reply::TransportFault));
     let mut profile = fixture_profile(sig);
     profile.firmware = vec![0u8; 64];
     let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
     mt.init(&mut t).expect("ready after two not-ready polls");
+    let t = t.inner;
     assert_eq!(t.calls(), expected, "polled until ready, then stopped");
     let turs = t.cdbs.iter().filter(|c| c[0] == SCSI_TEST_UNIT_READY);
     assert_eq!(turs.count(), 3, "three TEST UNIT READY polls");
+}
+
+// #75 post-upload path: run_init on a variant-A drive whose first unlock read fails
+// (forcing the upload) and whose upload confirms the unlock. `drops` re-confirm reads
+// after the settle then fail short (the restart dropped the firmware) before one
+// succeeds; `tur` answers every TEST UNIT READY; `stop` lands a Stop on the first wait.
+fn post_upload(
+    drops: usize,
+    tur: crate::scsi::mock::Reply,
+    stop: bool,
+) -> (Result<()>, Vec<String>, bool) {
+    use crate::scsi::mock::{Ev, Reply, StopFake};
+    struct Drive {
+        sig: [u8; 4],
+        unlock_reads: usize,
+        drops: usize,
+        tur: Reply,
+    }
+    impl ScsiTransport for Drive {
+        fn execute(
+            &mut self,
+            cdb: &[u8],
+            dir: DataDirection,
+            data: &mut [u8],
+            timeout_ms: u32,
+        ) -> crate::scsi::Result<ScsiResult> {
+            let ok = build_response(self.sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+            let reply = match cdb[0] {
+                SCSI_TEST_UNIT_READY => self.tur.clone(),
+                SCSI_READ_BUFFER if cdb[2] == BUFFER_ID_A && cdb[8] == UNLOCK_RESPONSE_SIZE => {
+                    self.unlock_reads += 1;
+                    // Read 1: run_init's (fails). Reads 2-3: load_firmware's pair. Then
+                    // the re-confirm read after the settle: short `drops` times per
+                    // upload round, so each round is fail, upload pair, re-confirm.
+                    let n = self.unlock_reads;
+                    let round = (n - 1) / 3;
+                    let reconfirm = n > 1 && (n - 1).is_multiple_of(3);
+                    if n == 1 || (reconfirm && round <= self.drops) {
+                        Reply::short(vec![0u8; 64], 10)
+                    } else {
+                        Reply::good(ok)
+                    }
+                }
+                _ => Reply::good(vec![0u8; data.len()]),
+            };
+            let mut m = crate::scsi::mock::MockTransport::always(reply);
+            m.execute(cdb, dir, data, timeout_ms)
+        }
+    }
+    let sig = [0x11, 0x22, 0x33, 0x44];
+    let mut profile = fixture_profile(sig);
+    profile.firmware = vec![0u8; 64];
+    let mut t = StopFake::new(Drive {
+        sig,
+        unlock_reads: 0,
+        drops,
+        tur,
+    });
+    t.cancel_on_pause = stop;
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
+    let r = mt.init(&mut t);
+    let shape = t
+        .log
+        .iter()
+        .map(|e| match e {
+            Ev::Exec(c) if is_unlock_cdb(c) => "unlock".into(),
+            Ev::Exec(c) => format!("{:02X}", c[0]),
+            Ev::Pause(d) => format!("pause {}ms", d.as_millis()),
+            Ev::PauseRefused(d) => format!("pause refused {}ms", d.as_millis()),
+            Ev::Refused(c) => format!("refused {:02X}", c[0]),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    (r, shape, mt.is_unlocked())
+}
+
+/// One upload round as `post_upload` labels it: WRITE BUFFER and its verify inside
+/// the critical span, then load_firmware's two unlock reads.
+const UPLOAD: [&str; 6] = ["Begin", "3B", "3C", "End", "unlock", "unlock"];
+
+// #75: after an upload the drive restarts. As 1.7.7 did, it gets 10 s with no
+// command at all, then one re-confirm unlock read, and only then the readiness poll.
+// 1.8.4 sent TEST UNIT READY at once and every 500 ms into the restarting drive.
+#[test]
+fn upload_settles_silently_then_reconfirms_once_before_polling() {
+    use crate::scsi::mock::Reply;
+    let (r, shape, unlocked) = post_upload(0, Reply::good(vec![]), false);
+    r.expect("unlocked");
+    assert!(unlocked);
+    let mut want = vec!["unlock"];
+    want.extend(UPLOAD);
+    want.extend(["pause 10000ms", "unlock", "00"]);
+    assert_eq!(shape, want);
+}
+
+// #75: a transport fault in the post-upload readiness poll ends it at once: no
+// further TEST UNIT READY, no START UNIT, no wait. The dead bus fails the init.
+#[test]
+fn transport_fault_in_the_post_upload_poll_ends_it_at_once() {
+    use crate::scsi::mock::Reply;
+    let (r, shape, _) = post_upload(0, Reply::TransportFault, false);
+    assert!(r.expect_err("dead bus").is_transport_failure());
+    let mut want = vec!["unlock"];
+    want.extend(UPLOAD);
+    want.extend(["pause 10000ms", "unlock", "00"]);
+    assert_eq!(shape, want, "one TUR, then nothing");
+}
+
+// #75: firmware the restart dropped is uploaded again, as 1.7.7 did, within its three
+// uploads: each upload gets the 10 s silence and one re-confirm read.
+#[test]
+fn firmware_dropped_across_the_settle_is_reuploaded_within_three_uploads() {
+    use crate::scsi::mock::Reply;
+    // Dropped once: a second upload, confirmed after its settle.
+    let (r, shape, unlocked) = post_upload(1, Reply::good(vec![]), false);
+    r.expect("unlocked on the second upload");
+    assert!(unlocked);
+    let mut want = vec!["unlock"];
+    want.extend(UPLOAD);
+    want.extend(["pause 10000ms", "unlock"]);
+    want.extend(UPLOAD);
+    want.extend(["pause 10000ms", "unlock", "00"]);
+    assert_eq!(shape, want);
+
+    // Dropped every time: three uploads (1.7.7's limit), never a fourth.
+    let (r, shape, _) = post_upload(3, Reply::good(vec![]), false);
+    let e = r.expect_err("never re-confirmed");
+    assert!(!e.is_transport_failure());
+    let mut want = vec!["unlock"];
+    for _ in 0..3 {
+        want.extend(UPLOAD);
+        want.extend(["pause 10000ms", "unlock"]);
+    }
+    assert_eq!(shape, want, "three uploads, no poll");
+}
+
+// #75: a Stop during the post-upload silence ends the init with no further command.
+#[test]
+fn stop_during_the_upload_settle_sends_nothing() {
+    use crate::scsi::mock::Reply;
+    let (r, shape, _) = post_upload(0, Reply::good(vec![]), true);
+    assert!(r.expect_err("stopped").is_transport_failure());
+    let mut want = vec!["unlock"];
+    want.extend(UPLOAD);
+    want.push("pause refused 10000ms");
+    assert_eq!(shape, want);
 }
 
 /// A virtual clock: `wait` advances time instantly and counts the waits.
