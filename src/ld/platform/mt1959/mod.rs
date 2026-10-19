@@ -389,10 +389,9 @@ impl Mt1959 {
                             last_err = e;
                             continue;
                         }
-                        // The upload confirmed the unlock, then the drive restarts. #75:
-                        // a command into a restarting USB drive can wedge it, so send
-                        // nothing for UPLOAD_SETTLE (Stop-aware), as 1.7.7 did; the next
-                        // attempt's unlock read is the one re-confirm.
+                        // #75: the drive restarts after the upload, and a command into a
+                        // restarting USB drive can wedge it: silence for UPLOAD_SETTLE as
+                        // in 1.7.7, then the next attempt's unlock read re-confirms.
                         Ok(()) => {
                             tracing::warn!(
                                 target: "freemkv::disc",

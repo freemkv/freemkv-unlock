@@ -180,10 +180,10 @@ impl LdUnlocker {
 const FAULT_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl LdUnlocker {
-    // After a calibration transport fault: `Ok` if the unlock still holds, `Transport`
-    // if the bus is still dead (or a Stop), `NotApplicable` if the drive lost the
-    // extended-access state. #75: a command right after the fault can wedge a USB drive,
-    // so nothing is sent for `settle`, then exactly one unlock read; never an upload.
+    /// After a calibration transport fault: `Ok` if the unlock still holds, `Transport`
+    /// if the bus is still dead (or a Stop), `NotApplicable` if the drive lost the
+    /// extended-access state. #75: a command right after the fault can wedge a USB drive,
+    /// so nothing is sent for `settle`, then exactly one unlock read; never an upload.
     fn reconfirm_after_fault(
         mt: &mut platform::mt1959::Mt1959,
         scsi: &mut dyn ScsiTransport,

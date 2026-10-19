@@ -819,10 +819,10 @@ fn run_init_waits_for_media_ready_after_upload() {
     assert_eq!(turs.count(), 3, "three TEST UNIT READY polls");
 }
 
-// #75 post-upload path: run_init on a variant-A drive whose first unlock read fails
-// (forcing the upload) and whose upload confirms the unlock. `drops` re-confirm reads
-// after the settle then fail short (the restart dropped the firmware) before one
-// succeeds; `tur` answers every TEST UNIT READY; `stop` lands a Stop on the first wait.
+/// #75 post-upload path: run_init on a variant-A drive whose first unlock read fails
+/// (forcing the upload) and whose upload confirms the unlock. `drops` re-confirm reads
+/// after the settle then fail short (the restart dropped the firmware) before one
+/// succeeds; `tur` answers every TEST UNIT READY; `stop` lands a Stop on the first wait.
 fn post_upload(
     drops: usize,
     tur: crate::scsi::mock::Reply,
