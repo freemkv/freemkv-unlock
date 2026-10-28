@@ -863,36 +863,124 @@ fn reconfirm_rereads_on_restart_sense_without_reuploading() {
     );
 }
 
-// Restart senses are re-read a bounded number of times, then count as a drop.
-#[test]
-fn reconfirm_restart_sense_retries_are_bounded() {
+/// A virtual clock whose waits also reach the transport (so `StopFake` logs the
+/// pauses) and advance its time instantly.
+struct PausingClock(Duration);
+
+impl ReadyClock for PausingClock {
+    fn elapsed(&self) -> Duration {
+        self.0
+    }
+    fn wait(&mut self, scsi: &mut dyn ScsiTransport, d: Duration) -> crate::scsi::Result<()> {
+        scsi.pause(d)?;
+        self.0 += d;
+        Ok(())
+    }
+}
+
+/// Runs `init` on a drive whose upload confirms, then answers the re-confirm read
+/// with `answers` in order (`unlock_ok` after them when `then_ok`). Returns the
+/// init result, the transport log and the commands sent.
+fn reconfirm_with(
+    answers: Vec<crate::scsi::mock::Reply>,
+    then_ok: bool,
+) -> (Result<()>, Vec<crate::scsi::mock::Ev>, Vec<Vec<u8>>) {
     use crate::scsi::mock::{MockTransport, Reply, StopFake};
     let sig = [0x11, 0x22, 0x33, 0x44];
     let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
-    let ua = || Reply::Sense {
-        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
-        sense_key: 0x06,
-        asc: 0x29,
-        ascq: 0x00,
-    };
     let mut script = vec![
         Reply::short(vec![0u8; 64], 10),
         Reply::good(vec![]),
         Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]),
         Reply::good(unlock_ok.clone()),
-        Reply::good(unlock_ok),
+        Reply::good(unlock_ok.clone()),
     ];
-    // The first read plus RECONFIRM_SENSE_RETRIES re-reads, all UNIT ATTENTION.
-    script.extend((0..=RECONFIRM_SENSE_RETRIES).map(|_| ua()));
-    let reads = script.len();
-    // Then the next command must be the second upload's WRITE_BUFFER.
+    script.extend(answers);
+    if then_ok {
+        script.push(Reply::good(unlock_ok));
+        script.push(Reply::good(vec![])); // TUR: ready
+    }
     let mut t = StopFake::new(MockTransport::scripted(script, Reply::TransportFault));
     let mut profile = fixture_profile(sig);
     profile.firmware = vec![0u8; 64];
     let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
-    let _ = mt.init(&mut t);
-    let t = t.inner;
-    assert_eq!(t.cdbs.get(reads).map(|c| c[0]), Some(SCSI_WRITE_BUFFER));
+    TEST_READY_CLOCK.set(Some(|| Box::new(PausingClock(Duration::ZERO))));
+    let r = mt.init(&mut t);
+    TEST_READY_CLOCK.set(None);
+    (r, t.log, t.inner.cdbs.clone())
+}
+
+fn sense_reply(sense_key: u8, asc: u8, ascq: u8) -> crate::scsi::mock::Reply {
+    crate::scsi::mock::Reply::Sense {
+        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+        sense_key,
+        asc,
+        ascq,
+    }
+}
+
+fn pauses_of(log: &[crate::scsi::mock::Ev]) -> Vec<Duration> {
+    use crate::scsi::mock::Ev;
+    log.iter()
+        .filter_map(|e| match e {
+            Ev::Pause(d) => Some(*d),
+            _ => None,
+        })
+        .collect()
+}
+
+fn uploads_of(cdbs: &[Vec<u8>]) -> usize {
+    cdbs.iter().filter(|c| c[0] == SCSI_WRITE_BUFFER).count()
+}
+
+// Restart senses are re-read until READY_STALL of the clock passes, then count as a drop.
+#[test]
+fn reconfirm_restart_sense_retries_are_bounded() {
+    let ua = || sense_reply(0x06, 0x29, 0x00);
+    // Reads at offsets 0, 1, ..., READY_STALL: one more than the seconds.
+    let reads = READY_STALL.as_secs() as usize + 1;
+    let (_, log, cdbs) = reconfirm_with((0..reads).map(|_| ua()).collect(), false);
+    // The next command after the last answer is the second upload's WRITE_BUFFER.
+    assert_eq!(cdbs.get(5 + reads).map(|c| c[0]), Some(SCSI_WRITE_BUFFER));
+    let pauses = pauses_of(&log);
+    let rereads = pauses.iter().filter(|d| **d == RECONFIRM_SENSE_PAUSE);
+    assert_eq!(
+        rereads.count(),
+        reads - 1,
+        "1 s apart, none after the budget"
+    );
+}
+
+// A drive restarting for ~20 s (02/04/01) is confirmed by the one upload.
+#[test]
+fn reconfirm_waits_out_a_20_second_restart_with_one_upload() {
+    let becoming = (0..20).map(|_| sense_reply(0x02, 0x04, 0x01)).collect();
+    let (r, log, cdbs) = reconfirm_with(becoming, true);
+    r.expect("unlocked after the restart");
+    assert_eq!(uploads_of(&cdbs), 1, "no second upload");
+    assert_eq!(
+        pauses_of(&log).len(),
+        1 + 20,
+        "the settle, then 20 re-reads"
+    );
+}
+
+// Answers that re-reading never clears (or a real drop) count as dropped at once.
+#[test]
+fn reconfirm_non_clearing_answers_are_a_drop_at_once() {
+    for (key, asc, ascq) in [(0x02, 0x04, 0x02), (0x02, 0x04, 0x03), (0x05, 0x24, 0x00)] {
+        let (_, log, cdbs) = reconfirm_with(vec![sense_reply(key, asc, ascq)], false);
+        assert_eq!(
+            cdbs.get(6).map(|c| c[0]),
+            Some(SCSI_WRITE_BUFFER),
+            "{asc:02X}/{ascq:02X}"
+        );
+        assert_eq!(
+            pauses_of(&log),
+            [Duration::from_secs(10)],
+            "no re-read pause"
+        );
+    }
 }
 
 /// #75 post-upload path: run_init on a variant-A drive whose first unlock read fails

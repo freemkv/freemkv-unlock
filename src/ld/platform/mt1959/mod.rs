@@ -60,9 +60,8 @@ const START_UNIT_TIMEOUT_MS: u32 = 30_000;
 const UPLOAD_SETTLE: Duration = Duration::from_secs(10);
 /// Most firmware uploads one `run_init` makes (1.7.7's three attempts).
 const UNLOCK_ATTEMPTS: usize = 3;
-/// Re-confirm reads answered by a restart sense (UNIT ATTENTION, becoming
-/// ready) before the read counts as a dropped firmware, and the pause between.
-const RECONFIRM_SENSE_RETRIES: u32 = 5;
+/// Pause between re-confirm reads answered by a restart sense (UNIT ATTENTION,
+/// becoming ready); they repeat for [`READY_STALL`] before counting as a drop.
 const RECONFIRM_SENSE_PAUSE: Duration = Duration::from_secs(1);
 
 // ── Init address (per disc type) ──────────────────────────────────────
@@ -430,10 +429,14 @@ impl Mt1959 {
         let Some(clock) = settled else {
             return self.do_unlock(scsi);
         };
+        let start = clock.elapsed();
         let mut retries = 0;
         loop {
             match self.do_unlock(scsi) {
-                Err(e) if retries < RECONFIRM_SENSE_RETRIES && is_restart_sense(&e) => {
+                Err(e)
+                    if clock.elapsed().saturating_sub(start) < READY_STALL
+                        && is_restart_sense(&e) =>
+                {
                     retries += 1;
                     tracing::debug!(
                         target: "freemkv::disc",
@@ -614,9 +617,13 @@ pub(crate) fn settle(scsi: &mut dyn ScsiTransport, d: Duration) -> Result<()> {
     Ok(())
 }
 
-/// MMC-6 Table F.3: UNIT ATTENTION (6/xx) or "2 04 xx LOGICAL UNIT NOT READY".
+/// MMC-6 Table F.3: UNIT ATTENTION (6/xx) or "2 04 xx LOGICAL UNIT NOT READY",
+/// except 04/02 and 04/03, which a re-read never clears.
 fn is_restart_sense(e: &Error) -> bool {
-    matches!(e.sense_triple(), Some((0x06, _, _)) | Some((0x02, 0x04, _)))
+    matches!(
+        e.sense_triple(),
+        Some((0x06, _, _)) | Some((0x02, 0x04, 0x00 | 0x01 | 0x04..))
+    )
 }
 
 /// The poll's clock: [`WallClock`], or a test's virtual clock (a per-thread seam,
