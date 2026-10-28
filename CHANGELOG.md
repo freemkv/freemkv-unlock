@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- MediaTek (LD) drives (#75): after a firmware upload, a re-confirm read answered with UNIT ATTENTION or "becoming ready" by the restarting drive is read again (up to 5 times, 1 s apart) instead of counting as a dropped firmware and uploading again.
+- MediaTek (LD) drives (#75): a re-confirm read answered with UNIT ATTENTION or "becoming ready" by the restarting drive is read again, 1 s apart, for up to the readiness stall time (60 s) instead of counting as a dropped firmware and uploading again; this also applies to the re-confirm after a calibration fault, and an upload whose own unlock read gets a restart answer still gets the 10 s settle. "Initializing command required" and "manual intervention required" are not retried.
 
 ## [1.8.5] — 2026-10-19
 
