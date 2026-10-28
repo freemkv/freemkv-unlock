@@ -381,6 +381,10 @@ impl Mt1959 {
                             );
                             return Err(e);
                         }
+                        // The upload went through and the drive is restarting.
+                        Err(e) if is_restart_sense(&e) => {
+                            settled = Some(settle_after_upload(scsi, attempt)?);
+                        }
                         Err(e) => {
                             tracing::debug!(
                                 target: "freemkv::disc",
@@ -395,18 +399,7 @@ impl Mt1959 {
                         // #75: the drive restarts after the upload, and a command into a
                         // restarting USB drive can wedge it: silence for UPLOAD_SETTLE as
                         // in 1.7.7, then the next attempt's unlock read re-confirms.
-                        Ok(()) => {
-                            tracing::warn!(
-                                target: "freemkv::disc",
-                                phase = "mt1959_upload_settle",
-                                attempt,
-                                settle_ms = UPLOAD_SETTLE.as_millis() as u64,
-                                "firmware uploaded: no commands while the drive restarts, then one re-confirm read"
-                            );
-                            let mut clock = ready_clock();
-                            clock.wait(scsi, UPLOAD_SETTLE)?;
-                            settled = Some(clock);
-                        }
+                        Ok(()) => settled = Some(settle_after_upload(scsi, attempt)?),
                     }
                 }
             }
@@ -609,6 +602,23 @@ pub(crate) trait ReadyClock {
     fn elapsed(&self) -> Duration;
     /// Wait `d` before the next poll.
     fn wait(&mut self, scsi: &mut dyn ScsiTransport, d: Duration) -> scsi::Result<()>;
+}
+
+/// The silence after a firmware upload; returns the clock the re-confirm read uses.
+fn settle_after_upload(
+    scsi: &mut dyn ScsiTransport,
+    attempt: usize,
+) -> Result<Box<dyn ReadyClock>> {
+    tracing::warn!(
+        target: "freemkv::disc",
+        phase = "mt1959_upload_settle",
+        attempt,
+        settle_ms = UPLOAD_SETTLE.as_millis() as u64,
+        "firmware uploaded: no commands while the drive restarts, then one re-confirm read"
+    );
+    let mut clock = ready_clock();
+    clock.wait(scsi, UPLOAD_SETTLE)?;
+    Ok(clock)
 }
 
 /// Send nothing for `d` (Stop-aware): `Err` only when the operation is stopped.

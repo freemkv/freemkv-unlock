@@ -983,6 +983,33 @@ fn reconfirm_non_clearing_answers_are_a_drop_at_once() {
     }
 }
 
+// The upload's own unlock read answered by a restart sense means the upload went
+// through: the drive still gets the 10 s settle and no second upload follows.
+#[test]
+fn restart_sense_on_the_upload_unlock_read_still_settles() {
+    use crate::scsi::mock::{MockTransport, Reply, StopFake};
+    let sig = [0x11, 0x22, 0x33, 0x44];
+    let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+    let script = vec![
+        Reply::short(vec![0u8; 64], 10), // run_init's do_unlock
+        Reply::good(vec![]),             // WRITE_BUFFER
+        Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]), // 0x45 verify
+        sense_reply(0x06, 0x29, 0x00),   // load_firmware's unlock read: restarting
+        Reply::good(unlock_ok),          // re-confirm after the settle
+        Reply::good(vec![]),             // TUR: ready
+    ];
+    let expected = script.len();
+    let mut t = StopFake::new(MockTransport::scripted(script, Reply::TransportFault));
+    let mut profile = fixture_profile(sig);
+    profile.firmware = vec![0u8; 64];
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
+    mt.init(&mut t).expect("unlocked after the settle");
+    assert_eq!(pauses_of(&t.log), [Duration::from_secs(10)]);
+    let t = t.inner;
+    assert_eq!(t.calls(), expected);
+    assert_eq!(uploads_of(&t.cdbs), 1, "no back-to-back second upload");
+}
+
 /// #75 post-upload path: run_init on a variant-A drive whose first unlock read fails
 /// (forcing the upload) and whose upload confirms the unlock. `drops` re-confirm reads
 /// after the settle then fail short (the restart dropped the firmware) before one
