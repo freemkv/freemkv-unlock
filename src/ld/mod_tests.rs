@@ -236,6 +236,8 @@ enum AfterProbeFault {
     Dead,
     // The bus recovers but the reset dropped the firmware: the unlock read has no markers.
     LostFirmware,
+    // The reset left a pending UNIT ATTENTION (06/29/00) on the first unlock read.
+    PendingUnitAttention,
 }
 
 // A drive that unlocks fully, then faults on the first speed probe (READ_BUFFER
@@ -244,6 +246,7 @@ struct ProbeFaultsDrive {
     resp: Vec<u8>,
     after: AfterProbeFault,
     faulted: bool,
+    ua_sent: bool,
 }
 impl ScsiTransport for ProbeFaultsDrive {
     fn execute(
@@ -264,6 +267,16 @@ impl ScsiTransport for ProbeFaultsDrive {
         }
         if self.faulted && self.after == AfterProbeFault::Dead {
             return Err(fault());
+        }
+        if self.faulted && self.after == AfterProbeFault::PendingUnitAttention && !self.ua_sent {
+            self.ua_sent = true;
+            let mut sense = [0u8; 32];
+            (sense[2], sense[12], sense[13]) = (0x06, 0x29, 0x00);
+            return Ok(ScsiResult {
+                status: 0x02,
+                bytes_transferred: 0,
+                sense,
+            });
         }
         let mut resp = self.resp.clone();
         if self.faulted && self.after == AfterProbeFault::LostFirmware {
@@ -307,6 +320,7 @@ fn probe_fault_unlock_logged(
         resp,
         after,
         faulted: false,
+        ua_sent: false,
     });
     t.cancel_on_pause = stop_in_settle;
     let r = LdUnlocker::new().unlock(&mut t, &ctx(&id));
@@ -346,6 +360,25 @@ fn calibration_fault_settles_quietly_then_reconfirms_once() {
         from_the_fault(&log),
         ["probe", "pause 5000ms", "unlock", "vid"],
         "silence, one re-confirm read, the VID"
+    );
+}
+
+// A pending UNIT ATTENTION after the device reset is read past, not reported as a
+// lost unlock: 06/29/00, then the good response, still unlocked.
+#[test]
+fn calibration_fault_reconfirm_reads_past_a_pending_unit_attention() {
+    let (r, log) = probe_fault_unlock_logged(AfterProbeFault::PendingUnitAttention, false);
+    assert!(r.expect("still unlocked").is_some());
+    assert_eq!(
+        from_the_fault(&log),
+        [
+            "probe",
+            "pause 5000ms",
+            "unlock",
+            "pause 1000ms",
+            "unlock",
+            "vid"
+        ]
     );
 }
 

@@ -840,7 +840,9 @@ impl Mt1959 {
     /// answers in the extended-access state (a reset drops the firmware).
     pub(crate) fn reconfirm_unlock(&mut self, scsi: &mut dyn ScsiTransport) -> Result<bool> {
         self.unlocked = false;
-        self.do_unlock(scsi)?;
+        // The same tolerant read as after an upload: a pending UNIT ATTENTION is not a loss.
+        let mut clock = ready_clock();
+        self.unlock_read(scsi, Some(&mut clock))?;
         Ok(self.unlocked)
     }
 }
