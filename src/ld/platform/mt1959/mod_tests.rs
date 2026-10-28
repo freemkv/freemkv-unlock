@@ -819,6 +819,82 @@ fn run_init_waits_for_media_ready_after_upload() {
     assert_eq!(turs.count(), 3, "three TEST UNIT READY polls");
 }
 
+// A restarting drive's first answers to the re-confirm read are UNIT ATTENTION
+// and "becoming ready": read again (bounded), not a second firmware upload.
+#[test]
+fn reconfirm_rereads_on_restart_sense_without_reuploading() {
+    use crate::scsi::mock::{Ev, MockTransport, Reply, StopFake};
+    let sig = [0x11, 0x22, 0x33, 0x44];
+    let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+    let sense = |sense_key, asc, ascq| Reply::Sense {
+        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+        sense_key,
+        asc,
+        ascq,
+    };
+    let script = vec![
+        Reply::short(vec![0u8; 64], 10), // run_init's do_unlock
+        Reply::good(vec![]),             // WRITE_BUFFER
+        Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]), // 0x45 verify
+        Reply::good(unlock_ok.clone()),  // do_unlock #1
+        Reply::good(unlock_ok.clone()),  // do_unlock #2
+        sense(0x06, 0x29, 0x00),         // re-confirm: UNIT ATTENTION (reset)
+        sense(0x02, 0x04, 0x01),         // re-confirm: becoming ready
+        Reply::good(unlock_ok),          // re-confirm: unlocked
+        Reply::good(vec![]),             // TUR: ready
+    ];
+    let expected = script.len();
+    let mut t = StopFake::new(MockTransport::scripted(script, Reply::TransportFault));
+    let mut profile = fixture_profile(sig);
+    profile.firmware = vec![0u8; 64];
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
+    mt.init(&mut t).expect("unlocked after the restart senses");
+    let log = t.log;
+    let t = t.inner;
+    assert_eq!(t.calls(), expected);
+    assert!(mt.is_unlocked());
+    let uploads = t.cdbs.iter().filter(|c| c[0] == SCSI_WRITE_BUFFER).count();
+    assert_eq!(uploads, 1, "a restart sense is not a dropped firmware");
+    let pauses: Vec<_> = log.iter().filter(|e| matches!(e, Ev::Pause(_))).collect();
+    let (settle, pause) = (Duration::from_secs(10), Duration::from_secs(1));
+    assert_eq!(
+        pauses,
+        vec![&Ev::Pause(settle), &Ev::Pause(pause), &Ev::Pause(pause)]
+    );
+}
+
+// Restart senses are re-read a bounded number of times, then count as a drop.
+#[test]
+fn reconfirm_restart_sense_retries_are_bounded() {
+    use crate::scsi::mock::{MockTransport, Reply, StopFake};
+    let sig = [0x11, 0x22, 0x33, 0x44];
+    let unlock_ok = build_response(sig, FIRMWARE_ACTIVE_SIG, FIRMWARE_MODE_SIG);
+    let ua = || Reply::Sense {
+        status: crate::scsi::SCSI_STATUS_CHECK_CONDITION,
+        sense_key: 0x06,
+        asc: 0x29,
+        ascq: 0x00,
+    };
+    let mut script = vec![
+        Reply::short(vec![0u8; 64], 10),
+        Reply::good(vec![]),
+        Reply::good(vec![0u8; VALIDATE_RESPONSE_SIZE as usize]),
+        Reply::good(unlock_ok.clone()),
+        Reply::good(unlock_ok),
+    ];
+    // The first read plus RECONFIRM_SENSE_RETRIES re-reads, all UNIT ATTENTION.
+    script.extend((0..=RECONFIRM_SENSE_RETRIES).map(|_| ua()));
+    let reads = script.len();
+    // Then the next command must be the second upload's WRITE_BUFFER.
+    let mut t = StopFake::new(MockTransport::scripted(script, Reply::TransportFault));
+    let mut profile = fixture_profile(sig);
+    profile.firmware = vec![0u8; 64];
+    let mut mt = Mt1959::new(profile, Platform::Mt1959A).unwrap();
+    let _ = mt.init(&mut t);
+    let t = t.inner;
+    assert_eq!(t.cdbs.get(reads).map(|c| c[0]), Some(SCSI_WRITE_BUFFER));
+}
+
 /// #75 post-upload path: run_init on a variant-A drive whose first unlock read fails
 /// (forcing the upload) and whose upload confirms the unlock. `drops` re-confirm reads
 /// after the settle then fail short (the restart dropped the firmware) before one

@@ -60,6 +60,10 @@ const START_UNIT_TIMEOUT_MS: u32 = 30_000;
 const UPLOAD_SETTLE: Duration = Duration::from_secs(10);
 /// Most firmware uploads one `run_init` makes (1.7.7's three attempts).
 const UNLOCK_ATTEMPTS: usize = 3;
+/// Re-confirm reads answered by a restart sense (UNIT ATTENTION, becoming
+/// ready) before the read counts as a dropped firmware, and the pause between.
+const RECONFIRM_SENSE_RETRIES: u32 = 5;
+const RECONFIRM_SENSE_PAUSE: Duration = Duration::from_secs(1);
 
 // ── Init address (per disc type) ──────────────────────────────────────
 const INIT_ADDR_BD: u16 = 0x0100;
@@ -302,7 +306,7 @@ impl Mt1959 {
             if attempt == UNLOCK_ATTEMPTS && settled.is_none() {
                 break;
             }
-            match self.do_unlock(scsi) {
+            match self.unlock_read(scsi, settled.as_mut()) {
                 Ok(_) => {
                     tracing::debug!(
                         target: "freemkv::disc",
@@ -414,6 +418,35 @@ impl Mt1959 {
             "MT1959 unlock did not succeed after 3 attempts"
         );
         Err(last_err)
+    }
+
+    /// The unlock read; after an upload (`settled`), a restarting drive's first
+    /// answers are UNIT ATTENTION or "becoming ready", not a dropped firmware.
+    fn unlock_read(
+        &mut self,
+        scsi: &mut dyn ScsiTransport,
+        settled: Option<&mut Box<dyn ReadyClock>>,
+    ) -> Result<Vec<u8>> {
+        let Some(clock) = settled else {
+            return self.do_unlock(scsi);
+        };
+        let mut retries = 0;
+        loop {
+            match self.do_unlock(scsi) {
+                Err(e) if retries < RECONFIRM_SENSE_RETRIES && is_restart_sense(&e) => {
+                    retries += 1;
+                    tracing::debug!(
+                        target: "freemkv::disc",
+                        phase = "mt1959_reconfirm_restart_sense",
+                        retries,
+                        sense = ?e.sense_triple(),
+                        "re-confirm read answered by a restarting drive; reading again"
+                    );
+                    clock.wait(scsi, RECONFIRM_SENSE_PAUSE)?;
+                }
+                r => return r,
+            }
+        }
     }
 
     // ── Probe disc ─────────────────────────────────────────────────────
@@ -579,6 +612,11 @@ pub(crate) trait ReadyClock {
 pub(crate) fn settle(scsi: &mut dyn ScsiTransport, d: Duration) -> Result<()> {
     ready_clock().wait(scsi, d)?;
     Ok(())
+}
+
+/// MMC-6 Table F.3: UNIT ATTENTION (6/xx) or "2 04 xx LOGICAL UNIT NOT READY".
+fn is_restart_sense(e: &Error) -> bool {
+    matches!(e.sense_triple(), Some((0x06, _, _)) | Some((0x02, 0x04, _)))
 }
 
 /// The poll's clock: [`WallClock`], or a test's virtual clock (a per-thread seam,
