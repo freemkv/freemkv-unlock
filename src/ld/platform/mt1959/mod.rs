@@ -56,7 +56,7 @@ const START_UNIT: [u8; 6] = [0x1B, 0x00, 0x00, 0x00, 0x01, 0x00];
 /// libfreemkv's START UNIT timeout (T4).
 const START_UNIT_TIMEOUT_MS: u32 = 30_000;
 /// After a confirmed firmware upload the drive restarts: no command for this long,
-/// then one re-confirm read (#75; 1.7.7's 10 s).
+/// then the re-confirm (#75; 1.7.7's 10 s).
 const UPLOAD_SETTLE: Duration = Duration::from_secs(10);
 /// Most firmware uploads one `run_init` makes (1.7.7's three attempts).
 const UNLOCK_ATTEMPTS: usize = 3;
@@ -614,7 +614,7 @@ fn settle_after_upload(
         phase = "mt1959_upload_settle",
         attempt,
         settle_ms = UPLOAD_SETTLE.as_millis() as u64,
-        "firmware uploaded: no commands while the drive restarts, then one re-confirm read"
+        "firmware uploaded: no commands while the drive restarts, then the re-confirm"
     );
     let mut clock = ready_clock();
     clock.wait(scsi, UPLOAD_SETTLE)?;

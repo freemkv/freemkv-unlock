@@ -183,7 +183,7 @@ impl LdUnlocker {
     /// After a calibration transport fault: `Ok` if the unlock still holds, `Transport`
     /// if the bus is still dead (or a Stop), `NotApplicable` if the drive lost the
     /// extended-access state. #75: a command right after the fault can wedge a USB drive,
-    /// so nothing is sent for `settle`, then exactly one unlock read; never an upload.
+    /// so nothing is sent for `settle`, then the unlock re-confirm (re-read only while the drive answers restarting); never an upload.
     fn reconfirm_after_fault(
         mt: &mut platform::mt1959::Mt1959,
         scsi: &mut dyn ScsiTransport,
@@ -193,7 +193,7 @@ impl LdUnlocker {
             target: "freemkv::disc",
             phase = "unlock_reconfirm_settle",
             settle_ms = settle.as_millis() as u64,
-            "transport fault during calibration: no commands for the settle, then one re-confirm read"
+            "transport fault during calibration: no commands for the settle, then the re-confirm"
         );
         platform::mt1959::settle(scsi, settle)?;
         match mt.reconfirm_unlock(scsi) {
