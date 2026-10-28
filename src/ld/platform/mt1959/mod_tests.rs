@@ -983,6 +983,18 @@ fn reconfirm_non_clearing_answers_are_a_drop_at_once() {
     }
 }
 
+// Negative: ILLEGAL REQUEST and NOT READY / no medium are not restart senses; the
+// re-confirm read counts as a dropped firmware at once (upload again, no re-read pause).
+#[test]
+fn reconfirm_non_restart_sense_is_a_dropped_firmware() {
+    for (key, asc, ascq) in [(0x05, 0x20, 0x00), (0x02, 0x3A, 0x00)] {
+        let (_, log, cdbs) = reconfirm_with(vec![sense_reply(key, asc, ascq)], false);
+        let what = format!("{key:02X}/{asc:02X}/{ascq:02X}");
+        assert_eq!(cdbs.get(6).map(|c| c[0]), Some(SCSI_WRITE_BUFFER), "{what}");
+        assert_eq!(pauses_of(&log), [Duration::from_secs(10)], "{what}");
+    }
+}
+
 // The upload's own unlock read answered by a restart sense means the upload went
 // through: the drive still gets the 10 s settle and no second upload follows.
 #[test]
