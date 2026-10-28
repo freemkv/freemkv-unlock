@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.6] — UNRELEASED
+
+### Fixed
+
+- MediaTek (LD) drives (#75): after a firmware upload, a re-confirm read answered with UNIT ATTENTION or "becoming ready" by the restarting drive is read again (up to 5 times, 1 s apart) instead of counting as a dropped firmware and uploading again.
+
 ## [1.8.5] — 2026-10-19
 
 ### Fixed
