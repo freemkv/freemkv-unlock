@@ -214,8 +214,8 @@ fn full_unlock_issues_identity_region_speed_unrestricted_encryption_then_bare_vi
     assert_eq!(t.cdbs.len(), 6);
     assert_eq!(t.cdbs[0], build_identity_cdb(RESP_LEN as u16));
     let set = |f: u8, s: u8| vec![0x3C, 0x0E, 0xC0, 0xDE, 0x02, f, s, 0x00, 0x40, 0x00];
-    assert_eq!(t.cdbs[1], set(0x02, 0x0F), "Region = free");
-    assert_eq!(t.cdbs[2], set(0x01, 0x00), "Speed = max");
+    assert_eq!(t.cdbs[1], set(0x02, 0x01), "Region = free");
+    assert_eq!(t.cdbs[2], set(0x01, 0x01), "Speed = max");
     assert_eq!(t.cdbs[3], set(0x03, 0x01), "Unrestricted = on");
     assert_eq!(t.cdbs[4], set(0x06, 0x00), "Encryption = off");
     assert_eq!(t.cdbs[5][0], crate::scsi::SCSI_READ_DISC_STRUCTURE);

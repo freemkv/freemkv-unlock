@@ -62,30 +62,28 @@ pub const STATE_OFF: u8 = 0x00;
 /// Feature state: explicit **on / enabled** (`0x01`).
 pub const STATE_ON: u8 = 0x01;
 
-/// [`Feature::Speed`] state: speed control OFF — the read-speed cap is lifted and
-/// the drive runs uncapped at maximum throughput. This is the [`STATE_OFF`]
-/// (`0x00`) leg of Speed: "off" is the *limiter* being off, i.e. maximum speed.
-/// `0x01..=0xFE` are explicit caps and `0xFF` is the OEM ramp.
-pub const SPEED_MAX: u8 = 0x00;
+/// Lift the read-speed policy ceiling using the source firmware's native limits.
+/// Both the modern ramp and classic selector use [`STATE_ON`] (`0x01`).
+/// `0x00` is not uncapped: modern ramps use it as a zero ceiling, while classic
+/// selectors retain OEM behavior. This does not override physical/media maxima.
+pub const SPEED_MAX: u8 = STATE_ON;
 
-/// [`Feature::Region`] state: force BD region A (`0x0A`). See [`BdRegion`]. BD
-/// regions A/B/C share the low-nibble block with the DVD `0x0N` scheme
-/// ([`REGION_DVD_BASE`]) and [`REGION_FREE`] (`0x0F`).
+/// Legacy experimental BD-region A byte. The current MediaTek RPC emitter
+/// treats this as OEM; it does not implement Blu-ray region forcing.
 pub const REGION_BD_A: u8 = 0x0A;
-/// [`Feature::Region`] state: force BD region B (`0x0B`).
+/// Legacy experimental BD-region B byte; no MediaTek BD override is implemented.
 pub const REGION_BD_B: u8 = 0x0B;
-/// [`Feature::Region`] state: force BD region C (`0x0C`).
+/// Legacy experimental BD-region C byte; no MediaTek BD override is implemented.
 pub const REGION_BD_C: u8 = 0x0C;
 
-/// [`Feature::Region`] state base for "force DVD region N": `REGION_DVD_BASE + N`,
-/// so regions 1..=8 are `0x01..=0x08`. `0x00` itself is region-locked (nothing
-/// plays).
-pub const REGION_DVD_BASE: u8 = 0x00;
+/// Base for the experimental DVD RPC response override: region N uses
+/// `0x10 + N` (`0x11..=0x18`). `0x01` is reserved for region-free.
+/// This reports an inverted DVD mask; physical enforcement is not qualified.
+pub const REGION_DVD_BASE: u8 = 0x10;
 
-/// [`Feature::Region`] state: region-free — any disc plays regardless of its
-/// region code. Sits in the region low-nibble block above the DVD (`0x01..=0x08`)
-/// and BD (`0x0A..=0x0C`) values.
-pub const REGION_FREE: u8 = 0x0F;
+/// Report a region-free DVD RPC-1 response (`0x01`), matching the firmware's
+/// Region On path and boot setting. This is not a Blu-ray region override.
+pub const REGION_FREE: u8 = STATE_ON;
 
 /// [`Verb::Reset`] mode (rides in the state slot `cdb[6]`): reload the saved flash
 /// config block into the RAM feature-state table, discarding un-saved RAM changes
@@ -167,17 +165,16 @@ pub enum Verb {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Feature {
-    /// Read-speed / riplock ceiling. [`STATE_PASSTHROUGH`] (`0xFF`) = OEM ramp;
-    /// [`STATE_OFF`] (`0x00`) = speed control off, i.e. the cap is lifted and the
-    /// drive runs uncapped at maximum throughput (see [`SPEED_MAX`]); `0x01..=0xFE`
-    /// = an explicit speed cap (the byte IS the cap, lower is slower). Note the OFF
-    /// direction: "off" means the *limiter* is off, so OFF is the fastest state.
+    /// Read-speed policy. [`STATE_PASSTHROUGH`] = OEM; [`SPEED_MAX`] (`0x01`)
+    /// lifts the policy ceiling while preserving native hardware/media maxima.
+    /// Modern ramps treat other bytes as explicit ceilings; classic selectors
+    /// retain OEM behavior for every byte except `0x01`.
     Speed = 0x01,
-    /// Region (RPC) control. [`STATE_PASSTHROUGH`] (`0xFF`) = drive's own region
-    /// logic; [`STATE_OFF`] (`0x00`) = region-locked (nothing plays);
-    /// [`REGION_DVD_BASE`]` + N` (`0x01..=0x08`) = force DVD region 1..8;
-    /// [`REGION_BD_A`]/`_B`/`_C` (`0x0A`/`0x0B`/`0x0C`) = force BD region A/B/C;
-    /// [`REGION_FREE`] (`0x0F`) = region-free (any disc plays).
+    /// DVD RPC response control. [`STATE_PASSTHROUGH`] = OEM; [`REGION_FREE`]
+    /// (`0x01`) reports RPC-1. `0x00` reports RPC-2 with every region masked.
+    /// [`REGION_DVD_BASE`] + N (`0x11..=0x18`) overrides the reported DVD mask
+    /// experimentally. Legacy BD bytes `0x0A..=0x0C` retain OEM behavior.
+    /// A reported mask alone does not establish playback/enforcement behavior.
     Region = 0x02,
     /// Unrestricted (BD/UHD) capability widen gate. [`STATE_PASSTHROUGH`]
     /// (`0xFF`) = OEM; [`STATE_OFF`] (`0x00`) = No (currently no-op on
@@ -187,9 +184,10 @@ pub enum Feature {
     /// expose, so on 0.9.2 this lever governs UHD acceptance.
     Unrestricted = 0x03,
     /// Host Revocation List handling on the cert path. [`STATE_PASSTHROUGH`]
-    /// (`0xFF`) = OEM enforce; [`STATE_OFF`] (`0x00`) = off (skip the HRL lookup —
-    /// revoked certs accepted, non-destructive, the unlock direction); [`STATE_ON`]
-    /// (`0x01`) = on (enforce the HRL).
+    /// (`0xFF`) = OEM enforce; [`STATE_OFF`] (`0x00`) = off (ignore the native
+    /// HRL lookup's rejection result without changing the list). The lookup
+    /// still executes; other certificate checks remain separate.
+    /// [`STATE_ON`] (`0x01`) = on (enforce the HRL).
     Hrl = 0x05,
     /// The one master encryption/cert bypass. [`STATE_OFF`] (`0x00`) = every
     /// drive-side encryption/cert requirement gone (cert-AKE relaxed, bus-wrap

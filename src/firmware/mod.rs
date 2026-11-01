@@ -323,7 +323,7 @@ impl<'a> FirmwareControl<'a> {
     pub fn disable_unrestricted(&mut self) -> Result<()> {
         self.set(Feature::Unrestricted, STATE_OFF)
     }
-    /// Skip the HRL lookup (revoked certs accepted; non-destructive). The unlock
+    /// Ignore HRL rejection after the native lookup; leave the list intact. The unlock
     /// direction is now [`STATE_OFF`] (`0x00` = HRL enforcement off).
     pub fn skip_hrl(&mut self) -> Result<()> {
         self.set(Feature::Hrl, STATE_OFF)
@@ -336,16 +336,17 @@ impl<'a> FirmwareControl<'a> {
     pub fn disable_encryption(&mut self) -> Result<()> {
         self.set(Feature::Encryption, STATE_OFF)
     }
-    /// Region-free (RPC-1). Sends [`REGION_FREE`] (`0x0F`) — under the migrated
-    /// region scheme `0x01` now means "force DVD region 1", not region-free.
+    /// Report DVD region-free (RPC-1), using the emitted firmware value `0x01`.
     pub fn region_free(&mut self) -> Result<()> {
         self.set(Feature::Region, REGION_FREE)
     }
-    /// Force a specific Blu-ray region.
+    /// Send a legacy experimental Blu-ray region byte. Current MediaTek firmware
+    /// retains OEM behavior for these bytes; this is not a working BD override.
     pub fn force_region_bd(&mut self, region: BdRegion) -> Result<()> {
         self.set(Feature::Region, region.state())
     }
-    /// Force a specific DVD region (1..=8). Returns
+    /// Override the reported DVD RPC region mask (1..=8; experimental).
+    /// Physical enforcement is not qualified. Returns
     /// [`FirmwareError::InvalidArgument`] for an out-of-range region without
     /// touching the drive.
     pub fn force_region_dvd(&mut self, region: u8) -> Result<()> {

@@ -52,10 +52,10 @@ fn state_and_frame_constants_match_abi() {
     assert_eq!(STATE_PASSTHROUGH, 0xFF);
     assert_eq!(STATE_OFF, 0x00);
     assert_eq!(STATE_ON, 0x01);
-    assert_eq!(SPEED_MAX, 0x00);
+    assert_eq!(SPEED_MAX, 0x01);
     assert_eq!([REGION_BD_A, REGION_BD_B, REGION_BD_C], [0x0A, 0x0B, 0x0C]);
-    assert_eq!(REGION_DVD_BASE, 0x00);
-    assert_eq!(REGION_FREE, 0x0F);
+    assert_eq!(REGION_DVD_BASE, 0x10);
+    assert_eq!(REGION_FREE, 0x01);
     assert_eq!(RESET_TO_FLASH, 0x00);
     assert_eq!(RESET_TO_DEFAULTS, 0x01);
     assert_eq!(RESET_TO_OEM, 0xFF);
@@ -600,12 +600,14 @@ fn typed_setters_issue_expected_set_cdbs() {
     // The HRL/Encryption unlock direction is STATE_OFF (0x00), not STATE_ON.
     assert_eq!(m.cdbs[1], build_set_cdb(Feature::Hrl, STATE_OFF));
     assert_eq!(m.cdbs[2], build_set_cdb(Feature::Encryption, STATE_OFF));
-    // Region-free is REGION_FREE (0x0F) — 0x01 now forces DVD region 1.
+    // Compare actual numeric CDB bytes as well as named constants.
     assert_eq!(m.cdbs[3], build_set_cdb(Feature::Region, REGION_FREE));
     assert_eq!(m.cdbs[4], build_set_cdb(Feature::Region, REGION_BD_B));
-    // force_region_dvd(2) = REGION_DVD_BASE + 2 = 0x02 under the new base.
-    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, 0x02));
+    // DVD overrides use 0x11..=0x18, distinct from region-free 0x01.
+    assert_eq!(m.cdbs[5], build_set_cdb(Feature::Region, 0x12));
     assert_eq!(m.cdbs[6], build_set_cdb(Feature::Speed, SPEED_MAX));
+    assert_eq!(m.cdbs[3][CDB_STATE], 0x01);
+    assert_eq!(m.cdbs[6][CDB_STATE], 0x01);
 }
 
 /// Regression: a bad caller argument is not a drive refusal, and the bus is
