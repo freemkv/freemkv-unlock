@@ -39,7 +39,7 @@ jobs:
   # clippy deliberately does NOT use it — it runs on `stable` (lint debt is
   # caught against current Rust).
   resolve-msrv:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, 'bump version')) }}
     runs-on: ubuntu-latest
     outputs:
       v: ${{ steps.msrv.outputs.v }}
@@ -56,7 +56,7 @@ jobs:
   # Hard-fails on main (and PRs targeting main); warns elsewhere so an
   # in-progress dev/qa branch whose entry isn't written yet is not blocked.
   changelog:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, 'bump version')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -121,7 +121,7 @@ jobs:
   # consumers against THIS commit: both dep freemkv-unlock by version, so each
   # gets a path patch (bdemu also patches libfreemkv to the sibling).
   consumers:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, 'bump version')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -181,7 +181,7 @@ jobs:
   # `stable` — advisory/licence debt is caught against current Rust, not the
   # MSRV pin — so no `needs: resolve-msrv`.
   deny:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, ': bump version')) }}
+    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && contains(github.event.head_commit.message, 'bump version')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
