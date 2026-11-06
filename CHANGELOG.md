@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Pioneer runtime unlock now probes native speed-policy support and selects volatile automatic quiet control off (native Standard mode) after encryption activation, verifying the setting by readback. Unlike Performance mode, this disables the adaptive quiet controller in the traced 209M firmware. It does not save to EEPROM or bypass media/servo limits. Unsupported, refused, and unverified settings are logged without discarding a working encryption unlock; transport faults still abort.
+- Pioneer custom Speed SET no longer acknowledges an unchanged policy. Runtime identity advances to capability version 5; power-cycle drives with an older resident hook before using this version.
+
 ## [1.8.8] — 2026-11-01
 
 ### Changed

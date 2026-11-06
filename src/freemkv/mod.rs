@@ -45,6 +45,9 @@ trait Backend {
     fn verify(&self, _scsi: &mut dyn ScsiTransport) -> BackendResult<()> {
         Ok(())
     }
+    fn tune(&self, _scsi: &mut dyn ScsiTransport) -> BackendResult<()> {
+        Ok(())
+    }
     fn get_vid(&self, scsi: &mut dyn ScsiTransport) -> BackendResult<Option<[u8; 16]>> {
         crate::vid::read_aacs_vid(scsi)
     }
@@ -255,6 +258,15 @@ impl FreemkvUnlocker {
             None => return Err(UnlockError::NotApplicable),
         };
         backend.prepare(scsi, installed)?;
+        self.unlock_backend(scsi, &mut *backend, installed)
+    }
+
+    fn unlock_backend(
+        &self,
+        scsi: &mut dyn ScsiTransport,
+        backend: &mut dyn Backend,
+        installed: bool,
+    ) -> BackendResult<Unlocked> {
         let result = {
             let mut critical =
                 crate::scsi::CriticalGuard::enter(scsi).map_err(|_| UnlockError::Transport)?;
@@ -274,6 +286,11 @@ impl FreemkvUnlocker {
         };
         scsi.pause(std::time::Duration::ZERO)
             .map_err(|_| UnlockError::Transport)?;
+        // Tune after OEM media reacquisition and outside the installation critical span.
+        // A refused optional setting must not roll back a verified encryption unlock.
+        if result.is_ok() {
+            backend.tune(scsi)?;
+        }
         result
     }
 

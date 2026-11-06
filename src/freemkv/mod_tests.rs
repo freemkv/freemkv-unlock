@@ -491,7 +491,6 @@ fn pioneer_activation_uses_shared_settings_and_allows_oem_media_reacquisition() 
         ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
             let (feature, state) = [
                 (Feature::Region, REGION_FREE),
-                (Feature::Speed, SPEED_MAX),
                 (Feature::Unrestricted, STATE_ON),
                 (Feature::Encryption, STATE_OFF),
             ][self.calls];
@@ -517,7 +516,7 @@ fn pioneer_activation_uses_shared_settings_and_allows_oem_media_reacquisition() 
     FreemkvUnlocker::new()
         .activate(&mut t, &renesas::Backend::new())
         .unwrap();
-    assert_eq!(t.calls, 4);
+    assert_eq!(t.calls, 3);
 }
 
 #[test]
@@ -561,4 +560,80 @@ fn cancellation_during_pioneer_preparation_never_enters_critical_span_or_install
         UnlockError::Transport
     );
     assert_eq!(t.inner.calls(), 4);
+}
+
+#[test]
+fn pioneer_native_tuning_runs_after_verified_activation_outside_critical_span() {
+    struct NativeBackend;
+    impl Backend for NativeBackend {
+        fn capabilities(&self) -> crate::protocol::Capabilities {
+            crate::protocol::Capabilities::PIONEER_RUNTIME
+        }
+        fn verify(&self, _: &mut dyn ScsiTransport) -> BackendResult<()> {
+            Ok(())
+        }
+        fn get_vid(&self, _: &mut dyn ScsiTransport) -> BackendResult<Option<[u8; 16]>> {
+            Ok(None)
+        }
+        fn tune(&self, t: &mut dyn ScsiTransport) -> BackendResult<()> {
+            renesas::Backend::new().tune(t)
+        }
+    }
+    struct T {
+        cdbs: Vec<Vec<u8>>,
+        critical: bool,
+        failed_activation: bool,
+    }
+    impl ScsiTransport for T {
+        fn begin_critical(&mut self) -> crate::scsi::Result<()> {
+            self.critical = true;
+            Ok(())
+        }
+        fn end_critical(&mut self) {
+            self.critical = false;
+        }
+        fn execute(
+            &mut self,
+            c: &[u8],
+            _: DataDirection,
+            b: &mut [u8],
+            _: u32,
+        ) -> crate::scsi::Result<ScsiResult> {
+            self.cdbs.push(c.to_vec());
+            if c[0..3] == [0x3c, 2, 0xf4] {
+                assert!(!self.critical);
+                assert_eq!(
+                    self.cdbs.len(),
+                    4,
+                    "three activation SETs precede native speed query"
+                );
+                // Unsupported settings must leave the verified encryption unlock usable.
+                return Ok(ScsiResult {
+                    status: 2,
+                    bytes_transferred: 0,
+                    sense: [0; 32],
+                });
+            }
+            assert!(self.critical);
+            assert_ne!(c[5], Feature::Speed as u8);
+            let reject = self.failed_activation && c[5] == Feature::Encryption as u8;
+            b.fill(0);
+            Ok(ScsiResult {
+                status: if reject { 2 } else { 0 },
+                bytes_transferred: b.len(),
+                sense: [0; 32],
+            })
+        }
+    }
+    for failed_activation in [false, true] {
+        let mut t = T {
+            cdbs: vec![],
+            critical: false,
+            failed_activation,
+        };
+        let result = FreemkvUnlocker::new().unlock_backend(&mut t, &mut NativeBackend, true);
+        assert_eq!(result.is_ok(), !failed_activation);
+        assert_eq!(t.cdbs.len(), if failed_activation { 3 } else { 4 });
+        assert!(!t.critical);
+    }
 }

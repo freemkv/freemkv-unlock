@@ -5,6 +5,8 @@
 //! The protocol hook stays resident; activation restores its borrowed OEM callback.
 //! VID retrieval is a separate, read-only operation.
 
+mod speed;
+
 use crate::UnlockError;
 #[cfg(test)]
 use crate::Unlocked;
@@ -182,6 +184,9 @@ impl super::Backend for Backend {
         } else {
             Err(UnlockError::Transport)
         }
+    }
+    fn tune(&self, scsi: &mut dyn ScsiTransport) -> Result<(), UnlockError> {
+        speed::configure(scsi)
     }
     fn capabilities(&self) -> crate::protocol::Capabilities {
         crate::protocol::Capabilities::PIONEER_RUNTIME
@@ -2757,7 +2762,6 @@ mod hook {
             if matches!(op, Operation::Suppress) {
                 cdb_byte(&mut a, crate::protocol::CDB_FEATURE)?;
                 for feature in [
-                    crate::protocol::Feature::Speed,
                     crate::protocol::Feature::Region,
                     crate::protocol::Feature::Unrestricted,
                     crate::protocol::Feature::Hrl,

@@ -444,8 +444,9 @@ impl Capabilities {
         match self.implementation {
             Implementation::Firmware => true,
             Implementation::PioneerRuntime => {
-                feature != Feature::Encryption
-                    || matches!(state, STATE_OFF | STATE_ON | STATE_PASSTHROUGH)
+                feature != Feature::Speed
+                    && (feature != Feature::Encryption
+                        || matches!(state, STATE_OFF | STATE_ON | STATE_PASSTHROUGH))
             }
         }
     }
@@ -460,11 +461,11 @@ pub struct ProtocolIdentity {
     pub capabilities: Capabilities,
 }
 
-// Extension: magic, version, implementation, SET and GET bitmaps. Version four
-// includes standard VID reads and optional SET no-ops; encryption changes policy.
+// Extension: magic, version, implementation, SET and GET bitmaps. Version five
+// rejects Speed SETs: the host selects and verifies the native volatile policy.
 // Unknown nonzero extensions fail closed, independently of legacy state bytes.
 const EXTENSION_OFFSET: usize = 32;
-const PIONEER_EXTENSION: &[u8; 8] = b"FMCP\x04\x01\x6e\x00";
+const PIONEER_EXTENSION: &[u8; 8] = b"FMCP\x05\x01\x6c\x00";
 impl ProtocolIdentity {
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != MEMREAD_LEN {
@@ -518,8 +519,9 @@ mod tests {
             for s in [STATE_OFF, STATE_ON, STATE_PASSTHROUGH, 2, 254] {
                 assert_eq!(
                     id.capabilities.supports_set(f, s),
-                    f != Feature::Encryption
-                        || matches!(s, STATE_OFF | STATE_ON | STATE_PASSTHROUGH)
+                    f != Feature::Speed
+                        && (f != Feature::Encryption
+                            || matches!(s, STATE_OFF | STATE_ON | STATE_PASSTHROUGH))
                 );
             }
         }

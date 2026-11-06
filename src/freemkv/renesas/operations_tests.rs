@@ -612,7 +612,7 @@ fn unsupported_feature_state_and_verb_are_rejected_without_activation() {
         for feature in [0, 1, 2, 3, 4, 5, 6, 7] {
             for state in [0, 1, 2, 254, 255] {
                 if verb == 2
-                    && (matches!(feature, 1 | 2 | 3 | 5)
+                    && (matches!(feature, 2 | 3 | 5)
                         || feature == 6 && matches!(state, 0 | 1 | 255))
                 {
                     continue;
@@ -629,7 +629,7 @@ fn unsupported_feature_state_and_verb_are_rejected_without_activation() {
 
 #[test]
 fn optional_sets_acknowledge_without_policy_reset_or_wait() {
-    for feature in [1, 2, 3, 5] {
+    for feature in [2, 3, 5] {
         for state in [0, 1, 2, 15, 254, 255] {
             let cdb = [0x3c, 0x0e, 0xc0, 0xde, 2, feature, state, 0, 64, 0];
             for suppressed in [false, true] {
@@ -1323,4 +1323,12 @@ fn scheduler_delay_discovery_requires_unique_adapter_and_kernel_target() {
     assert!(scheduler_delay(&image).is_err());
     image.fill(0);
     assert!(scheduler_delay(&image).is_err());
+}
+
+#[test]
+fn speed_set_is_rejected_instead_of_acknowledging_an_unchanged_policy() {
+    for state in [0, 1, 2, 15, 254, 255] {
+        let cdb = crate::protocol::build_set_cdb(crate::protocol::Feature::Speed, state);
+        assert_eq!(execute_command(Operation::Suppress, false, false, cdb, false), (true, vec![]));
+    }
 }
