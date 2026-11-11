@@ -36,7 +36,7 @@ jobs:
   # the MSRV read `needs.resolve-msrv.outputs.v` from Cargo.toml's rust-version;
   # clippy (cross-lint) runs on stable instead.
   resolve-msrv:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, 'bump version')) }}
+    if: "${{ !(github.event_name == 'push' && github.ref_type == 'branch' && github.event.commits[0] != null && github.event.commits[1] == null && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, ': bump version')) }}"
     runs-on: ubuntu-latest
     outputs:
       v: ${{ steps.msrv.outputs.v }}
@@ -61,7 +61,7 @@ jobs:
   #
   # release.yml excludes v*-rc* so a candidate never publishes a release.
   rc-tag:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, 'bump version')) }}
+    if: "${{ !(github.event_name == 'push' && github.ref_type == 'branch' && github.event.commits[0] != null && github.event.commits[1] == null && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, ': bump version')) }}"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -111,7 +111,7 @@ jobs:
   # the target it compiles for. Linting solely on the dev machine's host
   # target is how a lint that CI rejects reaches a push.
   cross-lint:
-    if: ${{ !(github.event_name == 'push' && github.ref_type == 'branch' && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, 'bump version')) }}
+    if: "${{ !(github.event_name == 'push' && github.ref_type == 'branch' && github.event.commits[0] != null && github.event.commits[1] == null && startsWith(github.event.head_commit.message, 'v') && contains(github.event.head_commit.message, ': bump version')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
