@@ -6,6 +6,7 @@
 
 - Pioneer runtime unlock now probes native speed-policy support and selects volatile automatic quiet control off (native Standard mode) after encryption activation, verifying the setting by readback. Unlike Performance mode, this disables the adaptive quiet controller in the traced 209M firmware. It does not save to EEPROM or bypass media/servo limits. Unsupported, refused, and unverified settings are logged without discarding a working encryption unlock; transport faults still abort.
 - Pioneer custom Speed SET no longer acknowledges an unchanged policy. Runtime identity advances to capability version 5; power-cycle drives with an older resident hook before using this version.
+- Speed and Region SETs now send the values flashed freemkv firmware implements: `SPEED_MAX` is `0x01` (was `0x00`, a zero ceiling on modern ramps), `REGION_FREE` is `0x01` (was `0x0F`), and `force_region_dvd(n)` sends `0x10 + n` (was `n`). The Blu-ray region bytes are documented as legacy: firmware keeps OEM behaviour for them.
 
 ## [1.8.8] — 2026-11-01
 

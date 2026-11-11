@@ -209,7 +209,8 @@ pub const ALL_FEATURES: [Feature; 5] = [
     Feature::Encryption,
 ];
 
-/// A Blu-ray region for [`crate::firmware::FirmwareControl::force_region_bd`].
+/// A legacy experimental Blu-ray region byte for
+/// [`crate::firmware::FirmwareControl::force_region_bd`]; not a working BD override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BdRegion {
     /// Region A (`0x0A`).
@@ -221,7 +222,7 @@ pub enum BdRegion {
 }
 
 impl BdRegion {
-    /// The `Feature::Region` state byte that forces this BD region.
+    /// The legacy `Feature::Region` byte for this BD region (firmware keeps OEM behaviour).
     pub fn state(self) -> u8 {
         match self {
             BdRegion::A => REGION_BD_A,
