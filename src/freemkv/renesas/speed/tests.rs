@@ -333,3 +333,100 @@ fn bdr_209m_quiet_off_disables_adaptive_control_where_performance_does_not() {
         assert_eq!(calls, expected);
     }
 }
+
+#[derive(Default)]
+struct Recorder(Vec<(Vec<u8>, DataDirection, usize, u32)>);
+impl ScsiTransport for Recorder {
+    fn execute(
+        &mut self,
+        c: &[u8],
+        d: DataDirection,
+        b: &mut [u8],
+        t: u32,
+    ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+        self.0.push((c.to_vec(), d, b.len(), t));
+        let reply = if self.0.len() == 1 {
+            settings(2, 1)
+        } else {
+            settings(0, 1)
+        };
+        let n = if c[0] == 0xbb {
+            0
+        } else {
+            b.len().min(reply.len())
+        };
+        b[..n].copy_from_slice(&reply[..n]);
+        Ok(crate::scsi::ScsiResult {
+            status: 0,
+            bytes_transferred: n,
+            sense: [0; 32],
+        })
+    }
+}
+
+#[test]
+fn adapter_reads_settings_in_and_sends_quiet_off_without_data() {
+    let mut t = Recorder::default();
+    assert!(matches!(select(&mut t), Ok(WriteOutcome::Verified(_))));
+    let seen: Vec<_> =
+        t.0.iter()
+            .map(|(c, d, n, ms)| (c.clone(), *d, *n > 0, *ms))
+            .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (QUERY.to_vec(), DataDirection::FromDevice, true, 5_000),
+            (QUIET_OFF.to_vec(), DataDirection::None, false, 5_000),
+            (QUERY.to_vec(), DataDirection::FromDevice, true, 5_000),
+        ]
+    );
+}
+
+#[test]
+fn adapter_refuses_data_out_without_reaching_the_drive() {
+    let mut t = MockTransport::always(Reply::good(vec![]));
+    let err = Adapter(&mut t)
+        .exec(&QUIET_OFF, pioneer_optical::drive::Data::Out(&[0x80]))
+        .unwrap_err();
+    assert!(!crate::scsi::is_dead_bus(&err));
+    assert_eq!(t.calls(), 0);
+}
+
+#[test]
+fn configure_keeps_the_unlock_for_every_non_transport_outcome() {
+    let cases = [
+        (
+            vec![
+                Reply::good(settings(2, 1)),
+                Reply::good(vec![]),
+                Reply::good(settings(0, 1)),
+            ],
+            3,
+        ),
+        (vec![Reply::good(settings(0, 1))], 1),
+        (
+            vec![
+                Reply::good(settings(2, 1)),
+                Reply::good(vec![]),
+                Reply::good(settings(2, 1)),
+            ],
+            3,
+        ),
+        (
+            vec![
+                Reply::good(settings(2, 1)),
+                Reply::good(vec![]),
+                Reply::good(vec![0; 256]),
+            ],
+            3,
+        ),
+        (vec![Reply::good(settings(2, 0))], 1),
+        (vec![Reply::short(settings(2, 1), 8)], 1),
+    ];
+    for (replies, calls) in cases {
+        let mut t = MockTransport::scripted(replies, Reply::TransportFault);
+        assert_eq!(configure(&mut t), Ok(()));
+        assert_eq!(t.calls(), calls);
+        assert!(t.cdbs.iter().all(|c| *c == QUERY || *c == QUIET_OFF));
+    }
+}

@@ -527,6 +527,27 @@ mod tests {
         }
     }
     #[test]
+    fn pioneer_set_bitmap_advertises_exactly_the_supported_features() {
+        let bitmap = PIONEER_EXTENSION[6];
+        let caps = Capabilities::PIONEER_RUNTIME;
+        let mut expected = 0u8;
+        for f in ALL_FEATURES {
+            if caps.supports_set(f, STATE_OFF) {
+                expected |= 1 << f as u8;
+            }
+        }
+        assert_eq!(bitmap, expected);
+        assert_eq!(bitmap & 1 << Feature::Speed as u8, 0);
+        assert_eq!(&PIONEER_EXTENSION[..6], b"FMCP\x05\x01");
+        assert_eq!(PIONEER_EXTENSION[7], 0, "no GET extensions");
+    }
+    #[test]
+    fn version_four_runtime_that_acknowledged_speed_fails_closed() {
+        let mut v4 = pioneer_identity();
+        v4[EXTENSION_OFFSET..EXTENSION_OFFSET + 8].copy_from_slice(b"FMCP\x04\x01\x6e\x00");
+        assert!(ProtocolIdentity::parse(&v4).is_none());
+    }
+    #[test]
     fn unknown_and_truncated_extensions_never_become_legacy() {
         let bytes = pioneer_identity();
         for n in 0..64 {

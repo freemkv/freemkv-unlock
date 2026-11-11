@@ -637,3 +637,72 @@ fn pioneer_native_tuning_runs_after_verified_activation_outside_critical_span() 
         assert!(!t.critical);
     }
 }
+
+#[test]
+fn pioneer_tuning_follows_media_reacquisition_and_dead_bus_aborts() {
+    struct Native;
+    impl Backend for Native {
+        fn capabilities(&self) -> crate::protocol::Capabilities {
+            crate::protocol::Capabilities::PIONEER_RUNTIME
+        }
+        fn get_vid(&self, _: &mut dyn ScsiTransport) -> BackendResult<Option<[u8; 16]>> {
+            Ok(None)
+        }
+        fn tune(&self, t: &mut dyn ScsiTransport) -> BackendResult<()> {
+            renesas::Backend::new().tune(t)
+        }
+    }
+    #[derive(Default)]
+    struct T {
+        log: Vec<&'static str>,
+        dead_tune: bool,
+    }
+    impl ScsiTransport for T {
+        fn pause(&mut self, _: std::time::Duration) -> Result<()> {
+            self.log.push("pause");
+            Ok(())
+        }
+        fn execute(
+            &mut self,
+            c: &[u8],
+            _: DataDirection,
+            b: &mut [u8],
+            _: u32,
+        ) -> Result<ScsiResult> {
+            if c[0..3] == [0x3c, 2, 0xf4] {
+                self.log.push("tune");
+                if self.dead_tune {
+                    return Err(crate::scsi::ScsiError {
+                        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                        sense: None,
+                    });
+                }
+            } else {
+                self.log.push("set");
+            }
+            b.fill(0);
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: b.len(),
+                sense: [0; 32],
+            })
+        }
+    }
+    for dead_tune in [false, true] {
+        let mut t = T {
+            dead_tune,
+            ..T::default()
+        };
+        let result = FreemkvUnlocker::new().unlock_backend(&mut t, &mut Native, true);
+        // The query answers all zeros (malformed): logged and kept, unless the bus died.
+        assert_eq!(
+            result.map(|_| ()),
+            if dead_tune {
+                Err(UnlockError::Transport)
+            } else {
+                Ok(())
+            }
+        );
+        assert_eq!(t.log, ["set", "set", "set", "pause", "tune"]);
+    }
+}

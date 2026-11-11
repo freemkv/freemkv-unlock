@@ -610,6 +610,23 @@ fn typed_setters_issue_expected_set_cdbs() {
     assert_eq!(m.cdbs[6][CDB_STATE], 0x01);
 }
 
+#[test]
+fn force_region_dvd_maps_every_region_outside_region_free() {
+    let mut m = FwMock::new();
+    {
+        let mut fw = FirmwareControl::new(&mut m);
+        for region in 1..=8 {
+            fw.force_region_dvd(region).unwrap();
+        }
+    }
+    let states: Vec<u8> = m.cdbs.iter().map(|c| c[CDB_STATE]).collect();
+    assert_eq!(states, (0x11..=0x18).collect::<Vec<u8>>());
+    for (cdb, state) in m.cdbs.iter().zip(0x11..=0x18) {
+        assert_eq!(*cdb, build_set_cdb(Feature::Region, state));
+    }
+    assert!(!states.contains(&REGION_FREE) && !states.contains(&STATE_PASSTHROUGH));
+}
+
 /// Regression: a bad caller argument is not a drive refusal, and the bus is
 /// never touched.
 #[test]

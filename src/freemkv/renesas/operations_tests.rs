@@ -1332,3 +1332,35 @@ fn speed_set_is_rejected_instead_of_acknowledging_an_unchanged_policy() {
         assert_eq!(execute_command(Operation::Suppress, false, false, cdb, false), (true, vec![]));
     }
 }
+
+#[test]
+fn hook_set_gate_matches_advertised_runtime_capabilities() {
+    let caps = crate::protocol::Capabilities::PIONEER_RUNTIME;
+    for feature in crate::protocol::ALL_FEATURES {
+        if feature == crate::protocol::Feature::Encryption {
+            continue; // Encryption transitions run the policy path; covered above.
+        }
+        for state in [0, 1, 2, 15, 254, 255] {
+            let cdb = crate::protocol::build_set_cdb(feature, state);
+            let expected = if caps.supports_set(feature, state) {
+                (false, vec![0; 64])
+            } else {
+                (true, vec![])
+            };
+            assert_eq!(
+                execute_command(Operation::Suppress, false, false, cdb, false),
+                expected,
+                "{feature:?} {state}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_speed_policy_query_passes_through_to_oem() {
+    let query = [0x3c, 2, 0xf4, 0, 0, 0, 0, 1, 0, 0];
+    assert_eq!(
+        execute_command(Operation::Suppress, false, false, query, false),
+        (false, vec![])
+    );
+}
