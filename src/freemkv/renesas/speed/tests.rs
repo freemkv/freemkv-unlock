@@ -140,14 +140,9 @@ fn impossible_transfer_count_is_not_verified() {
     assert_eq!(t.0.calls(), 2);
 }
 
-// Execute the native vendor-policy branch from BDR-209M 1.33 (SAT8600 ID60),
-// CPU 44B286..44B36A, to check the actual OEM argument mapping of our command.
-// Extracted from Normal envelope SHA256
-// 1930eb998112cd7aa6f695cc6d342d649f329125f006fc79d44a96bfef176ef5.
-// Framing-only decoded body: this region is readable native code. No claim of
-// complete firmware decoding or hardware throughput follows from this fixture.
-// Calls to the OEM singleton getter/logger are mocked; the final setter receives
-// the real computed R1H (save) and R1L (policy). No production model/address gate.
+// Native vendor-policy branch 44B286..44B36A, BDR-209M 1.33 (SAT8600 ID60) Normal envelope
+// SHA256 1930eb998112cd7aa6f695cc6d342d649f329125f006fc79d44a96bfef176ef5. OEM getter/logger
+// are mocked; the setter gets real R1H (save) and R1L (policy). Mapping only, not throughput.
 #[test]
 fn bdr_209m_native_branch_selects_quiet_off_without_eeprom_save() {
     let code = include_bytes!("209m-133-bb.bin");
@@ -259,10 +254,8 @@ fn bdr_209m_native_branch_selects_quiet_off_without_eeprom_save() {
     );
 }
 
-// Native setter core 455DA8..455DE6 from the same 209M Normal image as above.
-// Execute both policies: FD must select index zero AND disable adaptive control;
-// FE selects the same index without disabling it. Only OEM call boundaries are
-// mocked, so changing the tested branch or argument fails this regression.
+// Native setter core 455DA8..455DE6 (same image). FD must select index zero AND disable
+// adaptive control; FE selects it without disabling. Only OEM call boundaries are mocked.
 #[test]
 fn bdr_209m_quiet_off_disables_adaptive_control_where_performance_does_not() {
     let b = include_bytes!("209m-133-policy.bin");

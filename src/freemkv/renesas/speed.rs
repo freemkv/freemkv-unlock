@@ -1,6 +1,6 @@
 //! Native Pioneer speed policy. No product-name checks, RAM writes or EEPROM saves.
-//! Automatic quiet control off disables adaptive quiet policy, preserving media/servo limits
-//! or establish measured throughput. Standard MMC speed requests remain host-owned.
+//! Automatic quiet control off disables the adaptive quiet policy; it does not bypass
+//! media/servo limits or establish measured throughput. MMC speed requests stay host-owned.
 use crate::UnlockError;
 use crate::scsi::{DataDirection, ScsiError, ScsiTransport, is_dead_bus};
 use pioneer_optical::device::{Device, Error, Persistence, QuietDrive, WriteOutcome};
