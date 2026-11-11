@@ -236,6 +236,9 @@ enum AfterProbeFault {
     Dead,
     // The bus recovers but the reset dropped the firmware: the unlock read has no markers.
     LostFirmware,
+    // The bus recovers with the firmware answering but out of extended access: the
+    // secondary marker is gone.
+    LostExtendedAccess,
     // The reset left a pending UNIT ATTENTION (06/29/00) on the first unlock read.
     PendingUnitAttention,
 }
@@ -281,6 +284,9 @@ impl ScsiTransport for ProbeFaultsDrive {
         let mut resp = self.resp.clone();
         if self.faulted && self.after == AfterProbeFault::LostFirmware {
             resp[12..20].fill(0);
+        }
+        if self.faulted && self.after == AfterProbeFault::LostExtendedAccess {
+            resp[16..20].fill(0);
         }
         let n = resp.len().min(data.len());
         data[..n].copy_from_slice(&resp[..n]);
@@ -441,6 +447,15 @@ fn calibration_transport_fault_that_drops_the_firmware_is_not_unlocked() {
             .expect("not a dead bus")
             .is_none()
     );
+}
+
+// The re-confirm read answers with the signature and primary marker but no
+// secondary marker: the drive left extended access, so the unlock is not kept.
+#[test]
+fn calibration_transport_fault_that_leaves_extended_access_is_not_unlocked() {
+    let (r, log) = probe_fault_unlock_logged(AfterProbeFault::LostExtendedAccess, false);
+    assert!(r.expect("not a dead bus").is_none());
+    assert_eq!(from_the_fault(&log), ["probe", "pause 5000ms", "unlock"]);
 }
 
 // A drive-sense (not a dead bus) rejecting the speed probe is a genuine

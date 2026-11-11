@@ -427,6 +427,23 @@ fn transport_fault_during_pass2_probe_stays_a_transport_failure() {
     assert_eq!(crate::UnlockError::from(e), crate::UnlockError::Transport);
 }
 
+// #75: a transport fault on the calibration INIT command ends calibration there;
+// validate must not be sent into the just-faulted bus.
+#[test]
+fn transport_fault_on_the_calibration_init_sends_nothing_further() {
+    use crate::scsi::mock::{MockTransport, Reply};
+    let mut t = MockTransport::scripted(
+        vec![Reply::good(vec![0u8; 8]), Reply::TransportFault],
+        Reply::good(vec![0u8; 4]),
+    );
+    let mut mt = Mt1959::new(fixture_profile([0; 4]), Platform::Mt1959A).unwrap();
+    mt.init_complete = true;
+    let e = mt.run_probe(&mut t).expect_err("dead bus on INIT");
+    assert!(e.is_transport_failure());
+    assert_eq!(t.calls(), 2, "READ CAPACITY, INIT, then nothing");
+    assert_eq!(t.cdbs[1][3], SUB_CMD_INIT);
+}
+
 // `validate`'s transport-abort branch: a dead bus must propagate on
 // the first attempt, not be retried five times.
 #[test]
