@@ -914,3 +914,36 @@ fn disabling_unrestricted_sends_the_off_state() {
         .unwrap();
     assert_eq!(transport.calls(), 1);
 }
+
+#[test]
+fn descriptor_parses_legacy_and_runtime_identities() {
+    let mut legacy = vec![0u8; MEMREAD_LEN];
+    legacy[..13].copy_from_slice(b"freemkv 0.9.2");
+    for (reply, implementation) in [
+        (legacy, Implementation::Firmware),
+        (
+            crate::protocol::pioneer_identity().to_vec(),
+            Implementation::PioneerRuntime,
+        ),
+    ] {
+        let mut transport = MockTransport::always(Reply::good(reply));
+        let id = FirmwareControl::new(&mut transport)
+            .descriptor()
+            .unwrap()
+            .expect("a well-formed identity parses");
+        assert_eq!(id.identity.version, "0.9.2");
+        assert_eq!(id.capabilities.implementation(), implementation);
+    }
+}
+
+#[test]
+fn disabling_unrestricted_sends_the_exact_set_cdb() {
+    let mut transport = MockTransport::always(Reply::good(vec![0; MEMREAD_LEN]));
+    FirmwareControl::new(&mut transport)
+        .disable_unrestricted()
+        .unwrap();
+    assert_eq!(
+        transport.cdbs,
+        [build_set_cdb(Feature::Unrestricted, STATE_OFF).to_vec()]
+    );
+}
