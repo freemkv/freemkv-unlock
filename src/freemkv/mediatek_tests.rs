@@ -338,3 +338,15 @@ fn freemkv_unlocker_stays_unwind_safe() {
     fn assert_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
     assert_traits::<FreemkvUnlocker>();
 }
+
+#[test]
+fn claims_only_drives_the_mediatek_loader_recognises() {
+    let id = crate::DriveId {
+        vendor_id: "TEST MEDIATEK".into(),
+        ..crate::DriveId::default()
+    };
+    let unlocker = FreemkvUnlocker::new().with_mediatek_loader(Box::new(Loader { fail: false }));
+    assert!(unlocker.claims(&id));
+    assert!(!unlocker.claims(&crate::DriveId::default()));
+    assert!(!FreemkvUnlocker::new().claims(&id));
+}

@@ -706,3 +706,57 @@ fn pioneer_tuning_follows_media_reacquisition_and_dead_bus_aborts() {
         assert_eq!(t.log, ["set", "set", "set", "pause", "tune"]);
     }
 }
+
+#[test]
+fn a_pioneer_runtime_identity_selects_the_renesas_backend() {
+    let id = crate::DriveId::default();
+    let mut t = MockTransport::scripted(
+        vec![Reply::good(crate::protocol::pioneer_identity().to_vec())],
+        Reply::good(vec![0; 64]),
+    );
+    let r = FreemkvUnlocker::new().unlock(&mut t, &ctx(&id));
+    assert!(!matches!(r, Ok(Some(_))), "a blank image cannot be hooked");
+    let region_set = build_set_cdb(Feature::Region, REGION_FREE).to_vec();
+    assert!(
+        !t.cdbs.contains(&region_set),
+        "the flashed-firmware path must not run for a runtime identity"
+    );
+}
+
+struct InstallsLater(crate::protocol::Capabilities);
+impl Backend for InstallsLater {
+    fn install(&mut self, _: &mut dyn ScsiTransport, _: bool) -> BackendResult<()> {
+        Ok(())
+    }
+    fn capabilities(&self) -> crate::protocol::Capabilities {
+        self.0
+    }
+    fn get_vid(&self, _: &mut dyn ScsiTransport) -> BackendResult<Option<[u8; 16]>> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn post_install_identity_must_match_the_backend_capabilities() {
+    let flashed = crate::protocol::ProtocolIdentity::parse(&freemkv_identity_payload())
+        .unwrap()
+        .capabilities;
+    let runtime = crate::protocol::Capabilities::PIONEER_RUNTIME;
+    assert_ne!(flashed, runtime);
+    let runtime_reply = crate::protocol::pioneer_identity().to_vec();
+    let flashed_reply = freemkv_identity_payload();
+    for (backend, reported, matches) in [
+        (runtime, &runtime_reply, true),
+        (flashed, &flashed_reply, true),
+        (runtime, &flashed_reply, false),
+        (flashed, &runtime_reply, false),
+    ] {
+        let mut t = MockTransport::always(Reply::good(reported.clone()));
+        let r = FreemkvUnlocker::new().unlock_backend(&mut t, &mut InstallsLater(backend), false);
+        if matches {
+            assert!(r.is_ok(), "matching identity proceeds");
+        } else {
+            assert_eq!(r.unwrap_err(), UnlockError::NotApplicable);
+        }
+    }
+}
