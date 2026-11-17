@@ -3371,3 +3371,321 @@ fn certificate_diagnostic_id_is_bounded_and_uses_only_the_host_identifier() {
     certificate[4..10].copy_from_slice(&[0, 1, 2, 0xfd, 0xfe, 0xff]);
     assert_eq!(super::cert_host_id_hex(&certificate), "000102fdfeff");
 }
+
+// ── Mutation-hardening: exact boundaries and known answers ──────────────
+
+#[test]
+fn cert_host_id_hex_accepts_a_cert_exactly_ten_bytes_long() {
+    let cert = [0, 0, 0, 0, 1, 2, 3, 4, 5, 6];
+    assert_eq!(cert_host_id_hex(&cert), "010203040506");
+    assert_eq!(cert_host_id_hex(&cert[..9]), "unknown");
+}
+
+#[test]
+fn cert_public_keys_are_read_from_a_cert_ending_exactly_at_the_key() {
+    let c52: Vec<u8> = (1..=52).collect();
+    let (x, y) = cert_pub_key(&c52);
+    assert_eq!(x[..], c52[12..32]);
+    assert_eq!(y[..], c52[32..52]);
+
+    let c68: Vec<u8> = (1..=68).collect();
+    let (x, y) = cert_pub_key_p256(&c68);
+    assert_eq!(x[..], c68[4..36]);
+    assert_eq!(y[..], c68[36..68]);
+}
+
+#[test]
+fn keypair_matches_needs_both_coordinates_and_a_52_byte_cert() {
+    let mut one = [0u8; 20];
+    one[19] = 1;
+    let mut cert = vec![0u8; 52];
+    cert[12..32].copy_from_slice(&EC_GX);
+    cert[32..52].copy_from_slice(&EC_GY);
+    assert!(aacs1_keypair_matches(&one, &cert), "1*G is the generator");
+    assert!(!aacs1_keypair_matches(&one, &cert[..51]));
+
+    let mut wrong_y = cert.clone();
+    wrong_y[32..52].fill(0);
+    assert!(
+        !aacs1_keypair_matches(&one, &wrong_y),
+        "x alone is not enough"
+    );
+    let mut wrong_x = cert;
+    wrong_x[12..32].fill(0);
+    assert!(
+        !aacs1_keypair_matches(&one, &wrong_x),
+        "y alone is not enough"
+    );
+}
+
+#[test]
+fn key_cdbs_carry_the_high_length_byte() {
+    for cdb in [
+        cdb_report_key(1, 0x01, 0x0123),
+        cdb_send_key(1, 0x01, 0x0123),
+        cdb_report_disc_structure(1, 0x80, 0x0123),
+    ] {
+        assert_eq!([cdb[8], cdb[9]], [0x01, 0x23]);
+        assert_eq!(cdb[10] >> 6, 1);
+    }
+}
+
+#[test]
+fn generated_aacs1_host_keys_are_reduced_and_match_their_public_point() {
+    let n = BigUint::from_bytes_be(&EC_N);
+    let p = BigUint::from_bytes_be(&EC_P);
+    let a = BigUint::from_bytes_be(&EC_A);
+    let g = EcPoint::from_bytes(&EC_GX, &EC_GY);
+    for _ in 0..32 {
+        let (key, x, y) = generate_host_key_pair();
+        let d = BigUint::from_bytes_be(&key);
+        assert!(!d.is_zero() && d < n, "private scalar must lie in [1, n)");
+        let q = ec_mul(&d, &g, &a, &p);
+        assert_eq!(BigUint::from_bytes_be(&x), q.x);
+        assert_eq!(BigUint::from_bytes_be(&y), q.y);
+    }
+}
+
+#[test]
+fn ecdsa_verify_rejects_s_not_reduced_mod_n() {
+    let n = BigUint::from_bytes_be(&EC_N);
+    let limit = BigUint::one() << 160usize;
+    let (priv_key, px, py) = generate_host_key_pair();
+    loop {
+        let (r, s) = ecdsa_sign(&priv_key, b"payload");
+        assert!(ecdsa_verify(&px, &py, &r, &s, b"payload"));
+        let bumped = BigUint::from_bytes_be(&s) + &n;
+        if bumped >= limit {
+            continue;
+        }
+        let mut s2 = [0u8; 20];
+        s2.copy_from_slice(&to_bytes_be_padded(&bumped, 20));
+        assert!(!ecdsa_verify(&px, &py, &r, &s2, b"payload"));
+        break;
+    }
+}
+
+#[test]
+fn ecdsa_verify_p256_rejects_s_not_reduced_mod_n() {
+    let n = BigUint::from_bytes_be(&P256_N);
+    let (priv_key, px, py) = generate_host_key_pair_p256();
+    let (r, s) = ecdsa_sign_p256(&priv_key, b"payload");
+    assert!(ecdsa_verify_p256(&px, &py, &r, &s, b"payload"));
+    let bumped = (BigUint::from_bytes_be(&s) + &n).to_bytes_be();
+    assert!(!ecdsa_verify_p256(&px, &py, &r, &bumped, b"payload"));
+}
+
+fn aes_cmac_16_reference(data: &[u8; 16], key: &[u8; 16]) -> ([u8; 16], bool) {
+    use aes::Aes128;
+    use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
+    let cipher = Aes128::new(&(*key).into());
+    let mut l: Array<u8, _> = [0u8; 16].into();
+    cipher.encrypt_block(&mut l);
+    let mut l_bytes = [0u8; 16];
+    l_bytes.copy_from_slice(&l);
+    let l_val = u128::from_be_bytes(l_bytes);
+    let carry = l_val >> 127 == 1;
+    let k1 = (l_val << 1) ^ if carry { 0x87 } else { 0 };
+    let block = u128::from_be_bytes(*data) ^ k1;
+    let mut ga: Array<u8, _> = block.to_be_bytes().into();
+    cipher.encrypt_block(&mut ga);
+    let mut mac = [0u8; 16];
+    mac.copy_from_slice(&ga);
+    (mac, carry)
+}
+
+#[test]
+fn aes_cmac_16_matches_an_independent_u128_reference_with_and_without_carry() {
+    let (mut carried, mut plain) = (0, 0);
+    for i in 0..64u32 {
+        let mut key = [0u8; 16];
+        let mut data = [0u8; 16];
+        for j in 0..16 {
+            key[j] = (i * 37 + j as u32 * 11) as u8;
+            data[j] = (i * 91 + j as u32 * 5 + 3) as u8;
+        }
+        let (want, carry) = aes_cmac_16_reference(&data, &key);
+        assert_eq!(aes_cmac_16(&data, &key), want, "key #{i}");
+        if carry {
+            carried += 1;
+        } else {
+            plain += 1;
+        }
+    }
+    assert!(carried > 0 && plain > 0, "both subkey shapes exercised");
+}
+
+#[test]
+fn allocated_agid_is_the_top_two_bits_of_the_allocation_reply() {
+    for agid in 1..=3u8 {
+        let mut script = vec![Reply::good(vec![0u8; 2]); 4];
+        let mut alloc = vec![0u8; 8];
+        alloc[7] = (agid << 6) | 0x15;
+        script.push(Reply::good(alloc));
+
+        let mut t = MockTransport::scripted(script.clone(), Reply::TransportFault);
+        assert!(aacs1_ake(&mut t, &[1u8; 20], &[0u8; 92], &[0; 20], &[0; 20]).is_err());
+        assert_eq!(t.cdbs[5][10] >> 6, agid, "1.0 host cert SEND KEY");
+        assert_eq!(t.cdbs[6][10], (agid << 6) | 0x3F, "1.0 release");
+
+        let mut t = MockTransport::scripted(script, Reply::TransportFault);
+        assert!(
+            aacs2_authenticate_p256_with_anchor(
+                &mut t,
+                &[1u8; 32],
+                &[0u8; 132],
+                &[0; 32],
+                &[0; 32]
+            )
+            .is_err()
+        );
+        assert_eq!(t.cdbs[5][10] >> 6, agid, "2.0 host cert SEND KEY");
+        assert_eq!(t.cdbs[6][10], (agid << 6) | 0x3F, "2.0 release");
+    }
+}
+
+/// With `has_v2` false the P-256 AKE must not run even if the cert carries v2
+/// credentials: a failed 1.0 VID MAC is terminal.
+#[test]
+fn failed_vid_mac_without_p256_permission_never_tries_p256() {
+    let mut emu = DriveEmu::new();
+    emu.bad_vid_mac = true;
+    let (lax, lay) = (emu.la_x, emu.la_y);
+    let hc = with_v2_creds(dummy_cert());
+    let la = (&lax, &lay, &[0u8; 32], &[0u8; 32]);
+    let outcome = attempt_one_cert(&mut emu, &hc, 0, la, true, false);
+    assert_eq!(outcome_name(&outcome), "VidUnavailable");
+}
+
+// ── EC arithmetic against an independent BigInt reference ───────────────
+
+fn modp(v: num_bigint::BigInt, p: &num_bigint::BigInt) -> num_bigint::BigInt {
+    let r = v % p;
+    if r.sign() == num_bigint::Sign::Minus {
+        r + p
+    } else {
+        r
+    }
+}
+
+fn ref_inv(v: &num_bigint::BigInt, p: &num_bigint::BigInt) -> num_bigint::BigInt {
+    v.modpow(&(p - 2u32), p)
+}
+
+fn ref_point(
+    lam: num_bigint::BigInt,
+    x1: &num_bigint::BigInt,
+    x2: &num_bigint::BigInt,
+    y1: &num_bigint::BigInt,
+    p: &num_bigint::BigInt,
+) -> EcPoint {
+    let x3 = modp(&lam * &lam - x1 - x2, p);
+    let y3 = modp(lam * (x1 - &x3) - y1, p);
+    EcPoint::new(x3.to_biguint().unwrap(), y3.to_biguint().unwrap())
+}
+
+fn ref_double(pt: &EcPoint, a: &BigUint, p: &BigUint) -> EcPoint {
+    use num_bigint::BigInt;
+    let (x, y, a, p) = (
+        BigInt::from(pt.x.clone()),
+        BigInt::from(pt.y.clone()),
+        BigInt::from(a.clone()),
+        BigInt::from(p.clone()),
+    );
+    let lam = modp((&x * &x * 3u32 + a) * ref_inv(&(&y * 2u32), &p), &p);
+    ref_point(lam, &x, &x, &y, &p)
+}
+
+fn ref_add(p1: &EcPoint, p2: &EcPoint, p: &BigUint) -> EcPoint {
+    use num_bigint::BigInt;
+    let (x1, y1, x2, y2, p) = (
+        BigInt::from(p1.x.clone()),
+        BigInt::from(p1.y.clone()),
+        BigInt::from(p2.x.clone()),
+        BigInt::from(p2.y.clone()),
+        BigInt::from(p.clone()),
+    );
+    let lam = modp((&y2 - &y1) * ref_inv(&modp(&x2 - &x1, &p), &p), &p);
+    ref_point(lam, &x1, &x2, &y1, &p)
+}
+
+fn assert_same_point(got: &EcPoint, want: &EcPoint, what: &str) {
+    assert!(!got.infinity, "{what}: not infinity");
+    assert_eq!(got.x, want.x, "{what}: x");
+    assert_eq!(got.y, want.y, "{what}: y");
+}
+
+fn curves() -> [(BigUint, BigUint, EcPoint); 2] {
+    [
+        (
+            BigUint::from_bytes_be(&EC_P),
+            BigUint::from_bytes_be(&EC_A),
+            EcPoint::from_bytes(&EC_GX, &EC_GY),
+        ),
+        (
+            BigUint::from_bytes_be(&P256_P),
+            BigUint::from_bytes_be(&P256_A),
+            EcPoint::from_bytes(&P256_GX, &P256_GY),
+        ),
+    ]
+}
+
+#[test]
+fn ec_double_returns_reduced_coordinates_matching_the_reference() {
+    for (p, a, g) in curves() {
+        let mut pt = g;
+        for step in 0..24 {
+            let got = ec_double(&pt, &a, &p);
+            let want = ref_double(&pt, &a, &p);
+            assert_same_point(&got, &want, &format!("double #{step}"));
+            assert!(got.x < p && got.y < p, "double #{step} is reduced");
+            pt = got;
+        }
+    }
+}
+
+#[test]
+fn ec_add_returns_reduced_coordinates_matching_the_reference() {
+    for (p, a, g) in curves() {
+        let two_g = ref_double(&g, &a, &p);
+        let mut pts = vec![g];
+        for _ in 0..10 {
+            let next = ref_add(pts.last().unwrap(), &two_g, &p);
+            pts.push(next);
+        }
+        for (i, p1) in pts.iter().enumerate() {
+            for (j, p2) in pts.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let got = ec_add(p1, p2, &a, &p);
+                let want = ref_add(p1, p2, &p);
+                assert_same_point(&got, &want, &format!("add {i}+{j}"));
+                assert!(got.x < p && got.y < p, "add {i}+{j} is reduced");
+            }
+        }
+    }
+}
+
+#[test]
+fn ec_double_of_the_infinity_flag_is_infinity_whatever_the_coordinates() {
+    for (p, a, g) in curves() {
+        let flagged = EcPoint {
+            infinity: true,
+            ..g
+        };
+        assert!(ec_double(&flagged, &a, &p).infinity);
+    }
+}
+
+#[test]
+fn point_on_curve_rejects_coordinates_outside_the_field() {
+    let p = BigUint::from_bytes_be(&EC_P);
+    let a = BigUint::from_bytes_be(&EC_A);
+    let b = BigUint::from_bytes_be(&EC_B);
+    let gx = BigUint::from_bytes_be(&EC_GX);
+    let gy = BigUint::from_bytes_be(&EC_GY);
+    assert!(point_on_curve(&gx, &gy, &a, &b, &p));
+    assert!(!point_on_curve(&(&gx + &p), &gy, &a, &b, &p), "x >= p");
+    assert!(!point_on_curve(&gx, &(&gy + &p), &a, &b, &p), "y >= p");
+}
