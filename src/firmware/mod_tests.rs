@@ -854,3 +854,63 @@ fn recipe_transport_fault_after_identity_propagates() {
     assert_eq!(fw.arm_bypass_uhd().unwrap_err(), FirmwareError::Transport);
     assert_eq!(t.calls(), 2);
 }
+
+#[test]
+fn descriptor_distinguishes_absent_extensions_from_a_dead_bus() {
+    for reply in [
+        Reply::good(vec![0; MEMREAD_LEN]),
+        Reply::illegal_request(),
+        Reply::illegal_request_as_err(),
+    ] {
+        let mut transport = MockTransport::always(reply);
+        assert!(
+            FirmwareControl::new(&mut transport)
+                .descriptor()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(transport.calls(), 1);
+    }
+    let mut transport = MockTransport::always(Reply::TransportFault);
+    assert_eq!(
+        FirmwareControl::new(&mut transport)
+            .descriptor()
+            .unwrap_err(),
+        FirmwareError::Transport
+    );
+}
+
+#[test]
+fn descriptor_rejects_impossible_transport_counts() {
+    struct Oversized;
+    impl ScsiTransport for Oversized {
+        fn execute(
+            &mut self,
+            _: &[u8],
+            _: DataDirection,
+            data: &mut [u8],
+            _: u32,
+        ) -> ScsiTResult<ScsiResult> {
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: data.len() + 1,
+                sense: [0; 32],
+            })
+        }
+    }
+    assert_eq!(
+        FirmwareControl::new(&mut Oversized)
+            .descriptor()
+            .unwrap_err(),
+        FirmwareError::Rejected
+    );
+}
+
+#[test]
+fn disabling_unrestricted_sends_the_off_state() {
+    let mut transport = MockTransport::always(Reply::good(vec![0; MEMREAD_LEN]));
+    FirmwareControl::new(&mut transport)
+        .disable_unrestricted()
+        .unwrap();
+    assert_eq!(transport.calls(), 1);
+}

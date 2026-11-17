@@ -1,6 +1,17 @@
 use super::*;
 use mock::{MockTransport, Reply};
 
+#[test]
+fn agid_guard_debug_and_shared_transport_access_preserve_identity() {
+    let mut transport = MockTransport::always(Reply::TransportFault);
+    let mut release = [0; 12];
+    release[0] = SCSI_REPORT_KEY;
+    release[10] = 0xbf;
+    let guard = AgidGuard::new(&mut transport, 2, release);
+    assert_eq!(format!("{guard:?}"), "AgidGuard { agid: 2, armed: true }");
+    let _shared: &dyn ScsiTransport = &*guard;
+}
+
 /// The fixed-format sense layout the whole crate reads its diagnostics off
 /// (key at byte 2 low nibble, ASC at 12, ASCQ at 13). This file had no test
 /// at all, so nothing pinned the offsets.

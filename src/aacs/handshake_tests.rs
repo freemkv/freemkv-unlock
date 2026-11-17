@@ -3364,3 +3364,10 @@ fn per_cert_backoff_uses_pause() {
         "cert 2 never reached the drive"
     );
 }
+#[test]
+fn certificate_diagnostic_id_is_bounded_and_uses_only_the_host_identifier() {
+    assert_eq!(super::cert_host_id_hex(&[0; 9]), "unknown");
+    let mut certificate = [0xaa; 32];
+    certificate[4..10].copy_from_slice(&[0, 1, 2, 0xfd, 0xfe, 0xff]);
+    assert_eq!(super::cert_host_id_hex(&certificate), "000102fdfeff");
+}

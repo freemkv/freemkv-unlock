@@ -608,3 +608,59 @@ fn normal_image_reader_checks_header_length_and_chunked_contents() {
         assert!(discovery::load_normal(&mut drive).is_err());
     }
 }
+
+#[test]
+fn raw_diagnostic_commands_reject_invalid_requests_before_io() {
+    use crate::scsi::mock::{MockTransport, Reply};
+    let mut drive = MockTransport::always(Reply::TransportFault);
+    for (cdb, direction, bytes) in [
+        (vec![0; 9], DataDirection::FromDevice, vec![0; 16]),
+        (vec![0; 10], DataDirection::None, vec![0; 1]),
+        (vec![0; 10], DataDirection::FromDevice, vec![0; 4097]),
+    ] {
+        assert!(generic_cdb(&mut drive, &cdb, direction, bytes).is_err());
+    }
+    assert_eq!(drive.calls(), 0);
+    for direction in [DataDirection::None, DataDirection::ToDevice] {
+        let mut drive = MockTransport::always(Reply::good(vec![0; 16]));
+        let reply = generic_cdb(&mut drive, &[0; 10], direction, vec![]).unwrap();
+        assert!(reply.data.is_empty());
+    }
+}
+
+#[test]
+fn memory_access_and_guards_fail_closed_before_installer_writes() {
+    use crate::scsi::mock::{MockTransport, Reply};
+    let (_, prepared) = fixture();
+    let mut profile = prepared.profile;
+    let mut drive = MockTransport::always(Reply::TransportFault);
+    assert!(address(&profile, 0xdfffff, 2).is_err());
+    assert!(address(&profile, 0x87ffff, 2).is_err());
+    assert!(memory(&mut drive, &profile, 0x410000, &mut [0; 16], true).is_err());
+    assert_eq!(drive.calls(), 0);
+    profile.guards = vec![Guard { cpu_address: 0x1000, expected: vec![] }];
+    assert!(guards(&mut drive, &profile).is_err());
+    assert_eq!(drive.calls(), 0);
+    for reply in [Reply::illegal_request(), Reply::short(vec![0; 16], 15)] {
+        let mut drive = MockTransport::always(reply);
+        assert!(read(&mut drive, &profile, 0x1000, 16).is_err());
+    }
+}
+
+#[test]
+fn free_space_search_rejects_invalid_payloads_and_unbound_live_images() {
+    use crate::scsi::mock::{MockTransport, Reply};
+    let (_, prepared) = fixture();
+    let mut profile = prepared.profile;
+    profile.normal_length = 0x200000;
+    profile.ownership_evidence = "synthetic reviewed RAM ownership".into();
+    profile.write_path_evidence = "synthetic independent callback".into();
+    profile.reserved_windows = vec![Range::new(0xa01000, 4096).unwrap()];
+    let mut drive = MockTransport::always(Reply::good(vec![0; 4096]));
+    for size in [0, MAX_PAYLOAD as u32 + 1] {
+        assert!(find_free_space(&mut drive, &profile, size, 4).is_err());
+    }
+    assert_eq!(drive.calls(), 0);
+    assert!(find_free_spaces(&mut drive, &profile, 4).unwrap_err().to_string().contains("hash mismatch"));
+    assert!(drive.calls() > 0);
+}
