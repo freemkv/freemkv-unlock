@@ -185,6 +185,8 @@ fn agid_guard_release_buffer_follows_the_cdb_allocation_length() {
     let mut t = Sizes(Vec::new());
     for (hi, lo) in [(0u8, 0u8), (0, 2), (1, 2), (1, 0)] {
         let mut release = [0u8; 12];
+        release[0] = SCSI_REPORT_KEY;
+        release[10] = (1 << 6) | 0x3F;
         release[8] = hi;
         release[9] = lo;
         drop(AgidGuard::new(&mut t, 1, release));
