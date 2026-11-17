@@ -51,6 +51,14 @@ fn short_response_is_none() {
     assert_eq!(read_aacs_vid(&mut t).expect("no fault"), None);
 }
 
+/// Exactly header + VID (20 bytes) is enough: the MAC is not needed.
+#[test]
+fn header_plus_vid_is_the_minimum_accepted_length() {
+    let vid = [0x5Au8; 16];
+    let mut t = MockTransport::always(Reply::short(vid_ds_response(vid), 20));
+    assert_eq!(read_aacs_vid(&mut t).expect("no fault"), Some(vid));
+}
+
 /// A CHECK CONDITION (no medium / drive not open) → `Ok(None)`, never a VID
 /// parsed from the zero fill.
 #[test]

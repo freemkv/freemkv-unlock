@@ -90,6 +90,23 @@ fn read_oem_vid_short_response_is_none() {
     assert_eq!(got, None);
 }
 
+/// One byte short of the full 36-byte response is still short, even when
+/// the signature and VID bytes are valid.
+#[test]
+fn read_oem_vid_one_byte_short_is_none() {
+    let mut payload = vec![0u8; 36];
+    payload[0..3].copy_from_slice(&[0x00, 0x22, 0x00]);
+    payload[4..20].fill(0x3C);
+    let mut t = FakeTransport {
+        payload,
+        bytes_transferred: 35,
+    };
+    let got = LdUnlocker::new()
+        .read_oem_vid(&mut t, &known_vid_profile())
+        .expect("short response is Ok(None)");
+    assert_eq!(got, None);
+}
+
 /// A response whose 3-byte signature isn't `00 22 00` → `Ok(None)`.
 #[test]
 fn read_oem_vid_bad_header_is_none() {

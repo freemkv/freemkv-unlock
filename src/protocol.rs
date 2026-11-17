@@ -572,4 +572,15 @@ mod tests {
             Implementation::Firmware
         );
     }
+
+    #[test]
+    fn poke_cdb_packs_target_big_endian_and_value() {
+        let cdb = build_poke_cdb(0x1234_5678, 0xAB);
+        assert_eq!(cdb[CDB_OPCODE], READ_BUFFER_OPCODE);
+        assert_eq!(cdb[CDB_MODE], KNOCK_MODE);
+        assert_eq!(cdb[CDB_KNOCK..CDB_KNOCK + 2], DEBUG_KNOCK);
+        assert_eq!(cdb[CDB_VERB], Verb::Poke as u8);
+        assert_eq!(cdb[5..9], [0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(cdb[9], 0xAB);
+    }
 }
