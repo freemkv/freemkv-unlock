@@ -597,6 +597,11 @@ fn normal_image_reader_checks_header_length_and_chunked_contents() {
         Reply::good(image[4096..].to_vec()),
     ], Reply::TransportFault);
     assert_eq!(discovery::load_normal(&mut drive).unwrap(), image);
+    assert_eq!(
+        drive.cdbs[2],
+        pioneer_optical::cdb::read_memory(0x411000, 0x100).to_vec(),
+        "the second chunk is read at base + bytes already read"
+    );
     for header in [vec![0; 256], image[..255].to_vec()] {
         let mut drive = MockTransport::always(Reply::good(header));
         assert!(discovery::load_normal(&mut drive).is_err());
@@ -663,4 +668,13 @@ fn free_space_search_rejects_invalid_payloads_and_unbound_live_images() {
     assert_eq!(drive.calls(), 0);
     assert!(find_free_spaces(&mut drive, &profile, 4).unwrap_err().to_string().contains("hash mismatch"));
     assert!(drive.calls() > 0);
+}
+
+#[test]
+fn a_dead_bus_command_error_names_the_transport_failure() {
+    let e = command_error(ScsiError {
+        status: crate::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+        sense: None,
+    });
+    assert_eq!(e.to_string(), "Renesas transport failed");
 }
