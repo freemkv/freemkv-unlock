@@ -1364,3 +1364,60 @@ fn native_speed_policy_query_passes_through_to_oem() {
         (false, vec![])
     );
 }
+
+#[test]
+fn read_engine_state_requires_a_unique_low_ram_predicate() {
+    let mut code = vec![0x6a, 0x08, 0x2c, 0x46, 0xa8, 0x08, 0x44, 0x08, 0x0c, 0x88,
+        0x47, 0x04, 0xf8, 0x01, 0x40, 0x02, 0x18, 0x88, 0x54, 0x70];
+    assert_eq!(read_engine_state(&code).unwrap(), 0x2c46);
+    for address in [0u16, 0x8000, 0xffff] {
+        code[2..4].copy_from_slice(&address.to_be_bytes());
+        assert!(read_engine_state(&code).is_err());
+    }
+    code[2..4].copy_from_slice(&0x7fffu16.to_be_bytes());
+    assert_eq!(read_engine_state(&code).unwrap(), 0x7fff);
+    let duplicate = code.clone();
+    code.extend(duplicate);
+    assert!(read_engine_state(&code).is_err());
+}
+
+#[test]
+fn loaded_flag_discovery_rejects_inconsistent_and_aliased_cache_flags() {
+    let mut code = vec![
+        0x18, 0x88, 0x6a, 0xa8, 0, 0, 0x2f, 0x84,
+        0x6a, 0xa8, 0, 0, 0x2f, 0x86, 0x6a, 0xa8, 0, 0, 0x2f, 0x85,
+        0x6a, 0xa8, 0, 0, 0x2f, 0x87, 0x6a, 0xa8, 0, 0, 0x2f, 0x88,
+        0x54, 0x70, 0x6a, 0x28, 0, 0, 0x2f, 0x86, 0x54, 0x70,
+    ];
+    assert_eq!(loaded_state(&code, 0x2f87, 0x2f88).unwrap(), 0x2f86);
+    assert!(loaded_state(&code, 0x2f88, 0x2f87).is_err());
+    for address in [0u32, 0x2f87, 0x2f88, 0x1000000] {
+        code[10..14].copy_from_slice(&address.to_be_bytes());
+        code[36..40].copy_from_slice(&address.to_be_bytes());
+        assert!(loaded_state(&code, 0x2f87, 0x2f88).is_err());
+    }
+}
+
+#[test]
+fn security_accessor_must_be_assigned_to_the_expected_object() {
+    let base = 0x410000u32;
+    let slot = 0x13b6u32;
+    let object = 0x13b2u32;
+    let mut image = vec![0; 256];
+    let mut accessor = vec![0x7a, 0];
+    accessor.extend((base + 128).to_be_bytes());
+    accessor.extend(abs(0x5e, base + 200).unwrap());
+    accessor.extend([0x7a, 0]);
+    accessor.extend(slot.to_be_bytes());
+    accessor.extend([0x54, 0x70]);
+    image[32..32 + accessor.len()].copy_from_slice(&accessor);
+    let mut assignment = abs(0x5e, base + 32).unwrap().to_vec();
+    assignment.extend([1, 0, 0x6b, 0xa0]);
+    assignment.extend(object.to_be_bytes());
+    image[80..80 + assignment.len()].copy_from_slice(&assignment);
+    verify_security_object(&image, base, slot, object).unwrap();
+    assert!(verify_security_object(&image, base, slot, object + 2).is_err());
+    image[80..80 + assignment.len()].fill(0);
+    image[81..81 + assignment.len()].copy_from_slice(&assignment);
+    assert!(verify_security_object(&image, base, slot, object).is_err());
+}

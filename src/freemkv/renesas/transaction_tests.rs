@@ -520,3 +520,91 @@ fn foreign_policy_before_installation_is_not_overwritten() {
     );
     assert_eq!(d.get(p.allocation.start(), p.original.len()), p.original);
 }
+
+#[test]
+fn allocation_profile_rejects_unproven_and_out_of_map_memory() {
+    let (_, prepared) = fixture();
+    let mut valid = prepared.profile;
+    valid.normal_length = 0x200000;
+    valid.ownership_evidence = "synthetic RAM ownership proof".into();
+    valid.write_path_evidence = "synthetic independent write callback".into();
+    valid.reserved_windows = vec![Range::new(0xa01000, 4096).unwrap()];
+    validate(&valid).unwrap();
+    let invalid: Vec<Profile> = vec![
+        Profile { ownership_evidence: " \n".into(), ..valid.clone() },
+        Profile { write_path_evidence: String::new(), ..valid.clone() },
+        Profile { normal_length: 0x10ff, ..valid.clone() },
+        Profile { normal_length: 0x400001, ..valid.clone() },
+        Profile { normal_address: u32::MAX - 8, ..valid.clone() },
+        Profile { controller_cpu_base: 0xb00000, ..valid.clone() },
+        Profile { pointer_address: 3, ..valid.clone() },
+        Profile { pointer_address: 0x8000, ..valid.clone() },
+        Profile { table_length: 39, ..valid.clone() },
+        Profile { main_callback_offset: 0x20, ..valid.clone() },
+        Profile { write_pointer_address: valid.pointer_address, ..valid.clone() },
+        Profile { write_pointer_address: 3, ..valid.clone() },
+        Profile { original_table: 0x400000, ..valid.clone() },
+        Profile { write_original_table: 0x610000, ..valid.clone() },
+        Profile { reserved_windows: vec![], ..valid.clone() },
+        Profile { reserved_windows: vec![Range::new(0x900000, 16).unwrap()], ..valid.clone() },
+    ];
+    for profile in invalid {
+        assert!(validate(&profile).is_err(), "accepted invalid profile: {profile:?}");
+    }
+    assert_eq!(sha256(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+#[test]
+fn runtime_backend_stages_verifies_and_keeps_only_an_owned_resident_hook() {
+    use crate::freemkv::Backend as _;
+    for installed in [false, true] {
+        let (mut drive, mut prepared) = fixture();
+        drive.critical = true;
+        if installed {
+            stage(&mut drive, &prepared).unwrap();
+            prepared.original = prepared.payload.clone();
+        }
+        let mut backend = crate::freemkv::renesas::Backend::new();
+        backend.prepared = Some(prepared);
+        backend.existing = installed;
+        backend.install(&mut drive, installed).unwrap();
+        assert!(backend.touched);
+        drive.put(operations::SECURITY_SLOT, &operations::policy_table(0xa01000, 1024).to_be_bytes());
+        drive.put(0x2f86, &[0]);
+        drive.put(0x2f87, &[1]);
+        drive.put(0x2f88, &[0]);
+        backend.verify(&mut drive).unwrap();
+        backend.finish(&mut drive, true).unwrap();
+        assert_eq!(drive.get(0xe20, 4), 0xa01040u32.to_be_bytes());
+        drive.put(0xa01000, &[0xff]);
+        assert_eq!(backend.verify(&mut drive).unwrap_err(), crate::UnlockError::Transport);
+    }
+    let (mut drive, _) = fixture();
+    let mut backend = crate::freemkv::renesas::Backend::new();
+    backend.finish(&mut drive, false).unwrap();
+    assert_eq!(backend.install(&mut drive, false).unwrap_err(), crate::UnlockError::NotApplicable);
+}
+
+#[test]
+fn normal_image_reader_checks_header_length_and_chunked_contents() {
+    use crate::scsi::mock::{MockTransport, Reply};
+    let mut image = vec![0x53; 0x1100];
+    image[..8].copy_from_slice(b"PIONEER ");
+    image[20..24].copy_from_slice(&0x1100u32.to_be_bytes());
+    let mut drive = MockTransport::scripted(vec![
+        Reply::good(image[..256].to_vec()),
+        Reply::good(image[..4096].to_vec()),
+        Reply::good(image[4096..].to_vec()),
+    ], Reply::TransportFault);
+    assert_eq!(discovery::load_normal(&mut drive).unwrap(), image);
+    for header in [vec![0; 256], image[..255].to_vec()] {
+        let mut drive = MockTransport::always(Reply::good(header));
+        assert!(discovery::load_normal(&mut drive).is_err());
+    }
+    for size in [0, 0x10ff, 0x3f0001, u32::MAX] {
+        let mut header = image[..256].to_vec();
+        header[20..24].copy_from_slice(&size.to_be_bytes());
+        let mut drive = MockTransport::always(Reply::good(header));
+        assert!(discovery::load_normal(&mut drive).is_err());
+    }
+}
