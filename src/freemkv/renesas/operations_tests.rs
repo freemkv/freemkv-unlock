@@ -1421,3 +1421,58 @@ fn security_accessor_must_be_assigned_to_the_expected_object() {
     image[81..81 + assignment.len()].copy_from_slice(&assignment);
     assert!(verify_security_object(&image, base, slot, object).is_err());
 }
+
+#[test]
+fn dispatcher_discovery_binds_its_only_call_to_the_operation_lookup() {
+    let base = 0x410000u32;
+    let mut image = vec![0; 4096];
+    let mut lookup = vec![0x17, 0xf0, 0x0f, 0x81, 0x10, 0x30, 0x0a, 0x90, 0x10, 0x30, 0x7a, 0x10];
+    lookup.extend((base + 2048).to_be_bytes());
+    lookup.extend([0x54, 0x70]);
+    image[32..32 + lookup.len()].copy_from_slice(&lookup);
+    let mut dispatch = vec![
+        1, 0, 0x6d, 0xf3, 1, 0x20, 0x6d, 0xf4, 0x79, 0x37, 0, 0x20,
+        1, 0, 0x6f, 0xf2, 0, 0x1c, 1, 0, 0x6f, 0xf1, 0, 0x16, 0xfd, 1, 0x69, 0x10,
+    ];
+    dispatch.extend(abs(0x5e, base + 32).unwrap());
+    dispatch.extend([0x0f, 0x86, 1, 0, 0x69, 1, 1, 0, 0x69, 0x10, 1, 0, 0x6f, 3, 0, 0x10]);
+    dispatch.extend([0x0c, 0xd8, 0x79, 0x17, 0, 0x20, 1, 0x20, 0x6d, 0x76, 1, 0, 0x6d, 0x73, 0x54, 0x70]);
+    image[256..256 + dispatch.len()].copy_from_slice(&dispatch);
+    assert_eq!(internal_dispatcher(&image, base).unwrap(), base + 256);
+    image[284..288].copy_from_slice(&abs(0x5e, base + 34).unwrap());
+    assert!(internal_dispatcher(&image, base).is_err());
+    image[284..288].copy_from_slice(&abs(0x5e, base + 32).unwrap());
+    image[256 + dispatch.len() - 11] ^= 2;
+    assert!(internal_dispatcher(&image, base).is_err());
+}
+
+#[test]
+fn vid_discovery_checks_register_windows_and_callback_ownership() {
+    let base = 0x410000u32;
+    let mut image = vec![0; 8192];
+    for opcode in [0, 1, 3, 4, 0x12, 0x3b, 0x3c, 0xad] {
+        image[opcode * 4..opcode * 4 + 4].copy_from_slice(&0x1234u32.to_be_bytes());
+    }
+    let mut init = vec![0x7a, 1];
+    init.extend((base + 4096).to_be_bytes());
+    init.extend([1, 0, 0x6b, 0xa1]);
+    init.extend(0x1234u32.to_be_bytes());
+    image[1200..1200 + init.len()].copy_from_slice(&init);
+    for (offset, target) in [(0x10, 5000), (0x1a, 5010), (0x24, 5020)] {
+        image[4096 + offset..4100 + offset].copy_from_slice(&(base + target).to_be_bytes());
+    }
+    let words = [0x6a08u16, 0xed3c, 0x7718, 0x4400, 0x0c99, 0x4600, 0x7a00, 0, 0, 0x5e00, 0,
+        0x1933, 0x7a06, 0xffff, 0xed20, 0x0d31, 0x1771, 0x0f90, 0x0ae0, 0x680c, 0x0f90, 0x0ad0, 0x688c];
+    let code: Vec<u8> = words.into_iter().flat_map(u16::to_be_bytes).collect();
+    image[6000..6000 + code.len()].copy_from_slice(&code);
+    let sites = vid_sites(&image, base).unwrap();
+    assert_eq!((sites.slot, sites.table, sites.main, sites.status, sites.source),
+        (0x1234, base + 4096, base + 5020, 0xffffed3c, 0xffffed20));
+    for source in [0u32, 0xffffdfff, 0xfffffff1] {
+        image[6026..6030].copy_from_slice(&source.to_be_bytes());
+        assert!(vid_sites(&image, base).is_err());
+    }
+    image[6026..6030].copy_from_slice(&0xffffed20u32.to_be_bytes());
+    image[6002..6004].copy_from_slice(&0xdfffu16.to_be_bytes());
+    assert!(vid_sites(&image, base).is_err());
+}
