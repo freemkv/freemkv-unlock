@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.8.9"
+version = "1.8.10"
 dependencies = [
  "aes",
  "anyhow",
