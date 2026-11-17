@@ -2,6 +2,15 @@ use super::*;
 use mock::{MockTransport, Reply};
 
 #[test]
+fn a_critical_guard_borrows_the_original_transport() {
+    let mut transport = MockTransport::always(Reply::TransportFault);
+    let address = &transport as *const MockTransport as *const ();
+    let guard = CriticalGuard::enter(&mut transport).unwrap();
+    let borrowed = &*guard as *const dyn ScsiTransport as *const ();
+    assert_eq!(borrowed, address);
+}
+
+#[test]
 fn agid_guard_debug_and_shared_transport_access_preserve_identity() {
     let mut transport = MockTransport::always(Reply::TransportFault);
     let mut release = [0; 12];
