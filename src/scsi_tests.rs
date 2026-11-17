@@ -160,3 +160,34 @@ fn agid_guard_releases_once_via_cleanup_and_defuse_keeps_it() {
     assert_eq!(g.defuse(), 2);
     assert!(t.log.is_empty(), "defuse hands the AGID over unreleased");
 }
+
+// The release buffer is the CDB's 16-bit allocation length (bytes 8-9), or 8
+// when the CDB names none.
+#[test]
+fn agid_guard_release_buffer_follows_the_cdb_allocation_length() {
+    struct Sizes(Vec<usize>);
+    impl ScsiTransport for Sizes {
+        fn execute(
+            &mut self,
+            _: &[u8],
+            _: DataDirection,
+            data: &mut [u8],
+            _: u32,
+        ) -> Result<ScsiResult> {
+            self.0.push(data.len());
+            Ok(ScsiResult {
+                status: 0,
+                bytes_transferred: 0,
+                sense: [0; 32],
+            })
+        }
+    }
+    let mut t = Sizes(Vec::new());
+    for (hi, lo) in [(0u8, 0u8), (0, 2), (1, 2), (1, 0)] {
+        let mut release = [0u8; 12];
+        release[8] = hi;
+        release[9] = lo;
+        drop(AgidGuard::new(&mut t, 1, release));
+    }
+    assert_eq!(t.0, [8, 2, 258, 256]);
+}
