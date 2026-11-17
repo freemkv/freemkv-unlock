@@ -903,3 +903,159 @@ fn invalidate_loops_refused_after_cancel() {
         "nothing allocated, nothing released"
     );
 }
+
+// ── Mutation-hardening: CDB layouts and probe parsing ──────────────────
+
+struct ProfileDrive {
+    status: u8,
+    transferred: usize,
+    hi: u8,
+    lo: u8,
+}
+
+impl ScsiTransport for ProfileDrive {
+    fn execute(
+        &mut self,
+        _cdb: &[u8],
+        _dir: DataDirection,
+        data: &mut [u8],
+        _timeout_ms: u32,
+    ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+        data[6] = self.hi;
+        data[7] = self.lo;
+        Ok(crate::scsi::ScsiResult {
+            status: self.status,
+            bytes_transferred: self.transferred,
+            sense: [0u8; 32],
+        })
+    }
+}
+
+#[test]
+fn dvd_profile_probe_reads_the_big_endian_current_profile() {
+    for (status, transferred, hi, lo, want) in [
+        (0, 8, 0x00, 0x10, true),
+        (0, 8, 0x00, 0x1F, true),
+        (0, 8, 0x00, 0x20, false),
+        (0, 8, 0x01, 0x10, false),
+        (2, 8, 0x00, 0x10, false),
+        (0, 4, 0x00, 0x10, false),
+    ] {
+        let mut t = ProfileDrive {
+            status,
+            transferred,
+            hi,
+            lo,
+        };
+        assert_eq!(
+            mounted_disc_is_dvd(&mut t).unwrap(),
+            want,
+            "status {status}, {transferred} bytes, profile {hi:02x}{lo:02x}"
+        );
+    }
+}
+
+#[test]
+fn bus_auth_invalidates_all_four_agids_before_allocating() {
+    let mut t = MockTransport::always(Reply::illegal_request());
+    assert!(establish_authenticated_session(&mut t).is_err());
+    assert_eq!(t.cdbs.len(), 5, "four invalidations then the allocation");
+    for agid in 0..4u8 {
+        assert_eq!(t.cdbs[agid as usize], agid_release_cdb(agid).to_vec());
+    }
+}
+
+#[test]
+fn disc_key_read_requests_2052_bytes_under_the_held_agid() {
+    let mut t = MockTransport::always(Reply::good(vec![0u8; 2052]));
+    read_disc_key(&mut t, 2).expect("disc key read");
+    let cdb = &t.cdbs[0];
+    assert_eq!(cdb[0], crate::scsi::SCSI_READ_DISC_STRUCTURE);
+    assert_eq!(cdb[7], 0x02);
+    assert_eq!([cdb[8], cdb[9]], [0x08, 0x04]);
+    assert_eq!(cdb[10], 2 << 6);
+}
+
+#[test]
+fn send_key_cdb_carries_the_high_length_byte() {
+    let cdb = send_key_cdb(1, 0x03, 0x0123);
+    assert_eq!([cdb[8], cdb[9]], [0x01, 0x23]);
+    assert_eq!(cdb[10], (1 << 6) | 0x03);
+}
+
+struct KeyRecorder {
+    inner: CssEmu,
+    key2_payload: Option<Vec<u8>>,
+}
+
+impl ScsiTransport for KeyRecorder {
+    fn execute(
+        &mut self,
+        cdb: &[u8],
+        dir: DataDirection,
+        data: &mut [u8],
+        timeout_ms: u32,
+    ) -> crate::scsi::Result<crate::scsi::ScsiResult> {
+        if cdb[0] == crate::scsi::SCSI_SEND_KEY && cdb[10] & 0x3F == 0x03 {
+            self.key2_payload = Some(data.to_vec());
+        }
+        self.inner.execute(cdb, dir, data, timeout_ms)
+    }
+}
+
+#[test]
+fn host_key2_is_sent_reversed_at_offset_4_of_a_12_byte_payload() {
+    let mut t = KeyRecorder {
+        inner: css_emu(),
+        key2_payload: None,
+    };
+    establish_authenticated_session(&mut t).expect("bus auth");
+    // The emulator serves an all-zero drive challenge.
+    let key2 = crypt_key(1, 7, &[0u8; 10]);
+    assert_ne!(key2, [0u8; 5]);
+    let mut want = vec![0u8; 12];
+    want[1] = 0x0A;
+    for i in 0..5 {
+        want[4 + i] = key2[4 - i];
+    }
+    assert_eq!(t.key2_payload.expect("Key2 was sent"), want);
+}
+
+fn fnv1a(hash: &mut u64, bytes: &[u8]) {
+    for b in bytes {
+        *hash ^= u64::from(*b);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+}
+
+// Pins every crypt_key output across all key types, variants and a spread of
+// challenges so that any change to the cipher is caught.
+#[test]
+fn crypt_key_known_answers_across_types_variants_and_challenges() {
+    let mut seed: u64 = 0x1234_5678_9ABC_DEF0;
+    let mut challenges = vec![[0u8; 10], [0xFF; 10], [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]];
+    for _ in 0..5 {
+        let mut c = [0u8; 10];
+        for b in &mut c {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (seed >> 56) as u8;
+        }
+        challenges.push(c);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for key_type in 0..3 {
+        for variant in 0..32u8 {
+            for c in &challenges {
+                fnv1a(&mut hash, &crypt_key(key_type, variant, c));
+            }
+        }
+    }
+    let first = crypt_key(0, 0, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(
+        (hash, first),
+        (0xe93f_b885_7282_b02a, [0xfd, 0x14, 0xd4, 0x74, 0x2a]),
+        "crypt_key output changed: {hash:#018x} {first:02x?}"
+    );
+}
