@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.8.11] — UNRELEASED
+
+### Changed
+
+- Aligned the component version with the freemkv 1.8.11 release. No behavioral changes.
+
 ## [1.8.10] — 2026-11-17
 
 ### Changed
