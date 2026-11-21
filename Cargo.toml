@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-unlock"
-version = "1.8.10"
+version = "1.8.11"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
